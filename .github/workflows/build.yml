@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: Build & Verify (Dual-Platform Headers-Only)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-ubuntu-2204:
+    name: Linux x86_64 (Ubuntu 22.04 / GLIBC 2.35 / Vulkan 1.2)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Install build & Vulkan/SDL3 prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build clang lld pkg-config python3 \
+            patchelf xvfb libvulkan-dev mesa-vulkan-drivers vulkan-tools \
+            glslang-tools glslang-dev spirv-tools \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev \
+            libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev
+
+      - name: Setup pinned XboxXBERecomp SDK
+        run: |
+          chmod +x setup_sdk.sh release_linux.sh packaging/steamdeck/install-steamdeck.sh
+          ./setup_sdk.sh
+
+      - name: Configure & build copyright-clean --headers-only Linux binary
+        run: |
+          cmake --preset linux-release -B out/build/headers-only-linux -DPSIOPS_ALLOW_NO_XBE=ON
+          cmake --build out/build/headers-only-linux
+
+      - name: Verify ELF64 GLIBC <= 2.35 ceiling
+        run: |
+          MAX_GLIBC="$(objdump -T out/build/headers-only-linux/PsiOps | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -n 1 || true)"
+          echo "Detected max GLIBC symbol version: ${MAX_GLIBC}"
+          python3 -c '
+          import sys
+          v = sys.argv[1].replace("GLIBC_", "")
+          if v:
+              parts = tuple(int(x) for x in v.split("."))
+              assert parts <= (2, 35), f"GLIBC ceiling exceeded: {parts}"
+          ' "${MAX_GLIBC}"
+
+      - name: Headless lavapipe Steam Deck 1280x800 launcher smoke capture
+        run: |
+          mkdir -p .local/ci_smoke
+          LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy SteamDeck=1 xvfb-run -a -s "-screen 0 1280x800x24" \
+            ./out/build/headers-only-linux/PsiOps --launcher --launcher-tab 0 \
+            --capture-launcher-bmp "$PWD/.local/ci_smoke/launcher_linux.bmp"
+          test -s .local/ci_smoke/launcher_linux.bmp
+
+      - name: Package redistributable Linux tarball & verify via audit_release.py
+        run: |
+          ./release_linux.sh --skip-build
+          python3 tools/audit_release.py --ci --platform linux
+
+  windows-x64:
+    name: Windows x64 (D3D12 / XAudio2 / Clang)
+    runs-on: windows-2022
+    steps:
+      - name: Enforce pure-LF checkout for pinned SDK submodule
+        shell: cmd
+        run: git config --global core.autocrlf false
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Setup pinned XboxXBERecomp SDK
+        shell: cmd
+        run: setup_sdk.bat
+
+      - name: Install Python PE audit dependency & fetch signed retail upscaler plugins
+        shell: pwsh
+        run: |
+          python -m pip install --quiet pefile
+          python tools/fetch_upscalers.py
+
+      - name: Configure & build copyright-clean --headers-only Windows binary
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+          cmake --preset release -B out/build/headers-only-win -DPSIOPS_ALLOW_NO_XBE=ON
+          cmake --build out/build/headers-only-win
+
+      - name: Package Win64 launcher archive & verify via audit_release.py
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+          call release.bat --skip-build
+          python tools/audit_release.py --ci --platform win64

@@ -1,0 +1,133 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 22,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "win-base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "environment": {
+                "PATH": "C:/Program Files/LLVM/bin;$penv{PATH}"
+            },
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "CMAKE_C_FLAGS": "-march=x86-64-v2",
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v2"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "debug",
+            "displayName": "Windows x64 Debug",
+            "inherits": "win-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "release",
+            "displayName": "Windows x64 Release",
+            "inherits": "win-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "relwithdebinfo",
+            "displayName": "Windows x64 RelWithDebInfo",
+            "inherits": "win-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
+        },
+        {
+            "name": "linux-base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "CMAKE_C_FLAGS": "-march=x86-64-v2",
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v2"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
+        },
+        {
+            "name": "linux-release",
+            "displayName": "Linux x86_64 Release (Vulkan 1.2 + SDL3)",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "linux-debug",
+            "displayName": "Linux x86_64 Debug (Vulkan 1.2 + SDL3)",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
+        },
+        {
+            "name": "linux-cross-release",
+            "displayName": "Linux x86_64 Cross Release (from Windows)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "toolchainFile": "${sourceDir}/.local/linux_sysroot/linux-x86_64-toolchain.cmake",
+            "environment": {
+                "PATH": "C:/Program Files/LLVM/bin;$penv{PATH}"
+            },
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_FLAGS": "-march=x86-64-v2",
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v2"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "debug",
+            "configurePreset": "debug"
+        },
+        {
+            "name": "release",
+            "configurePreset": "release"
+        },
+        {
+            "name": "relwithdebinfo",
+            "configurePreset": "relwithdebinfo"
+        },
+        {
+            "name": "linux-release",
+            "configurePreset": "linux-release"
+        },
+        {
+            "name": "linux-debug",
+            "configurePreset": "linux-debug"
+        },
+        {
+            "name": "linux-cross-release",
+            "configurePreset": "linux-cross-release"
+        }
+    ]
+}

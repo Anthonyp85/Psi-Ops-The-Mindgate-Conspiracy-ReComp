@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Windows application icon, PerMonitorV2 DPI manifest, and version metadata
+// for Psi-Ops: The Mindgate Conspiracy (Original Xbox Static Recompilation).
+
+#include <winver.h>
+
+1 ICON "psiops.ico"
+1 24 "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Psi-Ops Recomp Contributors"
+            VALUE "FileDescription",  "Psi-Ops: The Mindgate Conspiracy (Native x64 Static Recompilation)"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "PsiOps"
+            VALUE "LegalCopyright",   "SPDX-License-Identifier: GPL-2.0-or-later"
+            VALUE "OriginalFilename", "PsiOps.exe"
+            VALUE "ProductName",      "Psi-Ops: The Mindgate Conspiracy"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

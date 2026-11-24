@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[Desktop Entry]
+Type=Application
+Name=Psi-Ops: The Mindgate Conspiracy
+GenericName=Action-Adventure Game (Native Linux Static Recompilation)
+Comment=Native Linux x86_64 Vulkan 1.2 static recompilation of Psi-Ops: The Mindgate Conspiracy (do NOT run under Proton)
+Exec=PsiOps
+Icon=psiops
+Terminal=false
+Categories=Game;ActionGame;
+StartupNotify=true
+StartupWMClass=PsiOps

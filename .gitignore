@@ -1,0 +1,53 @@
+# Build outputs and caches
+/out/
+/build/
+/dist/
+/generated/
+/cache/
+/plugins/
+CMakeUserPresets.json
+
+# Private local workspace, extracted XBE, Ghidra projects, screenshots, logs
+/.local/
+/logs/
+/hdd/
+/CrashDumps/
+/screenshots/
+
+# Copyrighted game assets, disc images, archives, and runtime user settings
+/assets/
+/Psi-Ops - The Mindgate Conspiracy (USA)/
+settings.toml
+*.iso
+*.xiso
+*.xbe
+*.7z
+*.sfd
+*.msx
+*.mbx
+*.xbox
+*.xbx
+
+# Compiled binaries and debug symbols
+*.exe
+*.dll
+*.so
+*.so.*
+*.lib
+*.a
+*.exp
+*.ilk
+*.obj
+*.o
+*.pdb
+*.dmp
+
+# Editor / OS clutter
+.vscode/
+.vs/
+*.user
+*.suo
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
