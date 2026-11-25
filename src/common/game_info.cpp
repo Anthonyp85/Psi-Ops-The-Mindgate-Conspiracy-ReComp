@@ -68,6 +68,8 @@ struct PsiOpsRawPhase {
     bool status_ready = false;
     bool in_shell = true;
     bool fmv_active = false;
+    bool pause_open = false;
+    bool non_pointer_modal = false;
     bool modal_ui_open = false;
     double sim_s = 0.0;
 };
@@ -129,16 +131,18 @@ PsiOpsRawPhase ReadPsiOpsPhaseRaw() {
     out.status_ready = mem::IsCommitted(0x005ED2B8u) && ((kernel::G<uint8_t>(0x005ED2B8u) & 1u) != 0u);
     out.in_shell = !out.status_ready || !mem::IsCommitted(0x005ECEA7u) || (kernel::G<uint8_t>(0x005ECEA7u) != 0u);
 
+    bool hud_modal_lock_on = false;
+    bool objectives_open_on = false;
     if (mem::IsCommitted(0x005CCB90u)) {
         uint32_t hud = kernel::R32(0x005CCB90u);
         if (hud && mem::IsCommitted(hud + 0x3B8u)) {
             out.hud = hud;
-            uint8_t hud_gameplay_active = kernel::G<uint8_t>(hud + 0x321u);
             uint8_t hud_modal_lock = kernel::G<uint8_t>(hud + 0x324u);
             uint8_t pause_open = kernel::G<uint8_t>(hud + 0x3B4u);
             uint8_t objectives_open = kernel::G<uint8_t>(hud + 0x3B5u);
-            out.modal_ui_open = (hud_gameplay_active == 0u) || (hud_modal_lock != 0u) || (pause_open != 0u) ||
-                                (objectives_open != 0u);
+            out.pause_open = (pause_open != 0u);
+            hud_modal_lock_on = (hud_modal_lock != 0u);
+            objectives_open_on = (objectives_open != 0u);
         }
     }
 
@@ -163,6 +167,16 @@ PsiOpsRawPhase ReadPsiOpsPhaseRaw() {
         out.pi.phase = perf::Phase::Paused;
         out.pi.g_elapsed_s = float(out.sim_s);
     }
+    // app->state == 4 is Psi-Ops's in-game Tutorial Tip / Mission Objectives overlay (screen='Tip', 0 spatial
+    // buttons, dismissed by A / LMB). Keep sim_s accounting in perf::Phase::Paused while treating it as a
+    // non-pointer modal so the OS cursor NEVER unlocks or pops up mid-gameplay.
+    const bool in_tip_modal = !out.fmv_active && !out.in_shell && (out.world != 0u) && (out.state == 4u) &&
+                              !out.pause_open;
+    out.non_pointer_modal = in_tip_modal || hud_modal_lock_on || objectives_open_on;
+    // Only unlock/show the OS menu cursor when an actual point-and-click menu is open
+    // (TitleMenu, Pause Menu state==6 / SavePrompt, or hud+0x3B4 pause_open).
+    out.modal_ui_open = (out.pi.phase == perf::Phase::TitleMenu) || out.pause_open ||
+                        (out.pi.phase == perf::Phase::Paused && !in_tip_modal);
     return out;
 }
 
@@ -179,7 +193,8 @@ gpu::CameraFrameData QueryPsiOpsCamera() {
     gpu::CameraFrameData out{};
     out.guest_frame = raw.pi.g_frame;
     out.dt_ms = (raw.pi.g_dt_ms > 0.5f && raw.pi.g_dt_ms < 200.0f) ? raw.pi.g_dt_ms : 16.667f;
-    out.is_3d_gameplay = (raw.pi.phase == perf::Phase::GameplayActive) && !raw.modal_ui_open;
+    out.is_3d_gameplay = ((raw.pi.phase == perf::Phase::GameplayActive) || (raw.state == 4u)) &&
+                         (raw.world != 0u) && !raw.in_shell && !raw.fmv_active && !raw.pause_open;
     if (!out.is_3d_gameplay || !kernel::g_base || !mem::IsCommitted(0x005DEFC8u)) return out;
 
     uint32_t renderer = kernel::R32(0x005DEFC8u);
@@ -262,7 +277,8 @@ bool IsSniperScopeActive() {
 void PsiOpsActionMap(const mkb::ActionPadState& act, input::Pad& pad) {
     using mkb::Action;
     if (act.phase == perf::Phase::Fmv) {
-        if (act.esc_pulse || act.held[size_t(Action::Interact)] || act.held[size_t(Action::Jump)]) {
+        if (act.esc_pulse || act.held[size_t(Action::Interact)] || act.held[size_t(Action::Jump)] ||
+            act.held[size_t(Action::Fire)]) {
             pad.buttons |= 1u << 4;  // START skips FMV/cutscene
         }
         return;
@@ -453,7 +469,8 @@ void OnPsiOpsPresent(uint64_t present_frame, std::filesystem::path& out_capture_
     input_rec::OnPresent(present_frame, out_capture_bmp, out_should_exit);
     // 2. Advance M&K autotest schedule and update Smart OS Cursor Capture for the upcoming frame.
     PsiOpsRawPhase raw = ReadPsiOpsPhaseRaw();
-    mkb::OnPresent(present_frame, raw.pi.phase, raw.modal_ui_open, out_capture_bmp, out_should_exit);
+    mkb::OnPresent(present_frame, raw.pi.phase, raw.modal_ui_open, out_capture_bmp, out_should_exit,
+                   raw.non_pointer_modal);
 }
 
 void OnPsiOpsPad(int port, input::Pad& pad) {

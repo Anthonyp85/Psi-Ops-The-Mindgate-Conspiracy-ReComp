@@ -681,7 +681,25 @@ int g_last_logged_ui_y0 = -99999;
 // UIManager (hud + 0xB0) in binary-verified 512x465 (y_off=+10) Layer 0x17 ortho space.
 void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
     EnsurePlayerPortBound(base);
-    if (input_rec::ShouldBypassMkb() || mkb::IsCursorCaptured() || mkb::IsOverlayOpen()) {
+    if (input_rec::ShouldBypassMkb() || mkb::IsOverlayOpen()) {
+        mkb::ReportMenuUiTelemetry("", -1, 0);
+        return;
+    }
+    if (mkb::IsCursorCaptured()) {
+        if (mkb::ConsumeNonPointerModalConfirm()) {
+            uint32_t hud = ctx.ecx;
+            if (!SafeAddr(hud, 0x260u) && SafeAddr(0x005CCB90u, 4u)) {
+                hud = ReadU32(base, 0x005CCB90u);
+            }
+            if (SafeAddr(hud, 0x300u)) {
+                uint32_t ui_mgr = hud + 0xB0u;
+                if (SafeAddr(ui_mgr, 0x240u) && ReadU32(base, ui_mgr + 0x10u) == 0u &&
+                    ReadU32(base, ui_mgr + 0x14u) != 0u && !IsUiBusy(base, ui_mgr)) {
+                    CallSendUiEvent(ctx, base, ui_mgr, kUiEvtConfirm);
+                }
+            }
+            mkb::PulseMenuPad(true, false, false);
+        }
         mkb::ReportMenuUiTelemetry("", -1, 0);
         return;
     }

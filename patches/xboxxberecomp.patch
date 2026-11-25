@@ -2612,7 +2612,7 @@ index bf8e3b9..e9aaef3 100644
  
  }  // namespace app
 diff --git a/runtime/app/main.cpp b/runtime/app/main.cpp
-index e36f7ac..cf09379 100644
+index e36f7ac..3ec92ee 100644
 --- a/runtime/app/main.cpp
 +++ b/runtime/app/main.cpp
 @@ -7,35 +7,250 @@
@@ -2967,34 +2967,70 @@ index e36f7ac..cf09379 100644
                       SWP_FRAMECHANGED);
      } else {
          const RECT& m = mi.rcMonitor;
-@@ -120,25 +387,49 @@ void ApplyNow() {
+@@ -119,26 +386,90 @@ void ApplyNow() {
+     }
  }
  
++bool IsMouseOrCursorMsg(UINT msg) {
++    switch (msg) {
++        case WM_MOUSEMOVE:
++        case WM_NCMOUSEMOVE:
++        case WM_MOUSELEAVE:
++        case WM_NCMOUSELEAVE:
++        case WM_LBUTTONDOWN:
++        case WM_LBUTTONUP:
++        case WM_LBUTTONDBLCLK:
++        case WM_RBUTTONDOWN:
++        case WM_RBUTTONUP:
++        case WM_RBUTTONDBLCLK:
++        case WM_MBUTTONDOWN:
++        case WM_MBUTTONUP:
++        case WM_MBUTTONDBLCLK:
++        case WM_XBUTTONDOWN:
++        case WM_XBUTTONUP:
++        case WM_XBUTTONDBLCLK:
++        case WM_MOUSEWHEEL:
++        case WM_MOUSEHWHEEL:
++        case WM_SETCURSOR:
++            return true;
++        default:
++            return false;
++    }
++}
++
++bool ForwardToImGui(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
++    std::lock_guard lock(UiLock());
++    if (!ImGui::GetCurrentContext()) return false;
++    // Never feed mouse clicks, moves, wheel, or WM_SETCURSOR to ImGui while the overlay is closed:
++    // ImGui_ImplWin32_WndProcHandler calls ::SetCapture/::ReleaseCapture on button down/up,
++    // and ::ReleaseCapture unconditionally clears Win32 ClipCursor across multi-monitor setups.
++    if (IsMouseOrCursorMsg(msg)) {
++        const ImGuiConfigFlags flags = ImGui::GetIO().ConfigFlags;
++        if ((flags & (ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoMouseCursorChange)) != 0) {
++            return false;
++        }
++    }
++    return ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp) != 0;
++}
++
  LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 -    {
 -        std::lock_guard lock(UiLock());
 -        if (ImGui::GetCurrentContext() && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return 1;
-+    // Handle GUI-thread cursor sync & WM_SETCURSOR BEFORE ImGui or DefWindowProcW can restore IDC_ARROW.
-+    if (msg == kSyncCursor || (msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT)) {
++    if (msg == kSyncCursor) {
 +        if (intptr_t result = 0; kGame.message && kGame.message(hwnd, msg, wp, lp, &result)) return result;
++        return 0;
 +    }
-+    // Always deliver raw input, mouse, and keyboard messages to kGame.message BEFORE ImGui so the
-+    // game input layer never drops events when the F1 overlay is closed (kGame.message returns false
-+    // for non-consumed events so ImGui still receives them cleanly when the overlay is open).
-+    if (msg == WM_INPUT || msg == WM_MOUSEMOVE || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
-+        msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP || msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP ||
-+        msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP || msg == WM_MOUSEWHEEL || msg == WM_KEYDOWN ||
-+        msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) {
++    // Always deliver raw input, mouse, cursor, and keyboard messages to kGame.message BEFORE ImGui so
++    // WM_SETCURSOR (all hit-test codes) and game input never drop events or fight ImGui capture.
++    if (msg == WM_INPUT) {
 +        if (intptr_t result = 0; kGame.message && kGame.message(hwnd, msg, wp, lp, &result)) return result;
-+        {
-+            std::lock_guard lock(UiLock());
-+            if (ImGui::GetCurrentContext() && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return 1;
-+        }
++    } else if (IsMouseOrCursorMsg(msg) || msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN ||
++               msg == WM_SYSKEYUP) {
++        if (intptr_t result = 0; kGame.message && kGame.message(hwnd, msg, wp, lp, &result)) return result;
++        if (ForwardToImGui(hwnd, msg, wp, lp)) return 1;
 +    } else {
-+        {
-+            std::lock_guard lock(UiLock());
-+            if (ImGui::GetCurrentContext() && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return 1;
-+        }
++        if (ForwardToImGui(hwnd, msg, wp, lp)) return 1;
 +        if (intptr_t result = 0; kGame.message && kGame.message(hwnd, msg, wp, lp, &result)) return result;
      }
 -    if (intptr_t result = 0; kGame.message && kGame.message(hwnd, msg, wp, lp, &result)) return result;
@@ -3007,6 +3043,11 @@ index e36f7ac..cf09379 100644
 +                InvalidateRefreshCache();
 +            }
 +            return 0;
++        case WM_MOVE:
++        case WM_SIZE:
++        case WM_DISPLAYCHANGE:
++            InvalidateRefreshCache();
++            break;
          case WM_KEYDOWN:
              if (wp == VK_F3) DumpThreads();
              return 0;
@@ -3028,7 +3069,7 @@ index e36f7ac..cf09379 100644
                      ShowWindow(hwnd, SW_MINIMIZE);
                  }
              } else if (Get().display_mode == DisplayMode::Fullscreen && Get().width && Get().height && !g_mode_changed &&
-@@ -150,6 +441,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+@@ -150,6 +481,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                  PostMessageW(hwnd, kApplyDisplay, 0, 0);
              }
              break;
@@ -3036,10 +3077,14 @@ index e36f7ac..cf09379 100644
          case kApplyDisplay:
              if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
              ApplyNow();
-@@ -160,8 +452,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+@@ -159,9 +491,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+             CloseSplash();
              if (wp) ApplyNow();
              ShowWindow(hwnd, SW_SHOW);
++            BringWindowToTop(hwnd);
              SetForegroundWindow(hwnd);
++            SetActiveWindow(hwnd);
++            SetFocus(hwnd);
 +            if (kGame.window) kGame.window(hwnd);
              return 0;
          case WM_CLOSE:
@@ -3049,7 +3094,7 @@ index e36f7ac..cf09379 100644
              DestroyWindow(hwnd);
              return 0;
          case WM_DESTROY:
-@@ -199,42 +495,178 @@ void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
+@@ -199,42 +538,182 @@ void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
  
  namespace {
  
@@ -3097,13 +3142,16 @@ index e36f7ac..cf09379 100644
 -                       EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1
 -                   ? mode.dmDisplayFrequency
 -                   : 0;
-+        uint32_t r = GetMonitorInfoW(static_cast<HMONITOR>(TargetMonitor()), &mi) &&
++        HMONITOR mon = (g_hwnd && IsWindow(g_hwnd) && IsWindowVisible(g_hwnd))
++                           ? MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST)
++                           : nullptr;
++        if (!mon) mon = static_cast<HMONITOR>(TargetMonitor());
++        uint32_t r = GetMonitorInfoW(mon, &mi) &&
 +                             EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1
 +                         ? mode.dmDisplayFrequency
 +                         : 0;
 +        rate.store(r, std::memory_order_relaxed);
-     }
--    return rate;
++    }
 +    return rate.load(std::memory_order_relaxed);
 +}
 +
@@ -3112,7 +3160,8 @@ index e36f7ac..cf09379 100644
 +    for (size_t i = 1; i < args.size(); ++i) {
 +        if (args[i] == flag) return true;
 +        if (args[i].size() > n + 1 && args[i].compare(0, n, flag) == 0 && args[i][n] == L'=') return true;
-+    }
+     }
+-    return rate;
 +    return false;
 +}
 +
@@ -3240,7 +3289,7 @@ index e36f7ac..cf09379 100644
  }
  
  }  // namespace app
-@@ -243,17 +675,33 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+@@ -243,17 +722,33 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
      SetUnhandledExceptionFilter(app::WriteCrashDump);
      std::signal(SIGABRT, [](int) { app::WriteCrashDump(nullptr); });
      timeBeginPeriod(1);
@@ -3275,7 +3324,7 @@ index e36f7ac..cf09379 100644
      app::GameFiles game;
      if (!app::FindGame(game)) return 1;
      if (!app::PrepareGameCode(game)) return 1;
-@@ -265,6 +713,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+@@ -265,6 +760,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
      wc.lpfnWndProc = app::WndProc;
      wc.hInstance = inst;
      wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
@@ -3283,7 +3332,7 @@ index e36f7ac..cf09379 100644
      wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
      wc.lpszClassName = app::kGame.name;
      RegisterClassExW(&wc);
-@@ -276,13 +725,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+@@ -276,13 +772,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
      } else if (!splash) {
          app::ApplyNow();
          ShowWindow(app::g_hwnd, SW_SHOW);
@@ -3296,11 +3345,12 @@ index e36f7ac..cf09379 100644
      io.IniFilename = nullptr;
 -    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
 +    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad |
-+                      ImGuiConfigFlags_NoMouseCursorChange;
++                      ImGuiConfigFlags_NoMouseCursorChange | ImGuiConfigFlags_NoMouse;
++    io.MouseDrawCursor = false;
      ImGui_ImplWin32_Init(app::g_hwnd);
  
      input::Init();
-@@ -296,12 +747,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+@@ -296,12 +795,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
          return 1;
      }
  
@@ -3325,10 +3375,10 @@ index e36f7ac..cf09379 100644
  }
 diff --git a/runtime/app/main_linux.cpp b/runtime/app/main_linux.cpp
 new file mode 100644
-index 0000000..d585d56
+index 0000000..3ab6238
 --- /dev/null
 +++ b/runtime/app/main_linux.cpp
-@@ -0,0 +1,1061 @@
+@@ -0,0 +1,1081 @@
 +// Native Linux SDL3 host: window, event loop, POSIX crash handler, pacing, and early CLI utilities.
 +// Mirrors runtime/app/main.cpp while keeping app.h and main.cpp 100% untouched.
 +#ifndef _WIN32
@@ -3948,7 +3998,11 @@ index 0000000..d585d56
 +        next_ms.store(now_ms + 1000, std::memory_order_relaxed);
 +        uint32_t r = 60;
 +        if (SDL_WasInit(SDL_INIT_VIDEO)) {
-+            SDL_DisplayID did = ResolveTargetDisplay();
++            SDL_DisplayID did = 0;
++            if (g_window && (SDL_GetWindowFlags(g_window) & SDL_WINDOW_HIDDEN) == 0) {
++                did = SDL_GetDisplayForWindow(g_window);
++            }
++            if (!did) did = ResolveTargetDisplay();
 +            if (did) {
 +                const SDL_DisplayMode* dm = SDL_GetCurrentDisplayMode(did);
 +                if (!dm || dm->refresh_rate <= 1.0f) dm = SDL_GetDesktopDisplayMode(did);
@@ -4260,7 +4314,8 @@ index 0000000..d585d56
 +    ImGuiIO& io = ImGui::GetIO();
 +    io.IniFilename = nullptr;
 +    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad |
-+                      ImGuiConfigFlags_NoMouseCursorChange;
++                      ImGuiConfigFlags_NoMouseCursorChange | ImGuiConfigFlags_NoMouse;
++    io.MouseDrawCursor = false;
 +    ImGui_ImplSDL3_InitForVulkan(app::g_window);
 +    // Keep gamepad polling strictly in core/input.cpp + FeedPadToImGui to prevent duplicate SDL_Gamepad opens.
 +    ImGui_ImplSDL3_SetGamepadMode(ImGui_ImplSDL3_GamepadMode_Manual, nullptr, 0);
@@ -4316,35 +4371,6 @@ index 0000000..d585d56
 +                            (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && game_win_id != 0 &&
 +                             ev.window.windowID == game_win_id);
 +
-+            // Feed ImGui on the main thread under UiLock(), skipping pointer/key events while relative mouse capture is active.
-+            bool is_window_ev = (ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST);
-+            bool rel_mouse = app::g_window && SDL_GetWindowRelativeMouseMode(app::g_window);
-+            if (!rel_mouse || is_window_ev) {
-+                SDL_Event scaled_ev = ev;
-+                if (app::g_window && (scaled_ev.type == SDL_EVENT_MOUSE_MOTION ||
-+                                      scaled_ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
-+                                      scaled_ev.type == SDL_EVENT_MOUSE_BUTTON_UP)) {
-+                    int lw = 0, lh = 0, pw = 0, ph = 0;
-+                    SDL_GetWindowSize(app::g_window, &lw, &lh);
-+                    SDL_GetWindowSizeInPixels(app::g_window, &pw, &ph);
-+                    if (lw > 0 && lh > 0 && pw > 0 && ph > 0 && (lw != pw || lh != ph)) {
-+                        float sx = float(pw) / float(lw);
-+                        float sy = float(ph) / float(lh);
-+                        if (scaled_ev.type == SDL_EVENT_MOUSE_MOTION) {
-+                            scaled_ev.motion.x *= sx;
-+                            scaled_ev.motion.y *= sy;
-+                        } else {
-+                            scaled_ev.button.x *= sx;
-+                            scaled_ev.button.y *= sy;
-+                        }
-+                    }
-+                }
-+                std::lock_guard<std::recursive_mutex> lock(app::UiLock());
-+                if (ImGui::GetCurrentContext()) {
-+                    ImGui_ImplSDL3_ProcessEvent(&scaled_ev);
-+                }
-+            }
-+
 +            uintptr_t wp = (ev.type == SDL_EVENT_USER) ? static_cast<uintptr_t>(ev.user.code) : 0;
 +            intptr_t result = 0;
 +            bool handled = app::kGame.message &&
@@ -4353,6 +4379,45 @@ index 0000000..d585d56
 +            if (is_close) {
 +                quit = true;
 +                break;
++            }
++
++            // Feed ImGui on the main thread under UiLock(), strictly gating mouse events while the
++            // F1 overlay is closed (ImGuiConfigFlags_NoMouse / NoMouseCursorChange) or relative mode is active.
++            if (!handled) {
++                const bool is_window_ev = (ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST);
++                const bool is_mouse_ev = (ev.type == SDL_EVENT_MOUSE_MOTION || ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
++                                          ev.type == SDL_EVENT_MOUSE_BUTTON_UP || ev.type == SDL_EVENT_MOUSE_WHEEL);
++                const bool rel_mouse = app::g_window && SDL_GetWindowRelativeMouseMode(app::g_window);
++                if (!rel_mouse || is_window_ev) {
++                    std::lock_guard<std::recursive_mutex> lock(app::UiLock());
++                    if (ImGui::GetCurrentContext()) {
++                        const ImGuiConfigFlags flags = ImGui::GetIO().ConfigFlags;
++                        const bool overlay_mouse_enabled =
++                            (flags & (ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoMouseCursorChange)) == 0;
++                        if (!is_mouse_ev || overlay_mouse_enabled) {
++                            SDL_Event scaled_ev = ev;
++                            if (app::g_window && (scaled_ev.type == SDL_EVENT_MOUSE_MOTION ||
++                                                  scaled_ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
++                                                  scaled_ev.type == SDL_EVENT_MOUSE_BUTTON_UP)) {
++                                int lw = 0, lh = 0, pw = 0, ph = 0;
++                                SDL_GetWindowSize(app::g_window, &lw, &lh);
++                                SDL_GetWindowSizeInPixels(app::g_window, &pw, &ph);
++                                if (lw > 0 && lh > 0 && pw > 0 && ph > 0 && (lw != pw || lh != ph)) {
++                                    float sx = float(pw) / float(lw);
++                                    float sy = float(ph) / float(lh);
++                                    if (scaled_ev.type == SDL_EVENT_MOUSE_MOTION) {
++                                        scaled_ev.motion.x *= sx;
++                                        scaled_ev.motion.y *= sy;
++                                    } else {
++                                        scaled_ev.button.x *= sx;
++                                        scaled_ev.button.y *= sy;
++                                    }
++                                }
++                            }
++                            ImGui_ImplSDL3_ProcessEvent(&scaled_ev);
++                        }
++                    }
++                }
 +            }
 +            if (handled) continue;
 +
@@ -4368,6 +4433,8 @@ index 0000000..d585d56
 +                    break;
 +                case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
 +                case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
++                case SDL_EVENT_WINDOW_RESIZED:
++                case SDL_EVENT_WINDOW_MOVED:
 +                    app::InvalidateRefreshCache();
 +                    break;
 +                default:
@@ -4383,6 +4450,9 @@ index 0000000..d585d56
 +    logx::Flush();
 +    if (app::g_window) {
 +        SDL_SetWindowRelativeMouseMode(app::g_window, false);
++        SDL_SetWindowMouseGrab(app::g_window, false);
++        SDL_SetWindowMouseRect(app::g_window, nullptr);
++        SDL_ShowCursor();
 +        SDL_DestroyWindow(app::g_window);
 +        app::g_window = nullptr;
 +    }
@@ -6851,7 +6921,7 @@ index 2255f8d..2af3292 100644
  
  }  // namespace input
 diff --git a/runtime/core/log.cpp b/runtime/core/log.cpp
-index 7e6507d..3bb7c3e 100644
+index 7e6507d..6ec0f8d 100644
 --- a/runtime/core/log.cpp
 +++ b/runtime/core/log.cpp
 @@ -2,12 +2,14 @@
@@ -6869,12 +6939,21 @@ index 7e6507d..3bb7c3e 100644
  #include <vector>
  
  namespace fs = std::filesystem;
+@@ -68,7 +70,7 @@ void Write(Level lv, const char* fmt, ...) {
+     n = std::min(n, int(sizeof(line)) - 1);
+     if (g_file) {
+         std::fwrite(line, 1, size_t(n), g_file);
+-        if (lv >= Level::Warn) std::fflush(g_file);
++        if (lv == Level::Warn || lv == Level::Error) std::fflush(g_file);
+     }
+     std::fwrite(line, 1, size_t(n), stderr);
+ }
 diff --git a/runtime/core/perf.cpp b/runtime/core/perf.cpp
 new file mode 100644
-index 0000000..607d77e
+index 0000000..3e515e7
 --- /dev/null
 +++ b/runtime/core/perf.cpp
-@@ -0,0 +1,1287 @@
+@@ -0,0 +1,1295 @@
 +#include "core/perf.h"
 +
 +#ifdef _WIN32
@@ -7789,6 +7868,14 @@ index 0000000..607d77e
 +}
 +
 +void SetPhaseCallback(PhaseCallback cb) { State().phase_cb.store(cb, std::memory_order_release); }
++
++Phase CurrentPhase() {
++    if (PhaseCallback cb = State().phase_cb.load(std::memory_order_acquire)) {
++        return cb().phase;
++    }
++    return Phase::TitleMenu;
++}
++
 +void SetShaderCacheEnabled(bool enabled) { State().shader_cache_enabled = enabled; }
 +
 +void SetAdapterInfo(const char* name, uint32_t vendor_id, uint32_t device_id, bool uma, uint64_t upload_ring_cap) {
@@ -8164,10 +8251,10 @@ index 0000000..607d77e
 +}  // namespace perf
 diff --git a/runtime/core/perf.h b/runtime/core/perf.h
 new file mode 100644
-index 0000000..b01d94b
+index 0000000..702a8e1
 --- /dev/null
 +++ b/runtime/core/perf.h
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,108 @@
 +#pragma once
 +#include <atomic>
 +#include <cstdint>
@@ -8199,6 +8286,7 @@ index 0000000..b01d94b
 +void Init();
 +void Shutdown();
 +void SetPhaseCallback(PhaseCallback cb);
++Phase CurrentPhase();
 +void SetShaderCacheEnabled(bool enabled);
 +void SetAdapterInfo(const char* name, uint32_t vendor_id, uint32_t device_id, bool uma, uint64_t upload_ring_cap);
 +void RecordBootPrewarm(double ms, uint32_t psos);
@@ -8494,7 +8582,7 @@ index 2f19baa..0412523 100644
  X86_HOST_API void x86_kernel(X86Context& ctx, uint8_t* base, uint32_t ordinal);
  [[noreturn]] X86_HOST_API void x86_trap(X86Context& ctx, uint32_t va, const char* what);
 diff --git a/runtime/gpu/backend.h b/runtime/gpu/backend.h
-index 275980a..11f074f 100644
+index 275980a..dbd3e21 100644
 --- a/runtime/gpu/backend.h
 +++ b/runtime/gpu/backend.h
 @@ -1,7 +1,10 @@
@@ -8516,7 +8604,7 @@ index 275980a..11f074f 100644
      virtual void SetGamma(const uint8_t* ramp /*3 x 256*/) = 0;
      // visibility tests: draws count passing pixels while simple[kMCountEnable / 4] is set, ClearReport zeroes the
      // count, GetReport writes it to a 16 byte report once the GPU is past those draws; without them it stays pending
-@@ -69,4 +73,148 @@ inline std::atomic<uint64_t> g_perf_sync_late{0}, g_perf_sync_block{0};  // read
+@@ -69,4 +73,151 @@ inline std::atomic<uint64_t> g_perf_sync_late{0}, g_perf_sync_block{0};  // read
  // F3: save the next frame, every draw and target, under diag::CaptureDir
  inline std::atomic<bool> g_capture{false};
  
@@ -8659,6 +8747,9 @@ index 275980a..11f074f 100644
 +using CameraCallback = CameraFrameData (*)();
 +void SetCameraCallback(CameraCallback cb);
 +CameraFrameData QueryCamera();
++using UiVisibleCallback = bool (*)();
++void SetUiVisibleCallback(UiVisibleCallback cb);
++bool HasVisibleUi();
 +void SetUpscaler(Upscaler* upscaler);
 +Upscaler* GetUpscaler();
 +GpuCaps GetGpuCaps();
@@ -8666,7 +8757,7 @@ index 275980a..11f074f 100644
 +
  }  // namespace gpu
 diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
-index 9ddd87b..76833d7 100644
+index 9ddd87b..4c14217 100644
 --- a/runtime/gpu/d3d12.cpp
 +++ b/runtime/gpu/d3d12.cpp
 @@ -14,16 +14,24 @@
@@ -8802,7 +8893,17 @@ index 9ddd87b..76833d7 100644
      };
      struct Alloc {
          ID3D12Resource* res;
-@@ -566,12 +612,14 @@ private:
+@@ -555,7 +601,8 @@ private:
+     bool CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t key);
+     void UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p, const uint32_t* colours,
+                        bool same);
+-    void UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std::vector<uint8_t>& px, uint32_t pitch);
++    void UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std::vector<uint8_t>& px, uint32_t pitch,
++                            const D3D12_RESOURCE_DESC* rd_opt = nullptr);
+     void LatchPackKey(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint32_t* colours);
+     void LatchPackImage(Tex& tx);
+     void CreatePackTexture(Tex& r, const texturedumper::Image& img);
+@@ -566,12 +613,14 @@ private:
      ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
      void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
      void ExpandPoints(D3D12_GRAPHICS_PIPELINE_STATE_DESC& d, bool sprite);
@@ -8821,7 +8922,7 @@ index 9ddd87b..76833d7 100644
      void FillTextureConstants(const State& s, const DrawShaders& sh, const DrawTextures& stages, DrawConstants& c);
      void FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c);
      void CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
-@@ -584,7 +632,7 @@ private:
+@@ -584,7 +633,7 @@ private:
      void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
      uint32_t EnsureViewSet(const DrawTextures& stages);
      uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp, bool fixed);
@@ -8830,7 +8931,7 @@ index 9ddd87b..76833d7 100644
      void SetBlendFactorStencilRef(const State& s);
      void UpdateTargetUsed(uint32_t data);
      void DrawGeometry(const Assembled& a);
-@@ -603,13 +651,27 @@ private:
+@@ -603,13 +652,27 @@ private:
      // Init, in order, each callee right after its caller
      bool CreateDevice();
      bool CreateSwapChain(HWND hwnd);
@@ -8861,7 +8962,7 @@ index 9ddd87b..76833d7 100644
      // Present, in call order, each callee right after its caller; DrawFrame runs the two after it
      void FinishCapture(const Surface& front);
      void StartCapture();
-@@ -693,8 +755,64 @@ private:
+@@ -693,8 +756,64 @@ private:
      ID3D12Resource* PrepareLateSource(Target& t, Late& l);
      void RecordLateCopy(Late& l, uint32_t slot, ID3D12Resource* src);
  
@@ -8926,7 +9027,7 @@ index 9ddd87b..76833d7 100644
      ComPtr<ID3D12CommandQueue> queue_;
      ComPtr<IDXGISwapChain3> swap_;
      ComPtr<ID3D12Resource> bb_[kFrames];
-@@ -703,6 +821,12 @@ private:
+@@ -703,6 +822,12 @@ private:
      uint64_t fence_value_ = 0;
      Frame frames_[kFrames];
      uint64_t frame_ = 0;
@@ -8939,7 +9040,7 @@ index 9ddd87b..76833d7 100644
      // texture view sets made since the descriptor ring last started over, by a hash of their resources and views, to
      // their first slot; resources freed in that time go to the frame's garbage, so no other one takes their address
      std::unordered_map<uint64_t, uint32_t> view_sets_;
-@@ -767,7 +891,43 @@ private:
+@@ -767,7 +892,43 @@ private:
      uint32_t guest_h_ = 480;
      uint32_t bb_w_ = 0;
      uint32_t bb_h_ = 0;
@@ -8983,11 +9084,12 @@ index 9ddd87b..76833d7 100644
      // surfaces locked without a wait: copies in flight, the newest finished one goes to guest memory
      struct Late {
          ComPtr<ID3D12Resource> rb[kFrames];
-@@ -809,23 +969,85 @@ private:
+@@ -809,23 +970,86 @@ private:
      uint64_t fps_n_ = 0;
  };
  
 +std::atomic<CameraCallback> g_camera_cb{nullptr};
++std::atomic<UiVisibleCallback> g_ui_visible_cb{nullptr};
 +std::atomic<Upscaler*> g_upscaler{nullptr};
 +std::mutex g_caps_lock;
 +GpuCaps g_gpu_caps{};
@@ -9074,7 +9176,7 @@ index 9ddd87b..76833d7 100644
      return true;
  }
  
-@@ -835,27 +1057,198 @@ bool D3D12Backend::CreateDevice() {
+@@ -835,27 +1059,198 @@ bool D3D12Backend::CreateDevice() {
          if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
      }
      if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)))) return false;
@@ -9149,7 +9251,10 @@ index 9ddd87b..76833d7 100644
 +        } else {
 +            LOGW("d3d12: requested GPU adapter '%s' not found; falling back to auto", want.c_str());
 +        }
-+    }
+     }
+-    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_))) &&
+-        FAILED(D3D12CreateDevice((adapter = nullptr).Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_)))) {
+-        LOGE("d3d12: no device");
 +
 +    if (!dev_) {
 +        for (const Candidate& c : cands) {
@@ -9169,10 +9274,7 @@ index 9ddd87b..76833d7 100644
 +                LOGW("d3d12: using WARP software adapter (XBE_ALLOW_WARP=1)");
 +            }
 +        }
-     }
--    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_))) &&
--        FAILED(D3D12CreateDevice((adapter = nullptr).Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_)))) {
--        LOGE("d3d12: no device");
++    }
 +    if (!dev_) {
 +        LOGE("d3d12: no compatible Direct3D 12 (FL 11_0+) GPU device found");
          return false;
@@ -9283,7 +9385,7 @@ index 9ddd87b..76833d7 100644
      return true;
  }
  
-@@ -889,25 +1282,31 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
+@@ -889,25 +1284,31 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
      hd.Type = t;
      hd.NumDescriptors = n;
      hd.Flags = visible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
@@ -9320,7 +9422,7 @@ index 9ddd87b..76833d7 100644
  }
  
  bool D3D12Backend::CreateRootSignature() {
-@@ -934,34 +1333,220 @@ bool D3D12Backend::CreateRootSignature() {
+@@ -934,34 +1335,220 @@ bool D3D12Backend::CreateRootSignature() {
      ComPtr<ID3DBlob> rs;
      ComPtr<ID3DBlob> err;
      if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs, &err))) return false;
@@ -9560,7 +9662,7 @@ index 9ddd87b..76833d7 100644
      texturedumper::Update();
      ext_ = g_extension.get();
      if (ext_) {
-@@ -971,6 +1556,10 @@ void D3D12Backend::LoadSettings() {
+@@ -971,6 +1558,10 @@ void D3D12Backend::LoadSettings() {
  }
  
  void D3D12Backend::Begin() {
@@ -9571,7 +9673,7 @@ index 9ddd87b..76833d7 100644
      ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
      cl_->SetDescriptorHeaps(2, heaps);
      cl_->SetGraphicsRootSignature(root_.Get());
-@@ -991,6 +1580,7 @@ void D3D12Backend::Submit(bool wait) {
+@@ -991,6 +1582,7 @@ void D3D12Backend::Submit(bool wait) {
          WaitFence(fence_value_);
          f.alloc->Reset();
          f.garbage.clear();
@@ -9579,7 +9681,7 @@ index 9ddd87b..76833d7 100644
          f.used = 0;
          f.srv = 0;
          view_sets_.clear();
-@@ -999,6 +1589,588 @@ void D3D12Backend::Submit(bool wait) {
+@@ -999,6 +1591,605 @@ void D3D12Backend::Submit(bool wait) {
      }
  }
  
@@ -9820,7 +9922,24 @@ index 9ddd87b..76833d7 100644
 +        if (job.write_shaders) WriteAtomicFile(job.dir / "shaders.bin", job.shaders_bytes);
 +        if (job.write_pso) WriteAtomicFile(job.pso_path, job.pso_bytes);
 +        if (job.write_meta) WriteAtomicFile(job.meta_path, job.meta_bytes);
-+        if (job.write_shaders || job.write_pso || job.write_meta) perf::RecordCacheWrite(false);
++        if (job.write_shaders || job.write_pso || job.write_meta) {
++            perf::RecordCacheWrite(false);
++            uint64_t bytes = 0;
++            std::error_code sz_ec;
++            auto ssz = std::filesystem::file_size(job.dir / "shaders.bin", sz_ec);
++            if (!sz_ec) bytes += ssz;
++            sz_ec.clear();
++            auto psz = std::filesystem::file_size(PsoCachePath(), sz_ec);
++            if (!sz_ec) bytes += psz;
++            sz_ec.clear();
++            auto msz = std::filesystem::file_size(PsoMetaPath(), sz_ec);
++            if (!sz_ec) bytes += msz;
++            sz_ec.clear();
++            auto asz = std::filesystem::file_size(
++                AotStampPath("d3d12", adapter_desc_.VendorId, adapter_desc_.DeviceId), sz_ec);
++            if (!sz_ec) bytes += asz;
++            g_cache_bytes_stat.store(bytes, std::memory_order_relaxed);
++        }
 +        {
 +            std::lock_guard<std::mutex> lock(save_mtx_);
 +            save_writing_ = false;
@@ -10168,7 +10287,7 @@ index 9ddd87b..76833d7 100644
  // the GPU is idle after it: every report asked for so far is written, as a title waiting on one expects
  void D3D12Backend::Flush() {
      Submit(true);
-@@ -1029,7 +2201,7 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
+@@ -1029,7 +2220,7 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
      Frame& f = CurrentFrame();
      g_perf.upload += size;
      uint64_t o = (f.used + align - 1) & ~(align - 1);
@@ -10177,7 +10296,7 @@ index 9ddd87b..76833d7 100644
          f.used = o + size;
          return {f.upload.Get(), o, f.map + o, f.upload->GetGPUVirtualAddress() + o};
      }
-@@ -1039,12 +2211,23 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
+@@ -1039,12 +2230,23 @@ D3D12Backend::Alloc D3D12Backend::Upload(uint64_t size, uint64_t align) {
      D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
      constexpr uint64_t kOwnAlign = 0x10000;  // a committed buffer's size granularity
      D3D12_RESOURCE_DESC bd = BufferDesc((size + kOwnAlign - 1) & ~(kOwnAlign - 1));
@@ -10206,7 +10325,7 @@ index 9ddd87b..76833d7 100644
  }
  
  uint32_t D3D12Backend::AllocSrvSlots(uint32_t n) {
-@@ -1081,12 +2264,17 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator
+@@ -1081,12 +2283,17 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator
      targets_.erase(it);
  }
  
@@ -10228,7 +10347,7 @@ index 9ddd87b..76833d7 100644
      D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
      D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_UNKNOWN, t.w, t.h);
      D3D12_CLEAR_VALUE cv{};
-@@ -1212,6 +2400,10 @@ bool D3D12Backend::BindTargets(const State& s) {
+@@ -1212,6 +2419,10 @@ bool D3D12Backend::BindTargets(const State& s) {
          Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
          ds->drawn = true;
      }
@@ -10239,7 +10358,7 @@ index 9ddd87b..76833d7 100644
      if (rt != bound_rt_ || ds != bound_ds_) {
          D3D12_CPU_DESCRIPTOR_HANDLE rh = rt ? Cpu(rtv_heap_.Get(), rt->view, rtv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
          D3D12_CPU_DESCRIPTOR_HANDLE dh = ds ? Cpu(dsv_heap_.Get(), ds->view, dsv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
-@@ -1246,7 +2438,7 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthCopyPipeline() {
+@@ -1246,7 +2457,7 @@ ID3D12PipelineState* D3D12Backend::EnsureDepthCopyPipeline() {
      p.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
      p.DSVFormat = kDepthFormat;
      p.SampleDesc.Count = 1;
@@ -10248,7 +10367,7 @@ index 9ddd87b..76833d7 100644
      return pso.Get();
  }
  
-@@ -1316,10 +2508,12 @@ ComPtr<ID3D12Resource> D3D12Backend::CreatePixelTexture(const std::vector<uint8_
+@@ -1316,10 +2527,12 @@ ComPtr<ID3D12Resource> D3D12Backend::CreatePixelTexture(const std::vector<uint8_
      ComPtr<ID3D12Resource> tex;
      D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
      D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_B8G8R8A8_UNORM, w, h);
@@ -10263,7 +10382,7 @@ index 9ddd87b..76833d7 100644
      for (uint32_t y = 0; y < h; y++) std::memcpy(a.cpu + size_t(y) * row, &px[size_t(y) * pitch], w * 4);
      D3D12_TEXTURE_COPY_LOCATION dst{tex.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
      D3D12_TEXTURE_COPY_LOCATION src{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-@@ -1336,24 +2530,47 @@ void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
+@@ -1336,24 +2549,47 @@ void D3D12Backend::UploadTarget(Target& t, const Surface& s) {
      g_perf.rtups++;
      TextureDesc d;
      if (!Describe(s.header, d) || Format(d.format).depth) return;
@@ -10317,7 +10436,7 @@ index 9ddd87b..76833d7 100644
      t.epoch = DirtyEpoch(t.data);
      t.sig = MemSig(t.data, t.bytes);
  }
-@@ -1426,13 +2643,24 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
+@@ -1426,13 +2662,24 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
      uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
      hash = Hash(src.data(), src.size(), entry_seed);
      auto it = blobs_.find(hash);
@@ -10343,7 +10462,7 @@ index 9ddd87b..76833d7 100644
      if (FAILED(hr)) {
          LOGE("d3d12: %s compile failed: %s", profile, err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
          LOGE("%s", src.c_str());
-@@ -1440,6 +2668,13 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
+@@ -1440,6 +2687,13 @@ ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const
          return nullptr;
      }
      blobs_[hash] = code;
@@ -10357,7 +10476,7 @@ index 9ddd87b..76833d7 100644
      return code.Get();
  }
  
-@@ -1463,7 +2698,8 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC D3D12Backend::FullScreenPipelineDesc(ID3DBlob
+@@ -1463,7 +2717,8 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC D3D12Backend::FullScreenPipelineDesc(ID3DBlob
  }
  
  ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over) {
@@ -10367,7 +10486,7 @@ index 9ddd87b..76833d7 100644
      if (pso) return pso.Get();
      uint64_t h;
      ID3DBlob* vs = Compile(kBlitHlsl, "vs", "vs_5_0", h);
-@@ -1479,7 +2715,9 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
+@@ -1479,7 +2734,9 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
          blend.DestBlendAlpha = D3D12_BLEND_ONE;
          blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
      }
@@ -10378,7 +10497,7 @@ index 9ddd87b..76833d7 100644
      return pso.Get();
  }
  
-@@ -1488,7 +2726,8 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
+@@ -1488,7 +2745,8 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
                                                        float blend) {
      uint64_t seed = uint64_t(rtv) << 1 | (blend >= 0 ? 1 : 0);
      uint64_t source_seed = Hash(hlsl, std::strlen(hlsl), seed);
@@ -10388,7 +10507,7 @@ index 9ddd87b..76833d7 100644
      if (pso) return pso.Get();
      uint64_t h;
      ID3DBlob* vs = Compile(hlsl, "vs", "vs_5_0", h);
-@@ -1502,7 +2741,9 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
+@@ -1502,7 +2760,9 @@ ID3D12PipelineState* D3D12Backend::EnsurePassPipeline(const char* hlsl, const ch
          b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_INV_BLEND_FACTOR;
          b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
      }
@@ -10399,7 +10518,7 @@ index 9ddd87b..76833d7 100644
      return pso.Get();
  }
  
-@@ -1661,13 +2902,24 @@ float D3D12Backend::TargetScale() const {
+@@ -1661,13 +2921,24 @@ float D3D12Backend::TargetScale() const {
      return float(t->w) / float(t->gw);
  }
  
@@ -10425,14 +10544,22 @@ index 9ddd87b..76833d7 100644
  ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps) {
      uint64_t h = Hash(&k, sizeof(k));
      auto it = psos_.find(h);
-@@ -1680,11 +2932,526 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
+@@ -1680,11 +2951,534 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, ID3DBlob* vs,
      if (k.topo == uint32_t(Topology::Points)) ExpandPoints(d, k.sprite);
      ComPtr<ID3D12PipelineState> pso;
      g_perf.psos++;
 -    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) LOGE("d3d12: pipeline creation failed");
 +    wchar_t wname[32];
 +    std::swprintf(wname, 32, L"draw_%016llX", (unsigned long long)h);
++    const size_t before_creates = runtime_pso_creates_;
 +    if (!CreateOrLoadPso(wname, d, pso)) LOGE("d3d12: pipeline creation failed");
++    if (boot_init_complete_ && runtime_pso_creates_ > before_creates) {
++        LOGI("d3d12: runtime PSO miss #%zu (vs=%016llX ps=%016llX regs=0x%04X topo=%u rt=%u ds=%u "
++             "blend=%u(%X,%X,%X) wm=0x%X z=(%u,%u,%X) sten=%u(%X,%X,%X,%X,%X,%X) cull=%u ccw=%u fill=%X spr=%u)",
++             runtime_pso_creates_, (unsigned long long)k.vs, (unsigned long long)k.ps, k.regs, k.topo, k.has_rt,
++             k.has_ds, k.blend, k.src, k.dst, k.op, k.wmask, k.zen, k.zwrite, k.zfunc, k.sten, k.sfunc, k.smask,
++             k.swmask, k.sfail, k.szfail, k.spass, k.cull, k.ccw, k.fill, k.sprite);
++    }
      psos_[h] = pso;
 +    if (cache_enabled_ && pso) {
 +        std::lock_guard<std::mutex> lock(cache_lock_);
@@ -10953,7 +11080,7 @@ index 9ddd87b..76833d7 100644
  TexKind TextureKind(const TextureDesc& d) {
      if (d.cube) return kTexCube;
      if (d.depth > 1) return kTex3D;
-@@ -1709,7 +3476,9 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
+@@ -1709,7 +3503,9 @@ ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const
      info.kind = kTex2D;
      // a pass shrinking it averages each tap over a console texel, else upscaled taps skip texels and ghost
      Target* rt = FindTarget(s.rt, false);
@@ -10964,7 +11091,7 @@ index 9ddd87b..76833d7 100644
      if (!t.depth && box && k > kUpscaledMin && rt && rt != &t && (t.gw > rt->gw || t.gh > rt->gh)) {
          stages.wide[stage] = k;
          info.flags |= kTexWide;
-@@ -1732,7 +3501,7 @@ bool SameTexture(const Tex& tx, const TextureDesc& d) {
+@@ -1732,7 +3528,7 @@ bool SameTexture(const Tex& tx, const TextureDesc& d) {
  // false when the texture could not be made, its entry dropped
  bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t key) {
      g_perf.newtex++;
@@ -10973,7 +11100,7 @@ index 9ddd87b..76833d7 100644
      tx = Tex{};
      tx.d = d;
      tx.fmt = HostFormat(fi.host);
-@@ -1745,7 +3514,6 @@ bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo
+@@ -1745,7 +3541,6 @@ bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo
          h = (h + 3) & ~3u;
          tx.levels = 1;
      }
@@ -10981,7 +11108,7 @@ index 9ddd87b..76833d7 100644
      D3D12_RESOURCE_DESC td{};
      td.Dimension = d.depth > 1 ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
      td.Width = w;
-@@ -1754,6 +3522,24 @@ bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo
+@@ -1754,6 +3549,24 @@ bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo
      td.MipLevels = UINT16(tx.levels);
      td.Format = tx.fmt;
      td.SampleDesc.Count = 1;
@@ -11006,9 +11133,40 @@ index 9ddd87b..76833d7 100644
      if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                               IID_PPV_ARGS(&tx.res)))) {
          textures_.erase(key);
-@@ -1802,13 +3588,13 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
+@@ -1766,11 +3579,16 @@ void CopyLevelRows(uint8_t* out, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp, U
+                    const std::vector<uint8_t>& px, uint32_t pitch) {
+     uint32_t slices = fp.Footprint.Depth;
+     size_t src_rows = pitch ? px.size() / pitch / std::max(slices, 1u) : 0;
++    if (slices == 1 && rows <= src_rows && fp.Footprint.RowPitch == pitch && pitch <= row_size) {
++        std::memcpy(out, px.data(), size_t(rows) * pitch);
++        return;
++    }
++    const size_t copy_bytes = std::min<size_t>(pitch, size_t(row_size));
+     for (uint32_t z = 0; z < slices; z++) {
+         for (uint32_t y = 0; y < rows; y++) {
+             uint8_t* dst = out + (size_t(z) * rows + y) * fp.Footprint.RowPitch;
+             if (y < src_rows) {
+-                std::memcpy(dst, &px[(size_t(z) * src_rows + y) * pitch], std::min<size_t>(pitch, row_size));
++                std::memcpy(dst, &px[(size_t(z) * src_rows + y) * pitch], copy_bytes);
+             } else {
+                 std::memset(dst, 0, size_t(row_size));
+             }
+@@ -1779,8 +3597,8 @@ void CopyLevelRows(uint8_t* out, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp, U
+ }
+ 
+ void D3D12Backend::UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std::vector<uint8_t>& px,
+-                                      uint32_t pitch) {
+-    D3D12_RESOURCE_DESC rd = tx.res->GetDesc();
++                                      uint32_t pitch, const D3D12_RESOURCE_DESC* rd_opt) {
++    D3D12_RESOURCE_DESC rd = rd_opt ? *rd_opt : tx.res->GetDesc();
+     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+     UINT rows;
+     UINT64 row_size;
+@@ -1801,14 +3619,15 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
+                                  const uint32_t* colours, bool same) {
      D3D12_RESOURCE_STATES st = same ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_DEST;
      Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_COPY_DEST);
++    const D3D12_RESOURCE_DESC rd = tx.res->GetDesc();
      uint32_t faces = d.cube ? 6 : 1;
 -    std::vector<uint8_t> px;
      for (uint32_t f = 0; f < faces; f++) {
@@ -11020,11 +11178,32 @@ index 9ddd87b..76833d7 100644
 +            upload_px_.clear();
 +            DecodeLevel(d, l, f, p, colours, upload_px_, pitch);
 +            if (ext_) ext_->Decoded(d, fi, f, l, upload_px_, pitch, tx.flags);
-+            UploadTextureLevel(tx, f, l, upload_px_, pitch);
++            UploadTextureLevel(tx, f, l, upload_px_, pitch, &rd);
          }
      }
      Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-@@ -2065,7 +3851,8 @@ constexpr uint64_t kQuadSalt = 0xC3C30000;        // the QuadHlsl variant, apart
+@@ -1861,14 +3680,16 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const
+     uint32_t total = TotalSize(d);
+     bool same = SameTexture(tx, d);
+     if (!same && !CreateTexture(tx, d, fi, key)) return nullptr;
+-    // cheap change check once per frame: lock epochs plus a sample of the bytes
++    // cheap change check once per frame: exact full-byte hash for <= kSigWholeMax, sampled + lock epoch above
+     if (tx.frame != presents_ + 1 || !same || tx.palette != palette.hash) {
+         tx.frame = presents_ + 1;
+         tx.palette = palette.hash;
+         const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
+-        auto perf_t = PerfClock::now();
+-        uint64_t sig = MemSig(d.data, total) ^ DirtyEpoch(d.data) ^ palette.hash;
+-        g_perf.sig += PerfMs(perf_t);
++        const bool perf_on = diag::Perf() || perf::Enabled();
++        auto perf_t = perf_on ? PerfClock::now() : PerfClock::time_point{};
++        const uint64_t dirty_mix = (total > kSigWholeMax) ? DirtyEpoch(d.data) : 0ull;
++        uint64_t sig = MemSig(d.data, total) ^ dirty_mix ^ palette.hash;
++        if (perf_on) g_perf.sig += PerfMs(perf_t);
+         if (sig != tx.sig || !same) {
+             PerfScope perf_up{g_perf.texup};
+             g_perf.texups++;
+@@ -2065,7 +3886,8 @@ constexpr uint64_t kQuadSalt = 0xC3C30000;        // the QuadHlsl variant, apart
  constexpr uint64_t kSpriteSalt = 0x3C3C0000;      // the SpriteSizeHlsl variant
  
  uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
@@ -11034,7 +11213,7 @@ index 9ddd87b..76833d7 100644
      uint64_t vkey = Hash(&a.decode, 8, seed);
      if (!sh.prog && a.pretransformed) vkey ^= kPretransformedSalt;
      if (sh.quad) vkey ^= kQuadSalt;
-@@ -2100,11 +3887,20 @@ void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawSh
+@@ -2100,11 +3922,20 @@ void D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, DrawSh
      if (vit != shader_src_.end()) {
          sh.vs_code = blobs_[vit->second].Get();
          sh.vh = vit->second;
@@ -11055,7 +11234,7 @@ index 9ddd87b..76833d7 100644
  }
  
  bool D3D12Backend::BindStageTexturesAndTargets(const State& s, DrawTextures& stages) {
-@@ -2126,14 +3922,24 @@ constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
+@@ -2126,14 +3957,24 @@ constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
  // sets sh.ph and sh.ps_code, compiling the shader on a cache miss
  void D3D12Backend::EnsurePixelShader(const PixelKey& pk, DrawShaders& sh) {
      // pixel shaders share the map with vertex shaders, the salt keeps their keys apart
@@ -11082,7 +11261,7 @@ index 9ddd87b..76833d7 100644
  }
  
  void KeyBlend(const State& s, PsoKey& k) {
-@@ -2156,7 +3962,8 @@ bool OffsetsPolygons(const State& s, Topology topology) {
+@@ -2156,7 +3997,8 @@ bool OffsetsPolygons(const State& s, Topology topology) {
  
  // polygon offset slopes are per console pixel, an upscaled target's pixels are smaller
  float HostSlopeScale(const State& s, const Target* ds) {
@@ -11092,7 +11271,7 @@ index 9ddd87b..76833d7 100644
  }
  
  void D3D12Backend::KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k) {
-@@ -2270,7 +4077,10 @@ void D3D12Backend::FillTextureConstants(const State& s, const DrawShaders& sh, c
+@@ -2270,7 +4112,10 @@ void D3D12Backend::FillTextureConstants(const State& s, const DrawShaders& sh, c
      for (int i = 0; i < 4; i++) {
          TextureDesc d;
          if (s.textures[size_t(i)] && Describe(s.textures[size_t(i)], d)) FillTexelConstants(i, d, stages, c);
@@ -11104,7 +11283,7 @@ index 9ddd87b..76833d7 100644
          const auto& t = s.tss[size_t(i)];
          c.bump[i][0] = Bits(t[kTssBumpEnvMat00]);
          c.bump[i][1] = Bits(t[kTssBumpEnvMat01]);
-@@ -2452,8 +4262,8 @@ uint8_t* D3D12Backend::UploadVertexConstants(const State& s) {
+@@ -2452,8 +4297,8 @@ uint8_t* D3D12Backend::UploadVertexConstants(const State& s) {
      return vc.cpu;
  }
  
@@ -11115,7 +11294,7 @@ index 9ddd87b..76833d7 100644
      // the extension edits the uploaded copy, so its draws always get their own
      bool same = !ext_ && last_vsc_gpu_ && !std::memcmp(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc));
      uint8_t* vsc = same ? nullptr : UploadVertexConstants(s);
-@@ -2465,6 +4275,25 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
+@@ -2465,6 +4310,25 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const
      if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vsc), c.ext, bound_rt_, k.blend ? k.src : 1);
      FillDepthConstants(s, sh, k, c);
      FillTextureConstants(s, sh, stages, c);
@@ -11141,7 +11320,7 @@ index 9ddd87b..76833d7 100644
      if (sh.fixed_transform) {
          FillTransformConstants(s, size, c);
          FillLightConstants(s, sh.fk, c);
-@@ -2630,20 +4459,21 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
+@@ -2630,20 +4494,21 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
  }
  
  // viewport covers the target, the guest viewport is in the shader; scissor clips to it
@@ -11173,7 +11352,7 @@ index 9ddd87b..76833d7 100644
      }
      D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                      std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
-@@ -2827,8 +4657,6 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2827,8 +4692,6 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
      if (ext_) ext_->BeginDraw(s);
      Assembled& a = asm_;
      if (!AssembleDraw(s, prim, start, count, indices, a)) return;
@@ -11182,7 +11361,7 @@ index 9ddd87b..76833d7 100644
      if (!BindTargets(s)) return;
      if (ext_ && ext_->Bound(*this, s, bound_rt_, bound_ds_, a.pretransformed) && !BindTargets(s)) return;
  
-@@ -2861,7 +4689,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2861,7 +4724,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
      GuestExtent size;
      SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
      DrawConstants c{};
@@ -11191,7 +11370,7 @@ index 9ddd87b..76833d7 100644
      if (ext_) binds_ = {};
  
      if (cap_) {
-@@ -2872,7 +4700,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2872,7 +4735,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
  
      // texture views and samplers, viewport and scissor, blend factor and stencil reference
      SetTextureViewsAndSamplers(s, a, stages);
@@ -11200,7 +11379,7 @@ index 9ddd87b..76833d7 100644
      SetBlendFactorStencilRef(s);
  
      // geometry, counted while the title runs a visibility test
-@@ -2883,9 +4711,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
+@@ -2883,9 +4746,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
  
  // a guest rect scaled to the target and clamped to it
  D3D12_RECT ScaledRect(const Target& t, int x0, int y0, int x1, int y1) {
@@ -11214,7 +11393,7 @@ index 9ddd87b..76833d7 100644
  }
  
  // rs: the rects buffer, reused across targets
-@@ -2929,7 +4758,8 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
+@@ -2929,7 +4793,8 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
  // ClearChannels' pipeline for the target format and channel mask, kept in blit_psos_; null when it can't be made
  ID3D12PipelineState* D3D12Backend::EnsureClearPipeline(DXGI_FORMAT rtv, uint8_t mask) {
      uint64_t seed = uint64_t(rtv) << 8 | mask;
@@ -11224,7 +11403,7 @@ index 9ddd87b..76833d7 100644
      if (pso) return pso.Get();
      uint64_t h;
      ID3DBlob* vs = Compile(kClearHlsl, "vs", "vs_5_0", h);
-@@ -2937,7 +4767,9 @@ ID3D12PipelineState* D3D12Backend::EnsureClearPipeline(DXGI_FORMAT rtv, uint8_t
+@@ -2937,7 +4802,9 @@ ID3D12PipelineState* D3D12Backend::EnsureClearPipeline(DXGI_FORMAT rtv, uint8_t
      if (!vs || !ps) return nullptr;
      D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
      d.BlendState.RenderTarget[0].RenderTargetWriteMask = mask;
@@ -11235,7 +11414,7 @@ index 9ddd87b..76833d7 100644
      return pso.Get();
  }
  
-@@ -3061,8 +4893,10 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3061,8 +4928,10 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
      D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), dst_t.view, rtv_inc_);
      cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
      float gw = src_t.gw * l.kx, gh = src_t.gh * l.ky;  // the source in the guest pixels the rects use
@@ -11248,7 +11427,7 @@ index 9ddd87b..76833d7 100644
      bool listed = l.count && l.src_rects;
      uint32_t n = listed ? l.count : 1;
      for (uint32_t i = 0; i < n; i++) {
-@@ -3071,8 +4905,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3071,8 +4940,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
          DrawnRect r{.x0 = 0, .y0 = 0, .x1 = whole_w, .y1 = whole_h};
          if (listed) r = ReadDrawnRect(l.src_rects, l.dst_points, i);
          if (r.x1 <= r.x0 || r.y1 <= r.y0) continue;
@@ -11258,7 +11437,7 @@ index 9ddd87b..76833d7 100644
          LONG right = std::min(LONG(vp.TopLeftX + vp.Width), LONG(dst_t.w));
          LONG bottom = std::min(LONG(vp.TopLeftY + vp.Height), LONG(dst_t.h));
          D3D12_RECT scissor{LONG(vp.TopLeftX), LONG(vp.TopLeftY), right, bottom};
-@@ -3081,7 +4914,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
+@@ -3081,7 +4949,7 @@ void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D1
          cl_->RSSetScissorRects(1, &scissor);
          binds_ = {};
          float uv[4] = {r.x0 / gw, r.y0 / gh, (r.x1 - r.x0) / gw, (r.y1 - r.y0) / gh};
@@ -11267,7 +11446,7 @@ index 9ddd87b..76833d7 100644
          float mul = 1 / dst_t.range;
          BlitOptions o{.alpha = true, .taps = taps, .mul = mul, .rtv = dst_t.fmt};
          Blit(src_res, src_t.fmt, uv, o);
-@@ -3097,7 +4930,8 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
+@@ -3097,7 +4965,8 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
      Transition(dst_t.res.Get(), dst_t.state, D3D12_RESOURCE_STATE_COPY_DEST);
      D3D12_TEXTURE_COPY_LOCATION dl{dst_t.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
      D3D12_TEXTURE_COPY_LOCATION sl{src_res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
@@ -11277,7 +11456,7 @@ index 9ddd87b..76833d7 100644
      bool listed = l.count && l.src_rects;
      uint32_t n = listed ? l.count : 1;
      for (uint32_t i = 0; i < n; i++) {
-@@ -3106,16 +4940,16 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
+@@ -3106,16 +4975,16 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
          uint32_t dy = 0;
          if (listed) {
              GuestRect r = ReadGuestRect(l.src_rects, i);
@@ -11300,7 +11479,7 @@ index 9ddd87b..76833d7 100644
              }
          }
          if (b.right <= b.left || b.bottom <= b.top || dx >= dst_t.w || dy >= dst_t.h) continue;
-@@ -3164,20 +4998,30 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count,
+@@ -3164,20 +5033,30 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count,
  
  void D3D12Backend::ResizeSwap() {
      HWND hwnd = static_cast<HWND>(app::Window());
@@ -11335,7 +11514,23 @@ index 9ddd87b..76833d7 100644
  }
  
  void D3D12Backend::FinishCapture(const Surface& front) {
-@@ -3267,6 +5111,7 @@ void D3D12Backend::RenderUi() {
+@@ -3255,18 +5134,22 @@ void D3D12Backend::BlitFrame(Target& t) {
+ }
+ 
+ void D3D12Backend::RenderUi() {
++    if (!HasVisibleUi()) return;
+     std::lock_guard lock(app::UiLock());
+     ImGui_ImplDX12_NewFrame();
+     ImGui_ImplWin32_NewFrame();
+     ImGui::NewFrame();
+     if (app::kGame.ui) app::kGame.ui(fps_);
+     ImGui::Render();
++    ImDrawData* dd = ImGui::GetDrawData();
++    if (!dd || dd->CmdListsCount == 0) return;
+     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
+     cl_->SetDescriptorHeaps(1, uh);
+-    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_.Get());
++    ImGui_ImplDX12_RenderDrawData(dd, cl_.Get());
  }
  
  void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
@@ -11343,7 +11538,7 @@ index 9ddd87b..76833d7 100644
      D3D12_RESOURCE_STATES bs = D3D12_RESOURCE_STATE_PRESENT;
      Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
      D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), kRtvCount + bi, rtv_inc_);
-@@ -3274,20 +5119,157 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
+@@ -3274,20 +5157,159 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
      cl_->ClearRenderTargetView(rh, black, 0, nullptr);
      cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
      bound_rt_ = bound_ds_ = nullptr;
@@ -11417,17 +11612,19 @@ index 9ddd87b..76833d7 100644
 +            bs = static_cast<D3D12_RESOURCE_STATES>(bb_st);
 +            lut_state_ = static_cast<D3D12_RESOURCE_STATES>(lut_st);
 +
-+            // Restore D3D12Backend's standard heaps, root signature, RTV, and bind cache before RenderUi()
-+            Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
-+            ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
-+            cl_->SetDescriptorHeaps(2, heaps);
-+            cl_->SetGraphicsRootSignature(root_.Get());
-+            cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
-+            D3D12_VIEWPORT full_vp{0, 0, float(bb_w_), float(bb_h_), 0, 1};
-+            D3D12_RECT full_sc{0, 0, LONG(bb_w_), LONG(bb_h_)};
-+            cl_->RSSetViewports(1, &full_vp);
-+            cl_->RSSetScissorRects(1, &full_sc);
-+            binds_ = {};
++            // Restore D3D12Backend's standard heaps/RTV only if a fallback blit or visible UI follows
++            if (!upscaled || HasVisibleUi()) {
++                Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_RENDER_TARGET);
++                ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
++                cl_->SetDescriptorHeaps(2, heaps);
++                cl_->SetGraphicsRootSignature(root_.Get());
++                cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
++                D3D12_VIEWPORT full_vp{0, 0, float(bb_w_), float(bb_h_), 0, 1};
++                D3D12_RECT full_sc{0, 0, LONG(bb_w_), LONG(bb_h_)};
++                cl_->RSSetViewports(1, &full_vp);
++                cl_->RSSetScissorRects(1, &full_sc);
++                binds_ = {};
++            }
 +        }
 +        if (!upscaled) BlitFrame(*t);
 +    }
@@ -11509,17 +11706,24 @@ index 9ddd87b..76833d7 100644
              it = textures_.erase(it);
          } else {
              ++it;
-@@ -3302,11 +5284,20 @@ void D3D12Backend::ResetFrame() {
+@@ -3298,15 +5320,25 @@ void D3D12Backend::ReleaseOldTextures() {
+ void D3D12Backend::ResetFrame() {
+     Frame& f = CurrentFrame();
+     if (f.fence && fence_->GetCompletedValue() < f.fence) {
+-        auto perf_wait = PerfClock::now();
++        const bool perf_on = diag::Perf() || perf::Enabled();
++        auto perf_wait = perf_on ? PerfClock::now() : PerfClock::time_point{};
          WaitFence(f.fence);
-         g_perf.wait += PerfMs(perf_wait);
-     }
+-        g_perf.wait += PerfMs(perf_wait);
++        if (perf_on) g_perf.wait += PerfMs(perf_wait);
++    }
 +    if (f.ts_valid && ts_map_ && ts_freq_) {
 +        uint32_t slot = uint32_t(frame_ % kFrames);
 +        uint64_t t0 = ts_map_[slot * 2];
 +        uint64_t t1 = ts_map_[slot * 2 + 1];
 +        if (t1 >= t0) last_gpu_ms_ = double(t1 - t0) * 1000.0 / double(ts_freq_);
 +        f.ts_valid = false;
-+    }
+     }
      f.alloc->Reset();
      f.garbage.clear();
 +    FreeSlabGarbage(f);
@@ -11530,7 +11734,7 @@ index 9ddd87b..76833d7 100644
      Begin();
  }
  
-@@ -3352,6 +5343,7 @@ void LogPerf() {
+@@ -3352,6 +5384,7 @@ void LogPerf() {
               p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
               (unsigned long long)p.shaders, (unsigned long long)p.psos);
          g_perf = Perf{};
@@ -11538,7 +11742,7 @@ index 9ddd87b..76833d7 100644
          perf_start = PerfClock::now();
          perf_frames = 0;
      }
-@@ -3373,20 +5365,78 @@ void D3D12Backend::Present(const Surface& front) {
+@@ -3373,20 +5406,81 @@ void D3D12Backend::Present(const Surface& front) {
  
      uint32_t bi = swap_->GetCurrentBackBufferIndex();
      DrawFrame(t, bi);
@@ -11555,16 +11759,20 @@ index 9ddd87b..76833d7 100644
      present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
      DeliverReports();
 -    bool vsync = app::Get().vsync;
+-    auto perf_swap = PerfClock::now();
+-    swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+-    g_perf.swap += PerfMs(perf_swap);
+-
 +    // Smart PresentMode dispatch: integer-multiple VSync on 60/120/180/240 Hz, VRR ALLOW_TEARING / Mailbox on non-multiples
 +    const app::Settings& cfg = app::Get();
 +    const uint32_t hz = app::DisplayRefreshHz();
 +    const app::PacingPolicy pol = app::ComputePacingPolicy(hz, cfg.fps_cap, cfg.present_mode, tearing_);
 +    const UINT sync_interval = UINT(pol.sync_interval);
 +    const UINT present_flags = pol.allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
-     auto perf_swap = PerfClock::now();
--    swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
++    const bool perf_on = diag::Perf() || perf::Enabled();
++    auto perf_swap = perf_on ? PerfClock::now() : PerfClock::time_point{};
 +    HRESULT phr = swap_->Present(sync_interval, present_flags);
-     g_perf.swap += PerfMs(perf_swap);
++    if (perf_on) g_perf.swap += PerfMs(perf_swap);
 +    const bool vsync_active = pol.vsync_pacing_active && phr != DXGI_STATUS_OCCLUDED;
 +    app::SetVsyncPacingActive(vsync_active);
 +    perf::RecordPresentPacing(pol.sync_interval, vsync_active);
@@ -11572,14 +11780,16 @@ index 9ddd87b..76833d7 100644
 +        HRESULT reason = dev_ ? dev_->GetDeviceRemovedReason() : S_OK;
 +        LOG_FIRST(4, "d3d12: Present failed (hr=0x%08lX, removed=0x%08lX)", (unsigned long)phr, (unsigned long)reason);
 +    }
- 
++
 +    frame_jitter_latched_ = false;
      presents_++;
      presents_seen_.store(presents_);
      frame_++;
-+    if (cache_enabled_ && (shaders_dirty_ || pso_dirty_ || meta_dirty_) && presents_ >= cache_dirty_frame_ + 120) {
++    if (cache_enabled_ && (shaders_dirty_ || pso_dirty_ || meta_dirty_) && presents_ >= cache_dirty_frame_ + 120 &&
++        perf::CurrentPhase() != perf::Phase::GameplayActive) {
 +        SaveCaches(false);
-+        PublishCacheStats();
++        g_cache_shaders_stat.store(uint32_t(shader_cache_entries_.size()), std::memory_order_relaxed);
++        g_cache_psos_stat.store(uint32_t(psos_.size() + blit_psos_.size()), std::memory_order_relaxed);
 +    } else if ((presents_ % 60) == 0) {
 +        g_cache_shaders_stat.store(uint32_t(shader_cache_entries_.size()), std::memory_order_relaxed);
 +        g_cache_psos_stat.store(uint32_t(psos_.size() + blit_psos_.size()), std::memory_order_relaxed);
@@ -11619,7 +11829,7 @@ index 9ddd87b..76833d7 100644
      if (diag::Perf()) LogPerf();
      ApplySettings();
  }
-@@ -3398,16 +5448,46 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
+@@ -3398,16 +5492,46 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
  }
  
  void D3D12Backend::ApplySettings() {
@@ -11671,7 +11881,7 @@ index 9ddd87b..76833d7 100644
      }
  }
  
-@@ -3442,9 +5522,21 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
+@@ -3442,9 +5566,21 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
                    it->second.w, it->second.h);
      }
      Target& t = it->second;
@@ -11694,7 +11904,7 @@ index 9ddd87b..76833d7 100644
      std::vector<uint8_t> px;
      if (!ReadBack(src.res, t.gw, t.gh, px)) return;
      // color targets are 32 bit linear in guest memory, the pitch rounds to 64 bytes
-@@ -3610,23 +5702,27 @@ bool D3D12Backend::ReadBack(ID3D12Resource* res, uint32_t w, uint32_t h, std::ve
+@@ -3610,23 +5746,27 @@ bool D3D12Backend::ReadBack(ID3D12Resource* res, uint32_t w, uint32_t h, std::ve
      UINT64 row_size;
      UINT64 bytes;
      dev_->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &row_size, &bytes);
@@ -11731,7 +11941,7 @@ index 9ddd87b..76833d7 100644
      return true;
  }
  
-@@ -3704,4 +5800,53 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
+@@ -3704,4 +5844,60 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
  
  std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
  
@@ -11768,6 +11978,13 @@ index 9ddd87b..76833d7 100644
 +CameraFrameData QueryCamera() {
 +    if (CameraCallback cb = g_camera_cb.load(std::memory_order_acquire)) return cb();
 +    return {};
++}
++
++void SetUiVisibleCallback(UiVisibleCallback cb) { g_ui_visible_cb.store(cb, std::memory_order_release); }
++
++bool HasVisibleUi() {
++    if (UiVisibleCallback cb = g_ui_visible_cb.load(std::memory_order_acquire)) return cb();
++    return true;
 +}
 +
 +void SetUpscaler(Upscaler* upscaler) { g_upscaler.store(upscaler, std::memory_order_release); }
@@ -12098,10 +12315,10 @@ index fed4612..33c0bff 100644
      State state_;
 diff --git a/runtime/gpu/shader_precompile.cpp b/runtime/gpu/shader_precompile.cpp
 new file mode 100644
-index 0000000..dd0f6e5
+index 0000000..70c067b
 --- /dev/null
 +++ b/runtime/gpu/shader_precompile.cpp
-@@ -0,0 +1,1533 @@
+@@ -0,0 +1,1600 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// Ahead-of-Time (AOT) NV2A Vertex/Pixel Shader & Pipeline Pre-Compiler
 +// shared across Win64 D3D12 and Native Linux Vulkan 1.2 backends.
@@ -12990,12 +13207,18 @@ index 0000000..dd0f6e5
 +                }
 +            }
 +
-+            // 1-texture unbound fallback (tex[0].kind = kTexNone) for untextured draws using layer1/genericmesh
++            // 1-texture unbound fallback (tex[0].kind = kTexNone) for untextured draws using layer1/genericmesh/shadow
 +            if (active_stages == 1u) {
 +                TexInfo none_tex[4]{};
 +                for (uint32_t atest = 0; atest <= 1u; ++atest) {
-+                    AddPixelShader(BuildProgPixelKey(sp.def, none_tex, 0, atest));
-+                    if (is_quad_capable) AddPixelShader(BuildProgPixelKey(sp.def, none_tex, 1, atest));
++                    uint64_t h0 = AddPixelShader(BuildProgPixelKey(sp.def, none_tex, 0, atest));
++                    if (is_shadow) shadow_ps.push_back(h0);
++                    if (is_generic) generic_ps.push_back(h0);
++                    if (is_generic2d && atest == 0) generic2d_ps.push_back(h0);
++                    if (is_quad_capable) {
++                        uint64_t h1 = AddPixelShader(BuildProgPixelKey(sp.def, none_tex, 1, atest));
++                        if (is_generic2d && atest == 0) generic2d_ps.push_back(h1);
++                    }
 +                }
 +            }
 +
@@ -13011,7 +13234,7 @@ index 0000000..dd0f6e5
 +                        for (uint32_t quad = 0; quad <= 1u; ++quad) {
 +                            for (uint32_t atest = 0; atest <= 1u; ++atest) {
 +                                uint64_t h = AddPixelShader(BuildProgPixelKey(sp.def, rt_tex, quad, atest));
-+                                if (atest == 0 && rect == 0 && fl == kTexTarget) {
++                                if (atest == 0) {
 +                                    if (is_mblur) mblur_ps.push_back(h);
 +                                    if (is_sat) sat_ps.push_back(h);
 +                                    if (is_generic2d) generic2d_ps.push_back(h);
@@ -13033,7 +13256,7 @@ index 0000000..dd0f6e5
 +                        for (uint32_t quad = 0; quad <= 1u; ++quad) {
 +                            for (uint32_t atest = 0; atest <= 1u; ++atest) {
 +                                uint64_t h = AddPixelShader(BuildProgPixelKey(sp.def, dt_tex, quad, atest));
-+                                if (quad == 0 && atest == 0 && rect == 0 && fl == kTexTarget) {
++                                if (quad == 0 && atest == 0) {
 +                                    pdistort_ps.push_back(h);
 +                                }
 +                            }
@@ -13052,7 +13275,7 @@ index 0000000..dd0f6e5
 +                        for (uint32_t quad = 0; quad <= 1u; ++quad) {
 +                            uint64_t h = AddPixelShader(BuildProgPixelKey(sp.def, fg_tex, quad, 0));
 +                            AddPixelShader(BuildProgPixelKey(sp.def, fg_tex, quad, 1));
-+                            if (rect0 == 0 && fl0 == kTexTarget) fog_ps.push_back(h);
++                            fog_ps.push_back(h);
 +                        }
 +                    }
 +                }
@@ -13145,8 +13368,10 @@ index 0000000..dd0f6e5
 +        uint64_t ps_ui_mod_n = 0;
 +        uint64_t ps_ui_notex_q = 0;
 +        uint64_t ps_ui_notex_n = 0;
-+        uint64_t ps_ui_p13_mod[2][2][2] = {};  // [rect][quad][atest]
-+        uint64_t ps_ui_p13_notex[2][2] = {};   // [quad][atest]
++        uint64_t ps_ui_mod[2][2][2] = {};         // [rect][quad][atest] stage1=DISABLE
++        uint64_t ps_ui_p13_mod[2][2][2] = {};     // [rect][quad][atest] stages1..3=PassMissingTexture
++        uint64_t ps_ui_p13_mod_da[2][2][2] = {};  // [rect][quad][atest] ALPHAOP=DISABLE
++        uint64_t ps_ui_p13_notex[2][2] = {};      // [quad][atest]
 +
 +        for (uint32_t quad = 0; quad <= 1u; ++quad) {
 +            for (uint32_t atest = 0; atest <= 1u; ++atest) {
@@ -13180,6 +13405,7 @@ index 0000000..dd0f6e5
 +
 +                    uint64_t h_mod = AddPixelShader(make_ff_pk(kTopModulate, kTaTexture, kTaCurrent, kTopModulate,
 +                                                               kTaTexture, kTaCurrent, kTex2D, rect, 0, 0, quad, atest));
++                    ps_ui_mod[rect][quad][atest] = h_mod;
 +                    if (quad && !atest && !rect) ps_ui_mod_q = h_mod;
 +                    if (!quad && !atest && !rect) ps_ui_mod_n = h_mod;
 +
@@ -13187,8 +13413,9 @@ index 0000000..dd0f6e5
 +                    ps_ui_p13_mod[rect][quad][atest] = AddPixelShader(make_ff_pk(
 +                        kTopModulate, kTaTexture, kTaCurrent, kTopModulate, kTaTexture, kTaCurrent, kTex2D, rect, 0,
 +                        0, quad, atest, true));
-+                    AddPixelShader(make_ff_pk(kTopModulate, kTaTexture, kTaCurrent, kTopDisable, kTaTexture,
-+                                              kTaCurrent, kTex2D, rect, 0, 0, quad, atest, true));
++                    ps_ui_p13_mod_da[rect][quad][atest] = AddPixelShader(make_ff_pk(
++                        kTopModulate, kTaTexture, kTaCurrent, kTopDisable, kTaTexture, kTaCurrent, kTex2D, rect, 0,
++                        0, quad, atest, true));
 +
 +                    AddPixelShader(make_ff_pk(kTopModulate, kTaTexture, kTaDiffuse, kTopModulate, kTaTexture,
 +                                              kTaDiffuse, kTex2D, rect, 0, 0, quad, atest));
@@ -13258,33 +13485,60 @@ index 0000000..dd0f6e5
 +                AddPso(vs_209s_q, ps_ui_mod_q, lay_209s, bl, ds_2d_off, strip);
 +                AddPso(vs_209s_n, ps_ui_mod_n, lay_209s, bl, ds_2d_off, strip);
 +            }
-+            // Exact Psi-Ops UI / Font / Menu PSOs with stages 1..3 PassMissingTexture
++            // Exact Psi-Ops UI / Font / Menu PSOs (both stage1=DISABLE and stages 1..3 PassMissingTexture)
 +            for (int rect = 0; rect <= 1; ++rect) {
 +                for (int atest = 0; atest <= 1; ++atest) {
-+                    const uint64_t ps_n = ps_ui_p13_mod[rect][0][atest];
-+                    const uint64_t ps_q = ps_ui_p13_mod[rect][1][atest];
-+                    // Non-quad UI & Fonts (Z-test LEQUAL no-write, alpha RGBA/RGB)
-+                    for (const auto& bl : {bl_alpha_rgb, bl_alpha_rgba}) {
-+                        AddPso(vs_142_n, ps_n, lay_142, bl, ds_3d_trans, strip);
-+                        AddPso(vs_209f_n, ps_n, lay_209f, bl, ds_3d_trans, strip);
-+                        AddPso(vs_209s_n, ps_n, lay_209s, bl, ds_3d_trans, strip);
-+                        AddPso(vs_209f_n, ps_n, lay_209f, bl, ds_2d_off, strip);
-+                        AddPso(vs_209s_n, ps_n, lay_209s, bl, ds_2d_off, strip);
++                    for (int p13 = 0; p13 <= 1; ++p13) {
++                        const uint64_t ps_n = p13 ? ps_ui_p13_mod[rect][0][atest] : ps_ui_mod[rect][0][atest];
++                        const uint64_t ps_q = p13 ? ps_ui_p13_mod[rect][1][atest] : ps_ui_mod[rect][1][atest];
++                        // Non-quad UI & Fonts (Z-test LEQUAL no-write, alpha RGBA/RGB)
++                        for (const auto& bl : {bl_alpha_rgb, bl_alpha_rgba}) {
++                            AddPso(vs_142_n, ps_n, lay_142, bl, ds_3d_trans, strip);
++                            AddPso(vs_209f_n, ps_n, lay_209f, bl, ds_3d_trans, strip);
++                            AddPso(vs_209s_n, ps_n, lay_209s, bl, ds_3d_trans, strip);
++                            AddPso(vs_209f_n, ps_n, lay_209f, bl, ds_2d_off, strip);
++                            AddPso(vs_209s_n, ps_n, lay_209s, bl, ds_2d_off, strip);
++                        }
++                        // Quad UI overlays & stencil masks
++                        AddPso(vs_209f_q, ps_q, lay_209f, bl_depth_only, ds_sten_write, strip);
++                        AddPso(vs_209f_q, ps_q, lay_209f, bl_alpha_rgb, ds_2d_nods, strip);
++                        AddPso(vs_209f_q, ps_q, lay_209f, bl_alpha_rgb, ds_2d_off, strip);
++                        AddPso(vs_209f_q, ps_q, lay_209f, bl_alpha_rgb, ds_3d_trans, strip);
++                        AddPso(vs_209f_q, ps_q, lay_209f, bl_alpha_rgb, ds_sten_incr, strip);
++                        AddPso(vs_209f_q, ps_q, lay_209f, bl_alpha_rgb, ds_sten_test, strip);
++                        AddPso(vs_209s_q, ps_q, lay_209s, bl_depth_only, ds_sten_write, strip);
++                        AddPso(vs_209s_q, ps_q, lay_209s, bl_alpha_rgb, ds_2d_nods, strip);
++                        AddPso(vs_209s_q, ps_q, lay_209s, bl_alpha_rgb, ds_2d_off, strip);
++                        AddPso(vs_209s_q, ps_q, lay_209s, bl_alpha_rgb, ds_3d_trans, strip);
++                        AddPso(vs_209s_q, ps_q, lay_209s, bl_alpha_rgb, ds_sten_incr, strip);
++                        AddPso(vs_209s_q, ps_q, lay_209s, bl_alpha_rgb, ds_sten_test, strip);
 +                    }
-+                    // Quad UI overlays & stencil masks
-+                    AddPso(vs_209f_q, ps_q, lay_209f, bl_depth_only, ds_sten_write, strip);
-+                    AddPso(vs_209f_q, ps_q, lay_209f, bl_alpha_rgb, ds_2d_nods, strip);
-+                    AddPso(vs_209f_q, ps_q, lay_209f, bl_alpha_rgb, ds_2d_off, strip);
-+                    AddPso(vs_209f_q, ps_q, lay_209f, bl_alpha_rgb, ds_sten_incr, strip);
-+                    AddPso(vs_209f_q, ps_q, lay_209f, bl_alpha_rgb, ds_sten_test, strip);
-+                    AddPso(vs_209s_q, ps_q, lay_209s, bl_alpha_rgb, ds_2d_nods, strip);
-+                    AddPso(vs_209s_q, ps_q, lay_209s, bl_alpha_rgb, ds_sten_incr, strip);
++
++                    // Stage 0 MODULATE(TEX, CURRENT) + ALPHAOP=DISABLE (LEVEL97C shell/quit-to-menu & 2D UI)
++                    const uint64_t ps_da_n = ps_ui_p13_mod_da[rect][0][atest];
++                    const uint64_t ps_da_q = ps_ui_p13_mod_da[rect][1][atest];
++                    for (const auto& bl : {bl_alpha_rgb, bl_alpha_rgba, bl_opaque_rgb}) {
++                        AddPso(vs_209f_n, ps_da_n, lay_209f, bl, ds_3d_trans, strip);
++                        AddPso(vs_209s_n, ps_da_n, lay_209s, bl, ds_3d_trans, strip);
++                        AddPso(vs_209f_n, ps_da_n, lay_209f, bl, ds_2d_off, strip);
++                        AddPso(vs_209s_n, ps_da_n, lay_209s, bl, ds_2d_off, strip);
++                        AddPso(vs_209f_q, ps_da_q, lay_209f, bl, ds_3d_trans, strip);
++                        AddPso(vs_209s_q, ps_da_q, lay_209s, bl, ds_3d_trans, strip);
++                        AddPso(vs_209f_q, ps_da_q, lay_209f, bl, ds_2d_off, strip);
++                        AddPso(vs_209s_q, ps_da_q, lay_209s, bl, ds_2d_off, strip);
++                        AddPso(vs_209f_q, ps_da_q, lay_209f, bl, ds_2d_nods, strip);
++                        AddPso(vs_209s_q, ps_da_q, lay_209s, bl, ds_2d_nods, strip);
++                    }
 +                }
 +            }
 +            for (int atest = 0; atest <= 1; ++atest) {
 +                AddPso(vs_209f_q, ps_ui_p13_notex[1][atest], lay_209f, bl_depth_only, ds_sten_write, strip);
 +                AddPso(vs_209f_q, ps_ui_p13_notex[1][atest], lay_209f, bl_alpha_rgb, ds_2d_nods, strip);
++                AddPso(vs_209f_q, ps_ui_p13_notex[1][atest], lay_209f, bl_alpha_rgb, ds_2d_off, strip);
++                AddPso(vs_209f_q, ps_ui_p13_notex[1][atest], lay_209f, bl_alpha_rgb, ds_3d_trans, strip);
 +                AddPso(vs_209f_q, ps_ui_p13_notex[1][atest], lay_209f, bl_alpha_rgb, ds_sten_incr, strip);
++                AddPso(vs_209f_n, ps_ui_p13_notex[0][atest], lay_209f, bl_alpha_rgb, ds_3d_trans, strip);
++                AddPso(vs_209s_n, ps_ui_p13_notex[0][atest], lay_209s, bl_alpha_rgb, ds_3d_trans, strip);
 +            }
 +            AddPso(vs_209f_q, ps_ui_notex_q, lay_209f, bl_alpha_rgb, ds_2d_off, strip);
 +            AddPso(vs_209f_n, ps_ui_notex_n, lay_209f, bl_alpha_rgb, ds_2d_off, strip);
@@ -13310,6 +13564,9 @@ index 0000000..dd0f6e5
 +                    }
 +                    if (lps.num_tex == 1) {
 +                        AddPso(vs.hash, lps.hash, vs.layout, bl_opaque_rgb, ds_3d_opaque_sten_zero, strip);
++                        AddPso(vs.hash, lps.hash, vs.layout, bl_opaque_rgb, ds_3d_trans, strip);
++                        AddPso(vs.hash, lps.hash, vs.layout, bl_alpha_rgb, ds_3d_opaque, strip);
++                        AddPso(vs.hash, lps.hash, vs.layout, bl_alpha_rgb, ds_3d_shadow_test, strip);
 +                    }
 +                }
 +            }
@@ -13330,12 +13587,19 @@ index 0000000..dd0f6e5
 +                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_3d_trans, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_additive, ds_3d_trans, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_subtractive, ds_3d_trans, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_opaque_rgb, ds_3d_trans, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_additive, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_subtractive, ds_2d_off, strip);
 +                }
 +            }
 +            for (const auto& vs : pdistort_vs) {
 +                for (uint64_t ps : pdistort_ps) {
 +                    AddPso(vs.hash, ps, vs.layout, bl_opaque_rgb, ds_3d_trans, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_3d_trans, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_additive, ds_3d_trans, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_subtractive, ds_3d_trans, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_2d_off, strip);
 +                }
 +            }
 +
@@ -13343,31 +13607,51 @@ index 0000000..dd0f6e5
 +            for (const auto& vs : generic_vs) {
 +                for (uint64_t ps : generic_ps) {
 +                    AddPso(vs.hash, ps, vs.layout, bl_opaque_rgb, ds_3d_opaque, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_opaque_rgb, ds_3d_trans, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_3d_trans, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgba, ds_3d_trans, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_additive, ds_3d_trans, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_subtractive, ds_3d_trans, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_depth_only, ds_3d_opaque, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_additive, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_subtractive, ds_2d_off, strip);
 +                }
 +            }
 +            for (const auto& vs : generic2d_vs) {
 +                for (uint64_t ps : generic2d_ps) {
 +                    AddPso(vs.hash, ps, vs.layout, bl_opaque_rgb, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_opaque_rgb, ds_2d_nods, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgba, ds_2d_off, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_2d_nods, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_sten_test, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_additive, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_subtractive, ds_2d_off, strip);
 +                }
 +            }
 +            for (const auto& vs : mblur_vs) {
 +                for (uint64_t ps : mblur_ps) {
 +                    AddPso(vs.hash, ps, vs.layout, bl_opaque_rgb, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_opaque_rgb, ds_2d_nods, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgba, ds_2d_off, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_2d_nods, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_sten_test, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_additive, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_additive, ds_2d_nods, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_additive, ds_sten_test, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_subtractive, ds_2d_off, strip);
 +                }
 +            }
 +            for (const auto& vs : fog_vs) {
 +                for (uint64_t ps : fog_ps) {
++                    AddPso(vs.hash, ps, vs.layout, bl_opaque_rgb, ds_2d_off, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_2d_nods, strip);
 +                    AddPso(vs.hash, ps, vs.layout, bl_alpha_rgb, ds_3d_trans, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_additive, ds_2d_off, strip);
++                    AddPso(vs.hash, ps, vs.layout, bl_additive, ds_3d_trans, strip);
 +                }
 +            }
 +        }
@@ -13384,7 +13668,7 @@ index 0000000..dd0f6e5
 +
 +uint64_t ComputeAotContentSignature(const char* backend_tag) {
 +    uint64_t h = Hash(&kAotSchemaVersion, sizeof(kAotSchemaVersion));
-+    const char* sha = kImageSha1 ? kImageSha1 : "";
++    const char* sha = kImageSha1;
 +    h = Hash(sha, std::strlen(sha), h);
 +    if (backend_tag) h = Hash(backend_tag, std::strlen(backend_tag), h);
 +    uint32_t rev = g_reversed_depth ? 1u : 0u;
@@ -13637,7 +13921,7 @@ index 0000000..dd0f6e5
 +}  // namespace gpu
 diff --git a/runtime/gpu/shader_precompile.h b/runtime/gpu/shader_precompile.h
 new file mode 100644
-index 0000000..bfcfbd0
+index 0000000..5fed5b2
 --- /dev/null
 +++ b/runtime/gpu/shader_precompile.h
 @@ -0,0 +1,113 @@
@@ -13660,7 +13944,7 @@ index 0000000..bfcfbd0
 +namespace gpu {
 +
 +inline constexpr uint32_t kAotStampMagic = 0x414F5453u;  // "AOTS"
-+inline constexpr uint32_t kAotSchemaVersion = 1u;
++inline constexpr uint32_t kAotSchemaVersion = 4u;
 +
 +struct AotStamp {
 +    uint32_t magic = kAotStampMagic;
@@ -13845,7 +14129,7 @@ index cb41514..1ce6faf 100644
  
  }  // namespace gpu
 diff --git a/runtime/gpu/texture.cpp b/runtime/gpu/texture.cpp
-index c778ba0..6d98da9 100644
+index c778ba0..c68b382 100644
 --- a/runtime/gpu/texture.cpp
 +++ b/runtime/gpu/texture.cpp
 @@ -1,11 +1,14 @@
@@ -13865,7 +14149,105 @@ index c778ba0..6d98da9 100644
  
  #include "core/log.h"
  #include "kernel/kernel.h"
-@@ -255,9 +258,69 @@ float DepthTexel(uint32_t fmt, const uint8_t* p) {
+@@ -122,8 +125,11 @@ uint8_t Clamp255(int v) { return uint8_t(v < 0 ? 0 : v > 255 ? 255 : v); }
+ 
+ // one texel to B, G, R, A
+ void Texel(uint32_t fmt, const uint8_t* p, uint8_t* o) {
+-    uint16_t s16;
+-    std::memcpy(&s16, p, 2);
++    auto load16 = [p]() {
++        uint16_t v;
++        std::memcpy(&v, p, 2);
++        return v;
++    };
+     switch (fmt) {
+         case 0x00: case 0x13:
+             o[0] = o[1] = o[2] = p[0];
+@@ -140,30 +146,38 @@ void Texel(uint32_t fmt, const uint8_t* p, uint8_t* o) {
+             o[0] = o[1] = o[2] = p[0];
+             o[3] = p[1];
+             break;
+-        case 0x02: case 0x10:
++        case 0x02: case 0x10: {
++            uint16_t s16 = load16();
+             o[0] = Expand5(s16 & 31);
+             o[1] = Expand5((s16 >> 5) & 31);
+             o[2] = Expand5((s16 >> 10) & 31);
+             o[3] = (s16 & 0x8000) ? 255 : 0;
+             break;
+-        case 0x03: case 0x1C:
++        }
++        case 0x03: case 0x1C: {
++            uint16_t s16 = load16();
+             o[0] = Expand5(s16 & 31);
+             o[1] = Expand5((s16 >> 5) & 31);
+             o[2] = Expand5((s16 >> 10) & 31);
+             o[3] = 255;
+             break;
+-        case 0x04: case 0x1D:
++        }
++        case 0x04: case 0x1D: {
++            uint16_t s16 = load16();
+             o[0] = Expand4(s16 & 15);
+             o[1] = Expand4((s16 >> 4) & 15);
+             o[2] = Expand4((s16 >> 8) & 15);
+             o[3] = Expand4(s16 >> 12);
+             break;
+-        case 0x05: case 0x11:
++        }
++        case 0x05: case 0x11: {
++            uint16_t s16 = load16();
+             o[0] = Expand5(s16 & 31);
+             o[1] = Expand6((s16 >> 5) & 63);
+             o[2] = Expand5(s16 >> 11);
+             o[3] = 255;
+             break;
++        }
+         case 0x06: case 0x12:
+             std::memcpy(o, p, 4);
+             break;
+@@ -189,18 +203,22 @@ void Texel(uint32_t fmt, const uint8_t* p, uint8_t* o) {
+             o[2] = p[3];
+             o[3] = p[0];
+             break;
+-        case 0x38: case 0x3D:
++        case 0x38: case 0x3D: {
++            uint16_t s16 = load16();
+             o[3] = (s16 & 1) ? 255 : 0;
+             o[0] = Expand5((s16 >> 1) & 31);
+             o[1] = Expand5((s16 >> 6) & 31);
+             o[2] = Expand5(s16 >> 11);
+             break;
+-        case 0x39: case 0x3E:
++        }
++        case 0x39: case 0x3E: {
++            uint16_t s16 = load16();
+             o[3] = Expand4(s16 & 15);
+             o[0] = Expand4((s16 >> 4) & 15);
+             o[1] = Expand4((s16 >> 8) & 15);
+             o[2] = Expand4(s16 >> 12);
+             break;
++        }
+         case 0x28: case 0x17:  // two channels, low byte then high byte
+             o[2] = p[0];
+             o[1] = p[1];
+@@ -213,12 +231,14 @@ void Texel(uint32_t fmt, const uint8_t* p, uint8_t* o) {
+             o[0] = p[0];
+             o[3] = p[1];
+             break;
+-        case 0x27: case 0x37:
++        case 0x27: case 0x37: {
++            uint16_t s16 = load16();
+             o[2] = Expand5(s16 & 31);
+             o[1] = Expand5((s16 >> 5) & 31);
+             o[0] = Expand6(s16 >> 10);
+             o[3] = 255;
+             break;
++        }
+         case 0x32: case 0x35:
+             o[0] = o[1] = o[2] = p[1];
+             o[3] = 255;
+@@ -255,9 +275,69 @@ float DepthTexel(uint32_t fmt, const uint8_t* p) {
      }
  }
  
@@ -13938,7 +14320,7 @@ index c778ba0..6d98da9 100644
  
  }  // namespace
  
-@@ -357,31 +420,46 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
+@@ -357,46 +437,152 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
      out.resize(size_t(row_pitch) * h * z);
      uint32_t bpp = f.bits / 8;
      if (d.format == 0x24 || d.format == 0x25) {
@@ -14000,7 +14382,123 @@ index c778ba0..6d98da9 100644
      for (uint32_t x = 0; x < w; x++) xo[x] = Deposit(x, mx);
      for (uint32_t y = 0; y < h; y++) yo[y] = Deposit(y, my);
      for (uint32_t k = 0; k < z; k++) zo[k] = Deposit(k, mz);
-@@ -434,14 +512,12 @@ void SurfaceSize(const Surface& s, uint32_t& w, uint32_t& h) {
+-    for (uint32_t k = 0; k < z; k++)
+-        for (uint32_t y = 0; y < h; y++)
+-            for (uint32_t x = 0; x < w; x++) {
+-                const uint8_t* p = src + size_t(xo[x] | yo[y] | zo[k]) * bpp;
+-                uint8_t* o = &out[((size_t(k) * h + y) * w + x) * 4];
+-                if (d.format == 0x0B && palette) {
+-                    uint32_t c = palette[p[0]];
+-                    std::memcpy(o, &c, 4);
+-                } else {
+-                    Texel(d.format, p, o);
++
++    auto run_swizzled = [&](auto&& fn) {
++        const uint32_t* xp = xo.data();
++        for (uint32_t k = 0; k < z; k++) {
++            const uint32_t zk = zo[k];
++            for (uint32_t y = 0; y < h; y++) {
++                const uint32_t yz = yo[y] | zk;
++                uint8_t* row = &out[(size_t(k) * h + y) * w * 4];
++                for (uint32_t x = 0; x < w; x++) {
++                    fn(src + size_t(xp[x] | yz) * bpp, row + size_t(x) * 4);
+                 }
+             }
++        }
++    };
++
++    if (d.format == 0x0B && palette) {
++        run_swizzled([palette](const uint8_t* p, uint8_t* o) {
++            uint32_t c = palette[p[0]];
++            std::memcpy(o, &c, 4);
++        });
++        return;
++    }
++    switch (d.format) {
++        case 0x06:
++            run_swizzled([](const uint8_t* p, uint8_t* o) { std::memcpy(o, p, 4); });
++            return;
++        case 0x07:
++            run_swizzled([](const uint8_t* p, uint8_t* o) {
++                uint32_t c;
++                std::memcpy(&c, p, 4);
++                c |= 0xFF000000u;
++                std::memcpy(o, &c, 4);
++            });
++            return;
++        case 0x00:
++            run_swizzled([](const uint8_t* p, uint8_t* o) {
++                uint8_t v = p[0];
++                o[0] = o[1] = o[2] = v;
++                o[3] = 255;
++            });
++            return;
++        case 0x01:
++            run_swizzled([](const uint8_t* p, uint8_t* o) {
++                uint8_t v = p[0];
++                o[0] = o[1] = o[2] = o[3] = v;
++            });
++            return;
++        case 0x19:
++            run_swizzled([](const uint8_t* p, uint8_t* o) {
++                o[0] = o[1] = o[2] = 255;
++                o[3] = p[0];
++            });
++            return;
++        case 0x1A:
++            run_swizzled([](const uint8_t* p, uint8_t* o) {
++                o[0] = o[1] = o[2] = p[0];
++                o[3] = p[1];
++            });
++            return;
++        case 0x05:
++            run_swizzled([](const uint8_t* p, uint8_t* o) {
++                uint16_t s16;
++                std::memcpy(&s16, p, 2);
++                o[0] = Expand5(s16 & 31);
++                o[1] = Expand6((s16 >> 5) & 63);
++                o[2] = Expand5(s16 >> 11);
++                o[3] = 255;
++            });
++            return;
++        case 0x04:
++            run_swizzled([](const uint8_t* p, uint8_t* o) {
++                uint16_t s16;
++                std::memcpy(&s16, p, 2);
++                o[0] = Expand4(s16 & 15);
++                o[1] = Expand4((s16 >> 4) & 15);
++                o[2] = Expand4((s16 >> 8) & 15);
++                o[3] = Expand4(s16 >> 12);
++            });
++            return;
++        case 0x02:
++            run_swizzled([](const uint8_t* p, uint8_t* o) {
++                uint16_t s16;
++                std::memcpy(&s16, p, 2);
++                o[0] = Expand5(s16 & 31);
++                o[1] = Expand5((s16 >> 5) & 31);
++                o[2] = Expand5((s16 >> 10) & 31);
++                o[3] = (s16 & 0x8000) ? 255 : 0;
++            });
++            return;
++        case 0x03:
++            run_swizzled([](const uint8_t* p, uint8_t* o) {
++                uint16_t s16;
++                std::memcpy(&s16, p, 2);
++                o[0] = Expand5(s16 & 31);
++                o[1] = Expand5((s16 >> 5) & 31);
++                o[2] = Expand5((s16 >> 10) & 31);
++                o[3] = 255;
++            });
++            return;
++        default:
++            run_swizzled([fmt = d.format](const uint8_t* p, uint8_t* o) { Texel(fmt, p, o); });
++            return;
++    }
+ }
+ 
+ uint32_t LinearColorFormat(uint32_t f) {
+@@ -434,14 +620,12 @@ void SurfaceSize(const Surface& s, uint32_t& w, uint32_t& h) {
  void MarkDirty(uint32_t res) {
      if (!res) return;
      uint32_t data = mem::VirtualFromPhysical(kernel::R32(res + 4));
@@ -14659,10 +15157,10 @@ index 0b95c4b..affbd44 100644
      }
 diff --git a/runtime/gpu/vulkan.cpp b/runtime/gpu/vulkan.cpp
 new file mode 100644
-index 0000000..fd8b07d
+index 0000000..78f9394
 --- /dev/null
 +++ b/runtime/gpu/vulkan.cpp
-@@ -0,0 +1,7112 @@
+@@ -0,0 +1,7152 @@
 +// Native Vulkan 1.2 backend for Linux x86_64 & Steam Deck (RADV / NVIDIA / Intel ANV / Mesa llvmpipe).
 +// Implements 100% parity with d3d12.cpp: reversed-Z D32_SFLOAT_S8_UINT, SizedTargetKey Swap(2)/Swap(4),
 +// glslang HLSL->SPIR-V compiler with persistent vk_shaders.bin & vk_psos_*.bin caches, negative-height
@@ -15758,6 +16256,7 @@ index 0000000..fd8b07d
 +
 +// Global shared state (matches d3d12.cpp API surface)
 +std::atomic<CameraCallback> g_camera_cb{nullptr};
++std::atomic<UiVisibleCallback> g_ui_visible_cb{nullptr};
 +std::atomic<Upscaler*> g_upscaler{nullptr};
 +std::mutex g_caps_lock;
 +GpuCaps g_gpu_caps{};
@@ -18186,9 +18685,10 @@ index 0000000..fd8b07d
 +void VulkanBackend::ResetFrame() {
 +    Frame& f = CurrentFrame();
 +    if (f.fence && GetCompletedValue() < f.fence) {
-+        auto perf_wait = PerfClock::now();
++        const bool perf_on = diag::Perf() || perf::Enabled();
++        auto perf_wait = perf_on ? PerfClock::now() : PerfClock::time_point{};
 +        WaitTimeline(f.fence);
-+        g_perf.wait += PerfMs(perf_wait);
++        if (perf_on) g_perf.wait += PerfMs(perf_wait);
 +    }
 +    if (f.ts_valid && ts_pool_ != VK_NULL_HANDLE) {
 +        uint32_t slot = uint32_t(frame_ % kFrames);
@@ -18465,7 +18965,23 @@ index 0000000..fd8b07d
 +        if (job.write_shaders) WriteAtomicFilePosix(job.dir / "vk_shaders.bin", job.shaders_bytes);
 +        if (job.write_pso) WriteAtomicFilePosix(job.pso_path, job.pso_bytes);
 +        if (job.write_meta) WriteAtomicFilePosix(job.meta_path, job.meta_bytes);
-+        if (job.write_shaders || job.write_pso || job.write_meta) perf::RecordCacheWrite(false);
++        if (job.write_shaders || job.write_pso || job.write_meta) {
++            perf::RecordCacheWrite(false);
++            uint64_t bytes = 0;
++            std::error_code sz_ec;
++            auto ssz = std::filesystem::file_size(job.dir / "vk_shaders.bin", sz_ec);
++            if (!sz_ec) bytes += ssz;
++            sz_ec.clear();
++            auto psz = std::filesystem::file_size(PsoCachePath(), sz_ec);
++            if (!sz_ec) bytes += psz;
++            sz_ec.clear();
++            auto msz = std::filesystem::file_size(PsoMetaPath(), sz_ec);
++            if (!sz_ec) bytes += msz;
++            sz_ec.clear();
++            auto asz = std::filesystem::file_size(AotStampPath("vk", phys_props_.vendorID, phys_props_.deviceID), sz_ec);
++            if (!sz_ec) bytes += asz;
++            g_cache_bytes_stat.store(bytes, std::memory_order_relaxed);
++        }
 +        {
 +            std::lock_guard<std::mutex> lock(save_mtx_);
 +            save_writing_ = false;
@@ -18926,6 +19442,11 @@ index 0000000..fd8b07d
 +            if (is_new) {
 +                runtime_pso_creates_++;
 +                if (perf::Enabled()) perf::RecordPsoCreate(PerfMs(pt0));
++                LOGI("vulkan: runtime PSO miss #%zu (vs=%016llX ps=%016llX regs=0x%04X topo=%u strip=%u rt=%u ds=%u "
++                     "blend=%u(%X,%X,%X) wm=0x%X z=(%u,%u,%X) sten=%u(%X,%X,%X,%X,%X,%X) cull=%u ccw=%u fill=%X spr=%u)",
++                     runtime_pso_creates_, (unsigned long long)k.vs, (unsigned long long)k.ps, k.regs, k.topo, k.strip,
++                     k.has_rt, k.has_ds, k.blend, k.src, k.dst, k.op, k.wmask, k.zen, k.zwrite, k.zfunc, k.sten,
++                     k.sfunc, k.smask, k.swmask, k.sfail, k.szfail, k.spass, k.cull, k.ccw, k.fill, k.sprite);
 +            } else if (perf::Enabled()) {
 +                perf::RecordPsoCacheHit();
 +            }
@@ -20281,13 +20802,18 @@ index 0000000..fd8b07d
 +    if (a.buf == VK_NULL_HANDLE || !a.cpu) return;
 +
 +    size_t src_rows = pitch ? (px.size() / pitch / std::max(ld, 1u)) : 0;
-+    for (uint32_t z = 0; z < ld; ++z) {
-+        for (uint32_t y = 0; y < rows; ++y) {
-+            uint8_t* dst = a.cpu + (size_t(z) * rows + y) * dst_pitch;
-+            if (y < src_rows) {
-+                std::memcpy(dst, &px[(size_t(z) * src_rows + y) * pitch], std::min<size_t>(pitch, dst_pitch));
-+            } else {
-+                std::memset(dst, 0, dst_pitch);
++    if (ld == 1 && rows <= src_rows && dst_pitch == pitch) {
++        std::memcpy(a.cpu, px.data(), size_t(rows) * pitch);
++    } else {
++        const size_t copy_bytes = std::min<size_t>(pitch, dst_pitch);
++        for (uint32_t z = 0; z < ld; ++z) {
++            for (uint32_t y = 0; y < rows; ++y) {
++                uint8_t* dst = a.cpu + (size_t(z) * rows + y) * dst_pitch;
++                if (y < src_rows) {
++                    std::memcpy(dst, &px[(size_t(z) * src_rows + y) * pitch], copy_bytes);
++                } else {
++                    std::memset(dst, 0, dst_pitch);
++                }
 +            }
 +        }
 +    }
@@ -20453,9 +20979,11 @@ index 0000000..fd8b07d
 +        tx.frame = presents_ + 1;
 +        tx.palette = palette.hash;
 +        const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
-+        auto perf_t = PerfClock::now();
-+        uint64_t sig = MemSig(d.data, total) ^ DirtyEpoch(d.data) ^ palette.hash;
-+        g_perf.sig += PerfMs(perf_t);
++        const bool perf_on = diag::Perf() || perf::Enabled();
++        auto perf_t = perf_on ? PerfClock::now() : PerfClock::time_point{};
++        const uint64_t dirty_mix = (total > kSigWholeMax) ? DirtyEpoch(d.data) : 0ull;
++        uint64_t sig = MemSig(d.data, total) ^ dirty_mix ^ palette.hash;
++        if (perf_on) g_perf.sig += PerfMs(perf_t);
 +        if (sig != tx.sig || !same) {
 +            PerfScope perf_up{g_perf.texup};
 +            g_perf.texups++;
@@ -21384,7 +21912,7 @@ index 0000000..fd8b07d
 +}
 +
 +void VulkanBackend::RenderUi(uint32_t bi) {
-+    if (!imgui_inited_) return;
++    if (!imgui_inited_ || !HasVisibleUi()) return;
 +    std::lock_guard<std::recursive_mutex> lock(app::UiLock());
 +    // Render-thread-safe ImGui frame: NEVER call ImGui_ImplSDL3_NewFrame() off the main thread!
 +    ImGuiIO& io = ImGui::GetIO();
@@ -21583,7 +22111,8 @@ index 0000000..fd8b07d
 +    present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
 +    DeliverReports();
 +
-+    auto perf_swap = PerfClock::now();
++    const bool perf_on = diag::Perf() || perf::Enabled();
++    auto perf_swap = perf_on ? PerfClock::now() : PerfClock::time_point{};
 +    VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
 +    pi.waitSemaphoreCount = 1;
 +    pi.pWaitSemaphores = &render_done_sems_[bi];
@@ -21591,7 +22120,7 @@ index 0000000..fd8b07d
 +    pi.pSwapchains = &swapchain_;
 +    pi.pImageIndices = &bi;
 +    VkResult pr = vk_.queue_present(queue_, &pi);
-+    g_perf.swap += PerfMs(perf_swap);
++    if (perf_on) g_perf.swap += PerfMs(perf_swap);
 +    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) swapchain_dirty_ = true;
 +
 +    // Complete any pending backbuffer BMP capture after GPU finishes the submitted frame
@@ -21628,9 +22157,11 @@ index 0000000..fd8b07d
 +    presents_seen_.store(presents_);
 +    frame_++;
 +
-+    if (cache_enabled_ && (shaders_dirty_ || pso_dirty_ || meta_dirty_) && presents_ >= cache_dirty_frame_ + 120) {
++    if (cache_enabled_ && (shaders_dirty_ || pso_dirty_ || meta_dirty_) && presents_ >= cache_dirty_frame_ + 120 &&
++        perf::CurrentPhase() != perf::Phase::GameplayActive) {
 +        SaveCaches(false);
-+        PublishCacheStats();
++        g_cache_shaders_stat.store(uint32_t(shader_cache_entries_.size()), std::memory_order_relaxed);
++        g_cache_psos_stat.store(uint32_t(psos_.size() + blit_psos_.size()), std::memory_order_relaxed);
 +    } else if ((presents_ % 60) == 0) {
 +        g_cache_shaders_stat.store(uint32_t(shader_cache_entries_.size()), std::memory_order_relaxed);
 +        g_cache_psos_stat.store(uint32_t(psos_.size() + blit_psos_.size()), std::memory_order_relaxed);
@@ -21758,6 +22289,13 @@ index 0000000..fd8b07d
 +CameraFrameData QueryCamera() {
 +    if (CameraCallback cb = g_camera_cb.load(std::memory_order_acquire)) return cb();
 +    return {};
++}
++
++void SetUiVisibleCallback(UiVisibleCallback cb) { g_ui_visible_cb.store(cb, std::memory_order_release); }
++
++bool HasVisibleUi() {
++    if (UiVisibleCallback cb = g_ui_visible_cb.load(std::memory_order_acquire)) return cb();
++    return true;
 +}
 +
 +void SetUpscaler(Upscaler* upscaler) { g_upscaler.store(upscaler, std::memory_order_release); }
@@ -21921,7 +22459,7 @@ index cf4711d..dd17b71 100644
  }
  
 diff --git a/runtime/kernel/disc.cpp b/runtime/kernel/disc.cpp
-index 46ff931..fd2f65b 100644
+index 46ff931..130e569 100644
 --- a/runtime/kernel/disc.cpp
 +++ b/runtime/kernel/disc.cpp
 @@ -1,9 +1,19 @@
@@ -21962,17 +22500,17 @@ index 46ff931..fd2f65b 100644
  constexpr uint8_t kFolder = 0x10;
  constexpr uint32_t kMaxTable = 16 << 20;
  
-+// 32-stripe x 8-way x 64 KiB = 16 MiB sharded read-ahead cache for small/sequential XISO reads
++// 32-stripe x 16-way x 64 KiB = 32 MiB sharded read-ahead cache for small/sequential XISO reads
 +constexpr uint32_t kCacheBlockShift = 16;
 +constexpr uint32_t kCacheBlockSize = 1u << kCacheBlockShift;
 +constexpr uint32_t kCacheStripes = 32;
-+constexpr uint32_t kCacheWays = 8;
-+constexpr uint32_t kCacheBypassBytes = 256u * 1024u;
++constexpr uint32_t kCacheWays = 16;
++constexpr uint32_t kCacheBypassBytes = 512u * 1024u;
 +
  std::unique_ptr<Disc> g_mounted;
  
  bool SameName(std::string_view a, std::string_view b) {
-@@ -42,33 +66,217 @@ std::string Upper(std::string s) {
+@@ -42,33 +66,240 @@ std::string Upper(std::string s) {
      return s;
  }
  
@@ -22069,7 +22607,40 @@ index 46ff931..fd2f65b 100644
 +            perf::RecordDiscOsRead(total_got, os_ms);
 +        }
 +    } else {
-+        thread_local std::array<uint8_t, kCacheBlockSize> scratch;
++        thread_local std::array<uint8_t, kCacheBlockSize * 2u> scratch;
++        thread_local const Disc* last_disc = nullptr;
++        thread_local uint64_t last_miss_block = ~uint64_t(0);
++        if (last_disc != this) {
++            last_disc = this;
++            last_miss_block = ~uint64_t(0);
++        }
++        auto insert_block = [&](uint64_t bidx, const uint8_t* src, uint32_t got_len) {
++            if (got_len == 0) return;
++            BlockCache::Stripe& st = cache_->stripes[size_t(bidx & (kCacheStripes - 1u))];
++            std::lock_guard<std::mutex> lock(st.mtx);
++            BlockCache::Slot* target = nullptr;
++            for (BlockCache::Slot& slot : st.slots) {
++                if (slot.block_idx == bidx) {
++                    target = &slot;
++                    break;
++                }
++            }
++            if (!target) {
++                target = &st.slots[0];
++                for (BlockCache::Slot& slot : st.slots) {
++                    if (slot.block_idx == ~uint64_t(0)) {
++                        target = &slot;
++                        break;
++                    }
++                    if (slot.last_used < target->last_used) target = &slot;
++                }
++                std::memcpy(target->data, src, got_len);
++                target->block_idx = bidx;
++                target->valid_len = got_len;
++            }
++            target->last_used = ++st.clock;
++        };
++
 +        auto* dst = static_cast<uint8_t*>(out);
 +        uint64_t cur_at = at;
 +        uint32_t rem = len;
@@ -22104,42 +22675,32 @@ index 46ff931..fd2f65b 100644
 +                continue;
 +            }
 +
-+            // Perform OS I/O outside the stripe mutex so concurrent threads never block on disk reads.
++            // Perform OS I/O outside stripe mutexes; coalesce contiguous 128 KiB read-ahead on multi-block or
++            // sequential misses to cut OS read syscalls in half during .XBox/.msx/.SFD streaming.
 +            const uint64_t block_off = block_idx << kCacheBlockShift;
++            const bool seq_prefetch = (last_miss_block != ~uint64_t(0) && block_idx == last_miss_block + 1u);
++            const bool want_two = (seq_prefetch || rem > chunk) && (size_ > block_off + kCacheBlockSize);
 +            const uint32_t to_read =
-+                (size_ > block_off) ? uint32_t(std::min<uint64_t>(kCacheBlockSize, size_ - block_off)) : kCacheBlockSize;
++                want_two
++                    ? uint32_t(std::min<uint64_t>(uint64_t(kCacheBlockSize) * 2u, size_ - block_off))
++                    : ((size_ > block_off) ? uint32_t(std::min<uint64_t>(kCacheBlockSize, size_ - block_off))
++                                           : kCacheBlockSize);
 +            auto os_t0 = perf::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-+            const uint32_t got_block = ReadRawAt(block_off, scratch.data(), to_read);
++            const uint32_t got_raw = ReadRawAt(block_off, scratch.data(), to_read);
++            const uint32_t got_block = std::min<uint32_t>(got_raw, kCacheBlockSize);
 +            if (perf::Enabled()) {
 +                double os_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - os_t0).count();
 +                perf::RecordDiscCacheMiss(got_block);
-+                perf::RecordDiscOsRead(got_block, os_ms);
++                perf::RecordDiscOsRead(got_raw, os_ms);
 +            }
 +            if (got_block == 0) break;
 +
-+            {
-+                std::lock_guard<std::mutex> lock(stripe.mtx);
-+                BlockCache::Slot* target = nullptr;
-+                for (BlockCache::Slot& slot : stripe.slots) {
-+                    if (slot.block_idx == block_idx) {
-+                        target = &slot;
-+                        break;
-+                    }
-+                }
-+                if (!target) {
-+                    target = &stripe.slots[0];
-+                    for (BlockCache::Slot& slot : stripe.slots) {
-+                        if (slot.block_idx == ~uint64_t(0)) {
-+                            target = &slot;
-+                            break;
-+                        }
-+                        if (slot.last_used < target->last_used) target = &slot;
-+                    }
-+                    std::memcpy(target->data, scratch.data(), got_block);
-+                    target->block_idx = block_idx;
-+                    target->valid_len = got_block;
-+                }
-+                target->last_used = ++stripe.clock;
++            insert_block(block_idx, scratch.data(), got_block);
++            if (got_raw > kCacheBlockSize) {
++                insert_block(block_idx + 1u, scratch.data() + kCacheBlockSize, got_raw - kCacheBlockSize);
++                last_miss_block = block_idx + 1u;
++            } else {
++                last_miss_block = block_idx;
 +            }
 +
 +            if (off_in_block < got_block) {
@@ -22194,7 +22755,7 @@ index 46ff931..fd2f65b 100644
      for (uint64_t base : kPartitions) {
          uint8_t volume[kSector];
          if (ReadAt(base + kVolume, volume, kSector) != kSector || std::memcmp(volume, kMagic, kMagicSize) != 0 ||
-@@ -82,10 +290,12 @@ bool Disc::Open(const std::filesystem::path& path, std::string& error) {
+@@ -82,10 +313,12 @@ bool Disc::Open(const std::filesystem::path& path, std::string& error) {
          root_ = {{}, base + uint64_t(sector) * kSector, size, true, {}};
          if (!ReadDir(root_, 0)) {
              error = "its folders cannot be read";
@@ -23856,7 +24417,7 @@ index 3bdfad2..ed139e2 100644
  #include <cstring>
  #include <string>
 diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
-index caf6cc5..7d1f378 100644
+index caf6cc5..37dc46b 100644
 --- a/runtime/xdk/d3d8.cpp
 +++ b/runtime/xdk/d3d8.cpp
 @@ -1,5 +1,6 @@
@@ -23972,7 +24533,7 @@ index caf6cc5..7d1f378 100644
  void SyncDeferred() {
      // deferred states live in the title's memory, the inline SetRenderState and SetTextureStageState write them
      for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsComplexFirst; i++) g_state.rs[i] = R32(kRenderState + i * 4);
-@@ -278,30 +341,49 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
+@@ -278,30 +341,61 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
      if (!w) w = 640;
      if (!h) h = 480;
      uint32_t ms = R32(pp + 0x10);  // D3DMULTISAMPLE_TYPE: samples across in bits 4-7, down in bits 0-3
@@ -23983,8 +24544,20 @@ index caf6cc5..7d1f378 100644
 -         auto_depth, depth_fmt, interval, R32(pp + 0x28));
 +    g_copy_mode = (swap_effect == 3) || ((ms & 0x3000) != 0);
 +    uint32_t back_alloc = (g_copy_mode && (g_ms_x > 1 || g_ms_y > 1)) ? ((w * g_ms_x * 4 + 63) & ~63u) * (h * g_ms_y) : 0;
-+    LOGI("d3d: %s %ux%u format %X buffers %u depth %u format %X interval %X flags %X swap %u ms %X copy %u", caller, w, h,
-+         fmt, count, auto_depth, depth_fmt, interval, R32(pp + 0x28), swap_effect, ms, g_copy_mode ? 1u : 0u);
++    uint32_t flags = R32(pp + 0x28);
++    static std::array<uint32_t, 11> last_pp{};
++    static bool has_last_pp = false;
++    const std::array<uint32_t, 11> cur_pp{w, h, fmt, count, auto_depth, depth_fmt, interval, flags, swap_effect, ms,
++                                          g_copy_mode ? 1u : 0u};
++    const bool pp_changed = !has_last_pp || cur_pp != last_pp;
++    last_pp = cur_pp;
++    has_last_pp = true;
++    if (pp_changed) {
++        LOGI("d3d: %s %ux%u format %X buffers %u depth %u format %X interval %X flags %X swap %u ms %X copy %u", caller,
++             w, h, fmt, count, auto_depth, depth_fmt, interval, flags, swap_effect, ms, g_copy_mode ? 1u : 0u);
++    } else {
++        LOGD("d3d: %s %ux%u (unchanged parameters)", caller, w, h);
++    }
      uint32_t color_fmt = gpu::LinearColorFormat(fmt);
      uint32_t zf = auto_depth ? gpu::LinearDepthFormat(depth_fmt) : 0;
      // surfaces of the same shape are kept: a title wraps their memory in textures of its own across a Reset
@@ -24028,7 +24601,7 @@ index caf6cc5..7d1f378 100644
              kernel::Shutdown(1);
          }
          g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
-@@ -310,7 +392,7 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
+@@ -310,7 +404,7 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
      SetDev(kDevRenderTarget, g_buffers[1]);
      SetDev(kDevDepth, g_depth);
      SetDev(kDevBackBuffer, g_buffers[1]);
@@ -24037,7 +24610,7 @@ index caf6cc5..7d1f378 100644
      float one = 1.0f, zs = g_depth && (R32(g_depth + 12) >> 8 & 0xFF) == 0x30 ? 65535.0f : 16777215.0f;
      std::memcpy(HostPtr(kDevice + kDevSuperX), &one, 4);
      std::memcpy(HostPtr(kDevice + kDevSuperY), &one, 4);
-@@ -329,18 +411,85 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
+@@ -329,18 +423,85 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
  constexpr bool kVBlank = XDK_CDevice_VBlankCount != xdk::kUnknown && XDK_CDevice_VBlankEvent != xdk::kUnknown &&
                           XDK_CDevice_VBlankCallback != xdk::kUnknown;
  
@@ -24129,7 +24702,7 @@ index caf6cc5..7d1f378 100644
          if (uint32_t callback = Dev(XDK_CDevice_VBlankCallback)) {
              // blank count, swaps shown, 1 when this blank showed one
              W32(info, count);
-@@ -349,9 +498,12 @@ void VerticalBlank(X86Context& ctx) {
+@@ -349,9 +510,12 @@ void VerticalBlank(X86Context& ctx) {
              CallGuest(ctx, callback, {info});
          }
          shown = swaps;
@@ -24145,7 +24718,7 @@ index caf6cc5..7d1f378 100644
      }
  }
  
-@@ -359,6 +511,31 @@ void VerticalBlank(X86Context& ctx) {
+@@ -359,6 +523,31 @@ void VerticalBlank(X86Context& ctx) {
  
  gpu::State& State() { return g_state; }
  std::recursive_mutex& Lock() { return g_lock; }
@@ -24177,7 +24750,7 @@ index caf6cc5..7d1f378 100644
  
  }  // namespace d3d
  
-@@ -410,10 +587,26 @@ HLE_STDCALL(D3DDevice_Release, 0) { return 1; }
+@@ -410,10 +599,26 @@ HLE_STDCALL(D3DDevice_Release, 0) { return 1; }
  
  // synchronisation, the renderer never runs behind
  
@@ -24204,7 +24777,7 @@ index caf6cc5..7d1f378 100644
          uint32_t type = R32(res) & 0x70000;  // 0x40000 texture, 0x50000 surface
          if (type == 0x40000 || type == 0x50000) {
              uint32_t data = mem::VirtualFromPhysical(R32(res + 4));
-@@ -440,7 +633,13 @@ HLE_STDCALL(D3D_BlockOnResource, 1) {
+@@ -440,7 +645,13 @@ HLE_STDCALL(D3D_BlockOnResource, 1) {
  HLE_WRAP(Lock2DSurface, 6) {
      uint32_t res = a[0];
      if ((a[5] & 0x20) && res && g_backend) {  // D3DLOCK_NOOVERWRITE
@@ -24218,7 +24791,20 @@ index caf6cc5..7d1f378 100644
          g_backend->SyncLate(mem::VirtualFromPhysical(R32(res + 4)));
      }
  }
-@@ -508,7 +707,7 @@ HLE_STDCALL(D3D_MakeRequestedSpace, 2) {
+@@ -497,18 +708,18 @@ HLE_STDCALL(D3D_KickOffAndWaitForIdle, 0) {
+ HLE_FASTCALL(CDevice_KickOff, 0) { return 0; }
+ 
+ HLE_STDCALL(D3DDevice_MakeSpace, 0) {
+-    LOG_FIRST(16, "d3d: MakeSpace from %08X, some caller still pushes hardware commands", R32(ctx.esp));
++    LOG_FIRST(2, "d3d: MakeSpace from %08X, some caller still pushes hardware commands", R32(ctx.esp));
+     std::lock_guard<std::recursive_mutex> lock(g_lock);
+     return ScratchPush();
+ }
+ HLE_STDCALL(D3D_MakeRequestedSpace, 2) {
+-    LOG_FIRST(16, "d3d: MakeRequestedSpace from %08X", R32(ctx.esp));
++    LOG_FIRST(2, "d3d: MakeRequestedSpace from %08X", R32(ctx.esp));
+     std::lock_guard<std::recursive_mutex> lock(g_lock);
+     return ScratchPush();
  }
  
  HLE_STDCALL(D3DDevice_BlockUntilVerticalBlank, 0) {
@@ -24227,7 +24813,7 @@ index caf6cc5..7d1f378 100644
      return 0;
  }
  // (status): D3DRASTER_STATUS {InVBlank, ScanLine} on a 60 Hz frame clock. The library reads the GPU's scanline,
-@@ -624,6 +823,61 @@ std::atomic<uint32_t> g_presents{0};
+@@ -624,6 +835,61 @@ std::atomic<uint32_t> g_presents{0};
  }  // namespace
  
  HLE_STDCALL(D3DDevice_Swap, 1) {
@@ -24289,7 +24875,7 @@ index caf6cc5..7d1f378 100644
      app::SplashFirstFrame();
      // handed over from the previous instance: the window opens on the second frame, the first picture with
      // anything drawn over it right after
-@@ -634,32 +888,50 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
+@@ -634,32 +900,50 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
          }
          app::FinishHandover();
      }
@@ -24363,7 +24949,7 @@ index caf6cc5..7d1f378 100644
      return n;
  }
  
-@@ -675,6 +947,7 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
+@@ -675,6 +959,7 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
  HLE_STDCALL(D3DDevice_Reset, 1) {
      constexpr uint32_t kClearTargetAndZ = 3;
      std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -24371,6 +24957,17 @@ index caf6cc5..7d1f378 100644
      ApplyRenderTarget(ctx, g_buffers[1], g_depth);
      SetFrameBuffers("Reset", a[0]);
      if (g_backend) g_backend->Clear(g_state, 0, nullptr, kClearTargetAndZ, 0, 1.0f, 0);
+@@ -925,8 +1210,8 @@ HLE_STDCALL(D3DDevice_CreateVertexShader, 4) {
+     vs->handle = rec | 1;
+     g_vs[vs->handle] = vs;
+     W32(out, vs->handle);
+-    LOG_FIRST(64, "d3d: vertex shader %08X, %zu decl tokens, %zu instructions, type %X", vs->handle, vs->decl.size(),
+-              vs->program.size() / 4, vs->program_type);
++    LOGD("d3d: vertex shader %08X, %zu decl tokens, %zu instructions, type %X", vs->handle, vs->decl.size(),
++         vs->program.size() / 4, vs->program_type);
+     return 0;
+ }
+ 
 diff --git a/runtime/xdk/d3d8.h b/runtime/xdk/d3d8.h
 index 977d028..bf9036d 100644
 --- a/runtime/xdk/d3d8.h

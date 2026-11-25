@@ -263,6 +263,11 @@ def _analyze_run(
             f"summary={res.summary_runtime_compiles}, log={runtime_log_compiles}); expected 0."
         )
 
+    if res.summary_runtime_psos != 0:
+        res.errors.append(
+            f"Mid-gameplay PSO creations detected: summary_runtime_psos={res.summary_runtime_psos}; expected 0."
+        )
+
     if res.sync_present_cache_writes != 0:
         res.errors.append(f"Synchronous Present() cache writes detected: {res.sync_present_cache_writes} (expected 0).")
 

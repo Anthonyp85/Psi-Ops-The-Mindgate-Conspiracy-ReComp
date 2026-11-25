@@ -313,7 +313,13 @@ def run_benchmark_case(
         return res
 
     media_before = m2.snapshot_media_stats(repo_root, iso_path)
-    log_file = exe_path.parent / "logs" / "psiops.log"
+    logs_dir = exe_path.parent / "logs"
+    log_file = logs_dir / "psiops.log"
+    logs_before: dict[Path, int] = (
+        {p: p.stat().st_mtime_ns for p in logs_dir.glob("psiops*.log") if p.is_file()}
+        if logs_dir.is_dir()
+        else {}
+    )
 
     # When --resume is passed, reuse an existing clean run newer than the target binary.
     if resume and perf_json.is_file() and saved_log.is_file() and state_log.is_file():
@@ -471,8 +477,19 @@ def run_benchmark_case(
                 m2.kill_wsl_psiops(wsl_distro)
                 res.errors.append(f"{name}: leftover Linux PsiOps processes: {post_pids}.")
 
-    if log_file.is_file():
-        shutil.copy2(log_file, saved_log)
+    newest_log: Path | None = None
+    if logs_dir.is_dir():
+        changed = [
+            p for p in logs_dir.glob("psiops*.log")
+            if p.is_file() and (p not in logs_before or p.stat().st_mtime_ns != logs_before[p])
+        ]
+        if changed:
+            newest_log = max(changed, key=lambda p: p.stat().st_mtime_ns)
+    if newest_log is None and log_file.is_file():
+        newest_log = log_file
+
+    if newest_log is not None:
+        shutil.copy2(newest_log, saved_log)
         log_text = saved_log.read_text(encoding="utf-8", errors="replace")
     else:
         log_text = stdout_s + "\n" + stderr_s

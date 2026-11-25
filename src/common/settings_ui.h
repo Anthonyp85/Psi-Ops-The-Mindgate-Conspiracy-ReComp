@@ -13,6 +13,9 @@ namespace settings_ui {
 // Initializes CLI/env flags (--open-settings / XBE_OPEN_SETTINGS) and caches plugin/GPU probes.
 void Init();
 
+// Lock-free visibility query used by GPU backends to skip ImGui frame overhead when UI is closed.
+bool HasVisibleUi();
+
 // Detects gamepad BACK + L3 chord to toggle the live F1 Settings Overlay.
 void OnPadPoll(int port, const input::Pad& pad);
 

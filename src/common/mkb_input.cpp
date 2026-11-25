@@ -224,13 +224,22 @@ struct MkbState {
     std::atomic<bool> in_size_move{false};
     std::atomic<bool> overlay_open{false};
     std::atomic<bool> cursor_captured{false};
+    std::atomic<bool> cursor_should_hide{false};
     std::atomic<bool> os_cursor_locked{false};
+    std::atomic<bool> os_cursor_hidden{false};
     std::atomic<bool> os_cursor_visible{true};
+    std::atomic<bool> cursor_tick_queued{false};
+    std::atomic<bool> last_raw_was_absolute{false};
+    std::atomic<int> imgui_overlay_synced{-1};
     bool cursor_sync_initialized = false;
     bool last_requested_capture = false;
+    bool last_requested_hide = false;
     std::atomic<ActiveDevice> active_device{ActiveDevice::Mkb};
     std::atomic<perf::Phase> cur_phase{perf::Phase::TitleMenu};
     std::atomic<bool> cur_modal_ui{false};
+    std::atomic<bool> cur_non_pointer_modal{false};
+    bool non_pointer_lmb_pending = false;
+    std::atomic<bool> non_pointer_ui_confirm_pending{false};
 
     // Real OS key/button state
     std::atomic<bool> key_down[size_t(KeyCode::Count)] = {};
@@ -343,22 +352,180 @@ bool MapClientToUiSpace(float cx, float cy, float win_w, float win_h, float& out
     return true;
 }
 
-void SyncImGuiNoMouseCursorFlag(bool overlay_open) {
+void SyncImGuiMouseFlags(bool overlay_open, bool force = false) {
     // Lock ordering rule: NEVER call while holding MkbState::lock (UiLock -> MkbState::lock).
+    MkbState& st = St();
+    const int want = overlay_open ? 1 : 0;
+    if (!force && st.imgui_overlay_synced.load(std::memory_order_acquire) == want) {
+        return;
+    }
     std::lock_guard<std::recursive_mutex> ui_lk(app::UiLock());
     if (ImGui::GetCurrentContext()) {
         ImGuiIO& io = ImGui::GetIO();
+        io.MouseDrawCursor = false;
         if (overlay_open) {
-            io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
+            io.ConfigFlags &= ~(ImGuiConfigFlags_NoMouseCursorChange | ImGuiConfigFlags_NoMouse);
         } else {
-            io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+            const bool was_enabled = (io.ConfigFlags & ImGuiConfigFlags_NoMouse) == 0;
+            io.ConfigFlags |= (ImGuiConfigFlags_NoMouseCursorChange | ImGuiConfigFlags_NoMouse);
+            if (was_enabled) {
+                io.ClearInputMouse();
+            }
+        }
+        st.imgui_overlay_synced.store(want, std::memory_order_release);
+    }
+}
+
+bool IsInteractiveMenuPhase(perf::Phase phase, bool modal_ui_open, bool non_pointer_modal) {
+    if (phase == perf::Phase::TitleMenu) return true;
+    if (modal_ui_open) return true;
+    if (phase == perf::Phase::Paused && !non_pointer_modal) return true;
+    return false;
+}
+
+bool ComputeWantHideCursor(const MkbState& st) {
+    if (input_rec::ShouldBypassMkb()) return false;
+    if (!st.window_focused.load(std::memory_order_relaxed)) return false;
+    if (st.in_size_move.load(std::memory_order_relaxed)) return false;
+    if (st.overlay_open.load(std::memory_order_relaxed)) return false;
+    if (IsInteractiveMenuPhase(st.cur_phase.load(std::memory_order_relaxed),
+                               st.cur_modal_ui.load(std::memory_order_relaxed),
+                               st.cur_non_pointer_modal.load(std::memory_order_relaxed))) {
+        return false;
+    }
+    return true;
+}
+
+bool ComputeWantCursorCapture(const MkbState& st) {
+    if (!ComputeWantHideCursor(st)) return false;
+    if (st.cfg.input_mode == InputMode::Controller) return false;
+    return true;
+}
+
+#ifdef _WIN32
+// Persistent 32x32 100%-transparent BGRA + 1bpp AND-mask HCURSOR.
+// Avoids Windows 11 black cursor sprites and IddCx / SudoMaker Virtual Display Adapter
+// fallback black blocks triggered by SetCursor(nullptr).
+HCURSOR CreateTransparentBlankCursor() {
+    constexpr int kW = 32;
+    constexpr int kH = 32;
+    BITMAPV5HEADER bi{};
+    bi.bV5Size = sizeof(BITMAPV5HEADER);
+    bi.bV5Width = kW;
+    bi.bV5Height = -kH;  // top-down
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000u;
+    bi.bV5GreenMask = 0x0000FF00u;
+    bi.bV5BlueMask = 0x000000FFu;
+    bi.bV5AlphaMask = 0xFF000000u;
+
+    void* color_bits = nullptr;
+    HDC screen_dc = GetDC(nullptr);
+    HBITMAP hbm_color =
+        CreateDIBSection(screen_dc, reinterpret_cast<const BITMAPINFO*>(&bi), DIB_RGB_COLORS, &color_bits, nullptr, 0);
+    if (screen_dc) ReleaseDC(nullptr, screen_dc);
+
+    HCURSOR hcur = nullptr;
+    if (hbm_color && color_bits) {
+        std::memset(color_bits, 0, size_t(kW) * size_t(kH) * 4u);
+        uint8_t and_mask[128];
+        std::memset(and_mask, 0xFF, sizeof(and_mask));
+        HBITMAP hbm_mask = CreateBitmap(kW, kH, 1, 1, and_mask);
+        if (hbm_mask) {
+            ICONINFO ii{};
+            ii.fIcon = FALSE;
+            ii.xHotspot = kW / 2;
+            ii.yHotspot = kH / 2;
+            ii.hbmMask = hbm_mask;
+            ii.hbmColor = hbm_color;
+            hcur = CreateIconIndirect(&ii);
+            DeleteObject(hbm_mask);
+        }
+        DeleteObject(hbm_color);
+    } else if (hbm_color) {
+        DeleteObject(hbm_color);
+    }
+
+    if (!hcur) {
+        uint8_t and_bits[128];
+        uint8_t xor_bits[128];
+        std::memset(and_bits, 0xFF, sizeof(and_bits));
+        std::memset(xor_bits, 0x00, sizeof(xor_bits));
+        hcur = CreateCursor(GetModuleHandleW(nullptr), kW / 2, kH / 2, kW, kH, and_bits, xor_bits);
+    }
+    return hcur;
+}
+
+HCURSOR GetBlankCursorWin32() {
+    static HCURSOR h_blank = CreateTransparentBlankCursor();
+    return h_blank;
+}
+
+HCURSOR GetArrowCursorWin32() {
+    static HCURSOR h_arrow = LoadCursorW(nullptr, IDC_ARROW);
+    return h_arrow;
+}
+
+bool ComputeClientLockRectWin32(HWND hwnd, RECT& out_rect) {
+    RECT rc{};
+    if (!GetClientRect(hwnd, &rc) || rc.right <= rc.left || rc.bottom <= rc.top) return false;
+    POINT tl{rc.left, rc.top}, br{rc.right, rc.bottom};
+    if (!ClientToScreen(hwnd, &tl) || !ClientToScreen(hwnd, &br)) return false;
+    RECT clip{tl.x, tl.y, br.x, br.y};
+    if (HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) {
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(mon, &mi)) {
+            clip.left = std::max(clip.left, mi.rcMonitor.left);
+            clip.top = std::max(clip.top, mi.rcMonitor.top);
+            clip.right = std::min(clip.right, mi.rcMonitor.right);
+            clip.bottom = std::min(clip.bottom, mi.rcMonitor.bottom);
+        }
+    }
+    if ((clip.right - clip.left) > 8 && (clip.bottom - clip.top) > 8) {
+        clip.left += 2;
+        clip.top += 2;
+        clip.right -= 2;
+        clip.bottom -= 2;
+    }
+    if (clip.right <= clip.left || clip.bottom <= clip.top) return false;
+    out_rect = clip;
+    return true;
+}
+
+void ReassertWin32ClipAndWarpOnGuiThread(MkbState& st, HWND hwnd, bool was_locked) {
+    if (st.autotest_active.load(std::memory_order_relaxed)) return;
+    if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd)) return;
+    if (GetCapture() == hwnd) {
+        ReleaseCapture();
+    }
+    RECT lock_rect{};
+    if (!ComputeClientLockRectWin32(hwnd, lock_rect)) return;
+    RECT cur_clip{};
+    const bool clip_matches =
+        GetClipCursor(&cur_clip) && cur_clip.left == lock_rect.left && cur_clip.top == lock_rect.top &&
+        cur_clip.right == lock_rect.right && cur_clip.bottom == lock_rect.bottom;
+    if (!clip_matches) {
+        ClipCursor(&lock_rect);
+    }
+    if (!st.last_raw_was_absolute.load(std::memory_order_relaxed)) {
+        const LONG cx = (lock_rect.left + lock_rect.right) / 2;
+        const LONG cy = (lock_rect.top + lock_rect.bottom) / 2;
+        const LONG half_w = std::max<LONG>(1, (lock_rect.right - lock_rect.left) / 2);
+        const LONG half_h = std::max<LONG>(1, (lock_rect.bottom - lock_rect.top) / 2);
+        POINT pt{};
+        if (!was_locked || !GetCursorPos(&pt) || std::abs(pt.x - cx) * 4 > half_w ||
+            std::abs(pt.y - cy) * 4 > half_h) {
+            SetCursorPos(cx, cy);
         }
     }
 }
 
-#ifdef _WIN32
 bool QueryOsCursorVisibleWin32(const MkbState& st) {
     HWND hwnd = static_cast<HWND>(st.window_handle);
+    HCURSOR h_blank = GetBlankCursorWin32();
     CURSORINFO ci{};
     ci.cbSize = sizeof(ci);
     if (GetCursorInfo(&ci)) {
@@ -366,7 +533,9 @@ bool QueryOsCursorVisibleWin32(const MkbState& st) {
             HWND over = WindowFromPoint(ci.ptScreenPos);
             HWND root = over ? GetAncestor(over, GA_ROOT) : nullptr;
             if (root == hwnd) {
-                return ((ci.flags & CURSOR_SHOWING) != 0) && (ci.hCursor != nullptr);
+                if ((ci.flags & CURSOR_SHOWING) == 0) return false;
+                if (ci.hCursor == nullptr || (h_blank && ci.hCursor == h_blank)) return false;
+                return true;
             }
         }
     }
@@ -375,76 +544,152 @@ bool QueryOsCursorVisibleWin32(const MkbState& st) {
 #endif
 
 // Must ONLY run on the OS GUI / window message-loop thread!
-void ApplyOsCursorCaptureOnGuiThread(MkbState& st, void* win_ptr, bool want_capture) {
+void ApplyOsCursorCaptureOnGuiThread(MkbState& st, void* win_ptr, bool want_capture, bool want_hide, bool force) {
     if (!win_ptr) return;
+    want_hide = want_hide || want_capture;
     const bool is_autotest = st.autotest_active.load(std::memory_order_relaxed);
 #ifdef _WIN32
     HWND hwnd = static_cast<HWND>(win_ptr);
     if (!IsWindow(hwnd)) return;
+    const bool was_locked = st.os_cursor_locked.load(std::memory_order_relaxed);
+    const bool was_hidden = st.os_cursor_hidden.load(std::memory_order_relaxed);
+    HCURSOR h_blank = GetBlankCursorWin32();
+    HCURSOR h_arrow = GetArrowCursorWin32();
+
+    // 1. Multi-monitor ClipCursor lock + center-warp (only when want_capture is true)
     if (want_capture) {
-        RECT rc{};
-        if (GetClientRect(hwnd, &rc)) {
-            POINT tl{rc.left, rc.top}, br{rc.right, rc.bottom};
-            ClientToScreen(hwnd, &tl);
-            ClientToScreen(hwnd, &br);
-            RECT clip{tl.x, tl.y, br.x, br.y};
-            if (!is_autotest) {
-                ClipCursor(&clip);
-                if (!st.os_cursor_locked.load(std::memory_order_relaxed)) {
-                    SetCursorPos((clip.left + clip.right) / 2, (clip.top + clip.bottom) / 2);
-                }
-            }
-        }
-        while (ShowCursor(FALSE) >= 0) {
-        }
-        SetCursor(nullptr);
-        st.os_cursor_locked.store(true, std::memory_order_release);
-        // Query real Win32 GUI-thread cursor display counter + GetCursor() and cross-check GetCursorInfo(&ci).
-        (void)ShowCursor(FALSE);
-        int disp_cnt = ShowCursor(TRUE);
-        bool vis = (disp_cnt >= 0) && (GetCursor() != nullptr);
-        CURSORINFO ci{};
-        ci.cbSize = sizeof(ci);
-        if (GetCursorInfo(&ci)) {
-            HWND over = WindowFromPoint(ci.ptScreenPos);
-            HWND root = over ? GetAncestor(over, GA_ROOT) : nullptr;
-            if (root == hwnd) {
-                vis = ((ci.flags & CURSOR_SHOWING) != 0) && (ci.hCursor != nullptr);
-            }
-        }
-        st.os_cursor_visible.store(vis, std::memory_order_release);
-    } else {
         if (!is_autotest) {
+            ReassertWin32ClipAndWarpOnGuiThread(st, hwnd, was_locked);
+        }
+        st.os_cursor_locked.store(true, std::memory_order_release);
+    } else {
+        if (!is_autotest && (was_locked || force)) {
             ClipCursor(nullptr);
         }
-        while (ShowCursor(TRUE) < 0) {
-        }
-        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         st.os_cursor_locked.store(false, std::memory_order_release);
-        (void)ShowCursor(TRUE);
-        int disp_cnt = ShowCursor(FALSE);
-        bool vis = (disp_cnt >= 0) && (GetCursor() != nullptr);
-        CURSORINFO ci{};
-        ci.cbSize = sizeof(ci);
-        if (GetCursorInfo(&ci)) {
-            HWND over = WindowFromPoint(ci.ptScreenPos);
-            HWND root = over ? GetAncestor(over, GA_ROOT) : nullptr;
-            if (root == hwnd) {
-                vis = ((ci.flags & CURSOR_SHOWING) != 0) && (ci.hCursor != nullptr);
-            }
+    }
+
+    // 2. Class cursor override + 32x32 transparent HCURSOR + ShowCursor display count
+    if (want_hide) {
+        const LONG_PTR want_cls = reinterpret_cast<LONG_PTR>(h_blank);
+        if (GetClassLongPtrW(hwnd, GCLP_HCURSOR) != want_cls) {
+            SetClassLongPtrW(hwnd, GCLP_HCURSOR, want_cls);
         }
-        st.os_cursor_visible.store(vis, std::memory_order_release);
+        if (!was_hidden || force) {
+            while (ShowCursor(FALSE) >= 0) {
+            }
+            SetCursor(h_blank);
+            st.os_cursor_hidden.store(true, std::memory_order_release);
+
+            (void)ShowCursor(FALSE);
+            int disp_cnt = ShowCursor(TRUE);
+            HCURSOR cur_h = GetCursor();
+            bool sprite_vis = (cur_h != nullptr) && (!h_blank || cur_h != h_blank);
+            bool vis = (disp_cnt >= 0) && sprite_vis;
+            CURSORINFO ci{};
+            ci.cbSize = sizeof(ci);
+            if (GetCursorInfo(&ci)) {
+                HWND over = WindowFromPoint(ci.ptScreenPos);
+                HWND root = over ? GetAncestor(over, GA_ROOT) : nullptr;
+                if (root == hwnd) {
+                    vis = ((ci.flags & CURSOR_SHOWING) != 0) && (ci.hCursor != nullptr) &&
+                          (!h_blank || ci.hCursor != h_blank);
+                }
+            }
+            st.os_cursor_visible.store(vis, std::memory_order_release);
+        } else {
+            if (GetCursor() != h_blank) {
+                SetCursor(h_blank);
+            }
+            CURSORINFO ci{};
+            ci.cbSize = sizeof(ci);
+            bool vis = false;
+            if (GetCursorInfo(&ci)) {
+                HWND over = WindowFromPoint(ci.ptScreenPos);
+                HWND root = over ? GetAncestor(over, GA_ROOT) : nullptr;
+                if (root == hwnd && ((ci.flags & CURSOR_SHOWING) != 0) && (ci.hCursor != nullptr) &&
+                    (!h_blank || ci.hCursor != h_blank)) {
+                    while (ShowCursor(FALSE) >= 0) {
+                    }
+                    SetCursor(h_blank);
+                    if (GetCursorInfo(&ci)) {
+                        vis = ((ci.flags & CURSOR_SHOWING) != 0) && (ci.hCursor != nullptr) &&
+                              (!h_blank || ci.hCursor != h_blank);
+                    }
+                }
+            }
+            st.os_cursor_visible.store(vis, std::memory_order_release);
+        }
+    } else {
+        const LONG_PTR want_cls = reinterpret_cast<LONG_PTR>(h_arrow);
+        if (GetClassLongPtrW(hwnd, GCLP_HCURSOR) != want_cls) {
+            SetClassLongPtrW(hwnd, GCLP_HCURSOR, want_cls);
+        }
+        if (was_hidden || force || !st.os_cursor_visible.load(std::memory_order_relaxed)) {
+            while (ShowCursor(TRUE) < 0) {
+            }
+            SetCursor(h_arrow);
+            st.os_cursor_hidden.store(false, std::memory_order_release);
+
+            (void)ShowCursor(TRUE);
+            int disp_cnt = ShowCursor(FALSE);
+            HCURSOR cur_h = GetCursor();
+            bool sprite_vis = (cur_h != nullptr) && (!h_blank || cur_h != h_blank);
+            bool vis = (disp_cnt >= 0) && sprite_vis;
+            CURSORINFO ci{};
+            ci.cbSize = sizeof(ci);
+            if (GetCursorInfo(&ci)) {
+                HWND over = WindowFromPoint(ci.ptScreenPos);
+                HWND root = over ? GetAncestor(over, GA_ROOT) : nullptr;
+                if (root == hwnd) {
+                    vis = ((ci.flags & CURSOR_SHOWING) != 0) && (ci.hCursor != nullptr) &&
+                          (!h_blank || ci.hCursor != h_blank);
+                }
+            }
+            st.os_cursor_visible.store(vis, std::memory_order_release);
+        }
     }
 #else
+    (void)force;
     SDL_Window* win = static_cast<SDL_Window*>(win_ptr);
     if (want_capture) {
-        if (!is_autotest) SDL_SetWindowRelativeMouseMode(win, true);
+        if (!is_autotest) {
+            int lw = 0, lh = 0;
+            SDL_GetWindowSize(win, &lw, &lh);
+            SDL_Rect inner_rect{0, 0, lw, lh};
+            if (lw > 8 && lh > 8) {
+                inner_rect.x = 2;
+                inner_rect.y = 2;
+                inner_rect.w = lw - 4;
+                inner_rect.h = lh - 4;
+            }
+            if (inner_rect.w > 0 && inner_rect.h > 0) {
+                SDL_SetWindowMouseRect(win, &inner_rect);
+            }
+            SDL_SetWindowMouseGrab(win, true);
+            SDL_SetWindowRelativeMouseMode(win, true);
+        }
         SDL_HideCursor();
         st.os_cursor_locked.store(true, std::memory_order_release);
+        st.os_cursor_hidden.store(true, std::memory_order_release);
+    } else if (want_hide) {
+        if (!is_autotest) {
+            SDL_SetWindowRelativeMouseMode(win, false);
+            SDL_SetWindowMouseGrab(win, false);
+            SDL_SetWindowMouseRect(win, nullptr);
+        }
+        SDL_HideCursor();
+        st.os_cursor_locked.store(false, std::memory_order_release);
+        st.os_cursor_hidden.store(true, std::memory_order_release);
     } else {
-        if (!is_autotest) SDL_SetWindowRelativeMouseMode(win, false);
+        if (!is_autotest) {
+            SDL_SetWindowRelativeMouseMode(win, false);
+            SDL_SetWindowMouseGrab(win, false);
+            SDL_SetWindowMouseRect(win, nullptr);
+        }
         SDL_ShowCursor();
         st.os_cursor_locked.store(false, std::memory_order_release);
+        st.os_cursor_hidden.store(false, std::memory_order_release);
     }
     st.os_cursor_visible.store(SDL_CursorVisible(), std::memory_order_release);
 #endif
@@ -452,42 +697,52 @@ void ApplyOsCursorCaptureOnGuiThread(MkbState& st, void* win_ptr, bool want_capt
 
 // Safe to call from ANY thread (D3D12/Vulkan render thread, guest thread, or GUI thread).
 // Marshals ShowCursor/SetCursor/ClipCursor/SDL_SetWindowRelativeMouseMode strictly onto the GUI thread.
-void ApplyOsCursorCaptureLocked(MkbState& st, bool want_capture, bool force = false) {
+void ApplyOsCursorCaptureLocked(MkbState& st, bool want_capture, bool want_hide, bool force = false,
+                                bool tick = false) {
+    want_hide = want_hide || want_capture;
     st.cursor_captured.store(want_capture, std::memory_order_release);
+    st.cursor_should_hide.store(want_hide, std::memory_order_release);
     if (!st.window_handle) return;
-    if (!force && st.cursor_sync_initialized && st.last_requested_capture == want_capture) {
+    const bool changed = !st.cursor_sync_initialized || st.last_requested_capture != want_capture ||
+                         st.last_requested_hide != want_hide;
+    if (!force && !changed && !tick) {
         return;
     }
     st.cursor_sync_initialized = true;
     st.last_requested_capture = want_capture;
+    st.last_requested_hide = want_hide;
 #ifdef _WIN32
     HWND hwnd = static_cast<HWND>(st.window_handle);
     if (IsWindow(hwnd)) {
         if (GetCurrentThreadId() == GetWindowThreadProcessId(hwnd, nullptr)) {
-            ApplyOsCursorCaptureOnGuiThread(st, hwnd, want_capture);
+            ApplyOsCursorCaptureOnGuiThread(st, hwnd, want_capture, want_hide, force || changed);
         } else {
-            PostMessageW(hwnd, kWinMsgSyncCursor, want_capture ? 1u : 0u, 0);
+            const WPARAM flags = (want_capture ? 1u : 0u) | (want_hide ? 2u : 0u) | ((force || changed) ? 4u : 0u);
+            if (force || changed) {
+                st.cursor_tick_queued.store(true, std::memory_order_release);
+                PostMessageW(hwnd, kWinMsgSyncCursor, flags, 0);
+            } else if (!st.cursor_tick_queued.exchange(true, std::memory_order_acq_rel)) {
+                PostMessageW(hwnd, kWinMsgSyncCursor, flags, 0);
+            }
         }
     }
 #else
-    SDL_Event cev{};
-    cev.type = SDL_EVENT_USER;
-    cev.user.code = kSdlEvSyncCursor;
-    cev.user.data1 = want_capture ? reinterpret_cast<void*>(uintptr_t(1)) : nullptr;
-    SDL_PushEvent(&cev);
+    if (force || changed) {
+        st.cursor_tick_queued.store(true, std::memory_order_release);
+        SDL_Event cev{};
+        cev.type = SDL_EVENT_USER;
+        cev.user.code = kSdlEvSyncCursor;
+        cev.user.data1 = reinterpret_cast<void*>(
+            uintptr_t((want_capture ? 1u : 0u) | (want_hide ? 2u : 0u) | 4u));
+        SDL_PushEvent(&cev);
+    } else if (tick && !st.cursor_tick_queued.exchange(true, std::memory_order_acq_rel)) {
+        SDL_Event cev{};
+        cev.type = SDL_EVENT_USER;
+        cev.user.code = kSdlEvSyncCursor;
+        cev.user.data1 = reinterpret_cast<void*>(uintptr_t((want_capture ? 1u : 0u) | (want_hide ? 2u : 0u)));
+        SDL_PushEvent(&cev);
+    }
 #endif
-}
-
-bool ComputeWantCursorCapture(const MkbState& st) {
-    if (input_rec::ShouldBypassMkb()) return false;
-    if (st.cfg.input_mode == InputMode::Controller) return false;
-    if (st.cfg.input_mode == InputMode::Auto && st.active_device.load(std::memory_order_relaxed) != ActiveDevice::Mkb)
-        return false;
-    if (!st.window_focused.load(std::memory_order_relaxed)) return false;
-    if (st.in_size_move.load(std::memory_order_relaxed)) return false;
-    if (st.overlay_open.load(std::memory_order_relaxed)) return false;
-    if (st.cur_modal_ui.load(std::memory_order_relaxed)) return false;
-    return st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::GameplayActive;
 }
 
 void MarkMkbActivity(MkbState& st) {
@@ -859,9 +1114,12 @@ void Init() {
 void Shutdown() {
     MkbState& st = St();
     std::lock_guard<std::mutex> lk(st.lock);
-    ApplyOsCursorCaptureLocked(st, false, true);
+    ApplyOsCursorCaptureLocked(st, false, false, true);
 #ifdef _WIN32
     ClipCursor(nullptr);
+    if (HWND hwnd = static_cast<HWND>(st.window_handle); hwnd && IsWindow(hwnd)) {
+        SetClassLongPtrW(hwnd, GCLP_HCURSOR, reinterpret_cast<LONG_PTR>(GetArrowCursorWin32()));
+    }
 #endif
 }
 
@@ -959,15 +1217,21 @@ void SaveSettings(void* toml_table_ptr) {
 
 void OnWindowCreated(void* window_handle) {
     MkbState& st = St();
+    SyncImGuiMouseFlags(st.overlay_open.load(std::memory_order_acquire), true);
     std::lock_guard<std::mutex> lk(st.lock);
     const bool first_bind = (st.window_handle != window_handle);
     st.window_handle = window_handle;
     st.prev_abs_valid = false;
 #ifdef _WIN32
     if (HWND hwnd = static_cast<HWND>(window_handle)) {
+        // Initialize blank & arrow HCURSOR handles on the GUI thread before render/telemetry threads query them.
+        (void)GetBlankCursorWin32();
+        (void)GetArrowCursorWin32();
         if (!st.autotest_active.load(std::memory_order_relaxed)) {
             if (IsWindowVisible(hwnd)) {
-                st.window_focused.store(GetForegroundWindow() == hwnd, std::memory_order_release);
+                const bool focused = !IsIconic(hwnd) && (GetForegroundWindow() == hwnd || GetActiveWindow() == hwnd ||
+                                                         GetFocus() == hwnd);
+                st.window_focused.store(focused, std::memory_order_release);
             } else {
                 st.window_focused.store(true, std::memory_order_release);
             }
@@ -982,14 +1246,24 @@ void OnWindowCreated(void* window_handle) {
         } else if (first_bind) {
             LOGR("mkb: Win32 WM_INPUT Raw Input mouse registered (hwnd=%p)", window_handle);
         }
-        ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), true);
+        ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
     }
 #else
-    if (window_handle && first_bind) {
-        LOGR("mkb: Linux SDL3 relative mouse + scancode host layer initialized");
-    }
     if (window_handle) {
-        ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), true);
+        if (first_bind) {
+            LOGR("mkb: Linux SDL3 relative mouse + scancode host layer initialized");
+        }
+        if (!st.autotest_active.load(std::memory_order_relaxed)) {
+            SDL_Window* win = static_cast<SDL_Window*>(window_handle);
+            SDL_WindowFlags wf = SDL_GetWindowFlags(win);
+            if ((wf & SDL_WINDOW_HIDDEN) == 0) {
+                const bool focused = ((wf & SDL_WINDOW_MINIMIZED) == 0) && ((wf & SDL_WINDOW_INPUT_FOCUS) != 0);
+                st.window_focused.store(focused, std::memory_order_release);
+            } else {
+                st.window_focused.store(true, std::memory_order_release);
+            }
+        }
+        ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
     }
 #endif
 }
@@ -1011,6 +1285,14 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
 
 #ifdef _WIN32
     HWND hwnd = static_cast<HWND>(window_handle ? window_handle : st.window_handle);
+    auto recover_focus_on_input = [&]() {
+        if (st.autotest_active.load(std::memory_order_relaxed)) return;
+        if (!st.window_focused.load(std::memory_order_relaxed)) {
+            st.window_focused.store(true, std::memory_order_release);
+            std::lock_guard<std::mutex> lk(st.lock);
+            ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
+        }
+    };
     auto update_client_ui_pos = [&](int cx, int cy) {
         if (!hwnd) return;
         RECT rc{};
@@ -1029,30 +1311,53 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
 
     switch (msg) {
         case kWinMsgSyncCursor: {
-            SyncImGuiNoMouseCursorFlag(st.overlay_open.load(std::memory_order_acquire));
-            bool want = (wp != 0);
-            ApplyOsCursorCaptureOnGuiThread(st, hwnd, want);
+            st.cursor_tick_queued.store(false, std::memory_order_release);
+            SyncImGuiMouseFlags(st.overlay_open.load(std::memory_order_acquire));
+            if (!st.autotest_active.load(std::memory_order_relaxed) && hwnd && IsWindow(hwnd) &&
+                IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
+                HWND fg = GetForegroundWindow();
+                const bool os_focused = (fg == hwnd) || (GetActiveWindow() == hwnd) || (GetFocus() == hwnd);
+                if (os_focused && !st.window_focused.load(std::memory_order_relaxed)) {
+                    st.window_focused.store(true, std::memory_order_release);
+                } else if (!os_focused && fg != nullptr && st.window_focused.load(std::memory_order_relaxed)) {
+                    st.window_focused.store(false, std::memory_order_release);
+                }
+            }
+            bool want_cap = false;
+            bool want_hide = false;
+            {
+                std::lock_guard<std::mutex> lk(st.lock);
+                want_cap = ComputeWantCursorCapture(st);
+                want_hide = ComputeWantHideCursor(st);
+                st.cursor_captured.store(want_cap, std::memory_order_release);
+                st.cursor_should_hide.store(want_hide || want_cap, std::memory_order_release);
+                st.cursor_sync_initialized = true;
+                st.last_requested_capture = want_cap;
+                st.last_requested_hide = want_hide || want_cap;
+            }
+            ApplyOsCursorCaptureOnGuiThread(st, hwnd, want_cap, want_hide, (wp & 4u) != 0);
             if (result) *result = 0;
             return true;
         }
         case WM_SETCURSOR: {
-            if (LOWORD(lp) == HTCLIENT) {
-                if (st.cursor_captured.load(std::memory_order_acquire)) {
-                    SetCursor(nullptr);
-                    if (result) *result = TRUE;
-                    return true;
-                }
-                if (!st.overlay_open.load(std::memory_order_acquire)) {
-                    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-                    if (result) *result = TRUE;
-                    return true;
-                }
+            if (st.cursor_should_hide.load(std::memory_order_acquire)) {
+                SetCursor(GetBlankCursorWin32());
+                if (result) *result = TRUE;
+                return true;
+            }
+            if (LOWORD(lp) == HTCLIENT && !st.overlay_open.load(std::memory_order_acquire)) {
+                SetCursor(GetArrowCursorWin32());
+                if (result) *result = TRUE;
+                return true;
             }
             return false;
         }
         case WM_MOUSEMOVE: {
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
-            if (!st.cursor_captured.load(std::memory_order_acquire) && !st.overlay_open.load(std::memory_order_acquire)) {
+            if (st.cursor_captured.load(std::memory_order_acquire)) {
+                ReassertWin32ClipAndWarpOnGuiThread(st, hwnd, true);
+            } else if (!st.overlay_open.load(std::memory_order_acquire) &&
+                       !st.cursor_should_hide.load(std::memory_order_acquire)) {
                 int cx = int(short(LOWORD(lp)));
                 int cy = int(short(HIWORD(lp)));
                 MarkMkbActivity(st);
@@ -1065,18 +1370,30 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
             bool down = (msg == WM_LBUTTONDOWN);
             if (down) {
+                recover_focus_on_input();
                 MarkMkbActivity(st);
                 if (handle_rebind_key(KeyCode::MouseLeft)) return true;
-                if (!st.cursor_captured.load(std::memory_order_acquire) &&
-                    !st.overlay_open.load(std::memory_order_acquire)) {
-                    update_client_ui_pos(int(short(LOWORD(lp))), int(short(HIWORD(lp))));
-                    std::lock_guard<std::mutex> lk(st.lock);
-                    st.ui_lmb_down = true;
-                    st.ui_lmb_click_pending = true;
+                if (!st.overlay_open.load(std::memory_order_acquire)) {
+                    if (!st.cursor_captured.load(std::memory_order_acquire) &&
+                        !st.cursor_should_hide.load(std::memory_order_acquire)) {
+                        update_client_ui_pos(int(short(LOWORD(lp))), int(short(HIWORD(lp))));
+                        std::lock_guard<std::mutex> lk(st.lock);
+                        st.ui_lmb_down = true;
+                        st.ui_lmb_click_pending = true;
+                    } else if (st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::Fmv ||
+                               st.cur_non_pointer_modal.load(std::memory_order_acquire)) {
+                        std::lock_guard<std::mutex> lk(st.lock);
+                        st.non_pointer_lmb_pending = true;
+                    }
                 }
             } else {
-                std::lock_guard<std::mutex> lk(st.lock);
-                st.ui_lmb_down = false;
+                {
+                    std::lock_guard<std::mutex> lk(st.lock);
+                    st.ui_lmb_down = false;
+                }
+                if (st.cursor_captured.load(std::memory_order_acquire)) {
+                    ReassertWin32ClipAndWarpOnGuiThread(st, hwnd, true);
+                }
             }
             st.key_down[size_t(KeyCode::MouseLeft)].store(down, std::memory_order_relaxed);
             return false;
@@ -1086,14 +1403,18 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
             bool down = (msg == WM_RBUTTONDOWN);
             if (down) {
+                recover_focus_on_input();
                 MarkMkbActivity(st);
                 if (handle_rebind_key(KeyCode::MouseRight)) return true;
                 if (!st.cursor_captured.load(std::memory_order_acquire) &&
+                    !st.cursor_should_hide.load(std::memory_order_acquire) &&
                     !st.overlay_open.load(std::memory_order_acquire)) {
                     update_client_ui_pos(int(short(LOWORD(lp))), int(short(HIWORD(lp))));
                     std::lock_guard<std::mutex> lk(st.lock);
                     st.ui_rmb_click_pending = true;
                 }
+            } else if (st.cursor_captured.load(std::memory_order_acquire)) {
+                ReassertWin32ClipAndWarpOnGuiThread(st, hwnd, true);
             }
             st.key_down[size_t(KeyCode::MouseRight)].store(down, std::memory_order_relaxed);
             return false;
@@ -1103,8 +1424,11 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
             bool down = (msg == WM_MBUTTONDOWN);
             if (down) {
+                recover_focus_on_input();
                 MarkMkbActivity(st);
                 if (handle_rebind_key(KeyCode::MouseMiddle)) return true;
+            } else if (st.cursor_captured.load(std::memory_order_acquire)) {
+                ReassertWin32ClipAndWarpOnGuiThread(st, hwnd, true);
             }
             st.key_down[size_t(KeyCode::MouseMiddle)].store(down, std::memory_order_relaxed);
             return false;
@@ -1117,8 +1441,11 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             if (kc != KeyCode::None) {
                 bool down = (msg == WM_XBUTTONDOWN);
                 if (down) {
+                    recover_focus_on_input();
                     MarkMkbActivity(st);
                     if (handle_rebind_key(kc)) return true;
+                } else if (st.cursor_captured.load(std::memory_order_acquire)) {
+                    ReassertWin32ClipAndWarpOnGuiThread(st, hwnd, true);
                 }
                 st.key_down[size_t(kc)].store(down, std::memory_order_relaxed);
             }
@@ -1134,8 +1461,12 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                 if (!handle_rebind_key(wk)) {
                     std::lock_guard<std::mutex> lk(st.lock);
                     if (st.cursor_captured.load(std::memory_order_acquire)) {
-                        if (st.wheel_queue.size() < 8) st.wheel_queue.push_back(notches);
-                    } else if (!st.overlay_open.load(std::memory_order_acquire)) {
+                        if (st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::GameplayActive &&
+                            st.wheel_queue.size() < 8) {
+                            st.wheel_queue.push_back(notches);
+                        }
+                    } else if (!st.cursor_should_hide.load(std::memory_order_acquire) &&
+                               !st.overlay_open.load(std::memory_order_acquire)) {
                         st.ui_wheel_pending += notches;
                     }
                 }
@@ -1152,8 +1483,10 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                     const RAWINPUT* ri = reinterpret_cast<const RAWINPUT*>(buf);
                     if (ri->header.dwType == RIM_TYPEMOUSE) {
                         const RAWMOUSE& rm = ri->data.mouse;
+                        const bool is_abs = (rm.usFlags & MOUSE_MOVE_ABSOLUTE) != 0;
+                        st.last_raw_was_absolute.store(is_abs, std::memory_order_relaxed);
                         int32_t dx = 0, dy = 0;
-                        if ((rm.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+                        if (!is_abs) {
                             dx = int32_t(rm.lLastX);
                             dy = int32_t(rm.lLastY);
                         } else {
@@ -1172,17 +1505,19 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                             st.prev_abs_valid = true;
                         }
                         if (dx != 0 || dy != 0) {
-                            bool was_mkb = (st.active_device.load(std::memory_order_relaxed) == ActiveDevice::Mkb);
                             MarkMkbActivity(st);
                             bool cap = st.cursor_captured.load(std::memory_order_acquire);
-                            if (!cap && !was_mkb && ComputeWantCursorCapture(st)) {
+                            if (!cap && ComputeWantCursorCapture(st)) {
                                 std::lock_guard<std::mutex> lk(st.lock);
-                                ApplyOsCursorCaptureLocked(st, true);
+                                ApplyOsCursorCaptureLocked(st, true, true, true);
                                 cap = true;
                             }
                             if (cap) {
-                                st.raw_dx.fetch_add(dx, std::memory_order_relaxed);
-                                st.raw_dy.fetch_add(dy, std::memory_order_relaxed);
+                                if (st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::GameplayActive) {
+                                    st.raw_dx.fetch_add(dx, std::memory_order_relaxed);
+                                    st.raw_dy.fetch_add(dy, std::memory_order_relaxed);
+                                }
+                                ReassertWin32ClipAndWarpOnGuiThread(st, hwnd, true);
                             }
                         }
                         auto set_btn = [&](USHORT down_flag, USHORT up_flag, KeyCode kc) {
@@ -1190,7 +1525,12 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                                 MarkMkbActivity(st);
                                 if (!handle_rebind_key(kc)) st.key_down[size_t(kc)].store(true, std::memory_order_relaxed);
                             }
-                            if (rm.usButtonFlags & up_flag) st.key_down[size_t(kc)].store(false, std::memory_order_relaxed);
+                            if (rm.usButtonFlags & up_flag) {
+                                st.key_down[size_t(kc)].store(false, std::memory_order_relaxed);
+                                if (st.cursor_captured.load(std::memory_order_acquire)) {
+                                    ReassertWin32ClipAndWarpOnGuiThread(st, hwnd, true);
+                                }
+                            }
                         };
                         set_btn(RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, KeyCode::MouseLeft);
                         set_btn(RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, KeyCode::MouseRight);
@@ -1205,12 +1545,14 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
         case WM_KEYDOWN:
         case WM_SYSKEYDOWN: {
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
+            recover_focus_on_input();
             KeyCode kc = Win32VkToKeyCode(wp, lp);
             if (kc == KeyCode::F1 && ((lp & (1LL << 30)) == 0)) {
                 bool next = !st.overlay_open.load(std::memory_order_relaxed);
                 st.overlay_open.store(next, std::memory_order_release);
+                SyncImGuiMouseFlags(next, true);
                 std::lock_guard<std::mutex> lk(st.lock);
-                ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), true);
+                ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
                 return true;
             }
             if (kc != KeyCode::None) {
@@ -1235,7 +1577,19 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                     st.key_down[i].store(false, std::memory_order_relaxed);
             }
             std::lock_guard<std::mutex> lk(st.lock);
-            ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), true);
+            ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
+            return false;
+        }
+        case WM_ACTIVATEAPP: {
+            if (st.autotest_active.load(std::memory_order_relaxed)) return false;
+            bool focused = (wp != FALSE);
+            st.window_focused.store(focused, std::memory_order_release);
+            if (!focused) {
+                for (size_t i = 0; i < size_t(KeyCode::Count); ++i)
+                    st.key_down[i].store(false, std::memory_order_relaxed);
+            }
+            std::lock_guard<std::mutex> lk(st.lock);
+            ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
             return false;
         }
         case WM_KILLFOCUS: {
@@ -1244,31 +1598,35 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             for (size_t i = 0; i < size_t(KeyCode::Count); ++i)
                 st.key_down[i].store(false, std::memory_order_relaxed);
             std::lock_guard<std::mutex> lk(st.lock);
-            ApplyOsCursorCaptureLocked(st, false, true);
+            ApplyOsCursorCaptureLocked(st, false, false, true);
             return false;
         }
         case WM_SETFOCUS: {
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
             st.window_focused.store(true, std::memory_order_release);
             std::lock_guard<std::mutex> lk(st.lock);
-            ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), true);
+            ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
             return false;
         }
         case WM_ENTERSIZEMOVE: {
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
             st.in_size_move.store(true, std::memory_order_release);
             std::lock_guard<std::mutex> lk(st.lock);
-            ApplyOsCursorCaptureLocked(st, false, true);
+            ApplyOsCursorCaptureLocked(st, false, false, true);
             return false;
         }
         case WM_EXITSIZEMOVE:
+        case WM_DISPLAYCHANGE:
         case WM_SIZE:
         case WM_MOVE: {
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
             if (msg == WM_EXITSIZEMOVE) st.in_size_move.store(false, std::memory_order_release);
             std::lock_guard<std::mutex> lk(st.lock);
-            bool want = ComputeWantCursorCapture(st);
-            if (want || msg == WM_EXITSIZEMOVE) ApplyOsCursorCaptureLocked(st, want, true);
+            bool want_cap = ComputeWantCursorCapture(st);
+            bool want_hide = ComputeWantHideCursor(st);
+            if (want_cap || want_hide || msg == WM_EXITSIZEMOVE || msg == WM_DISPLAYCHANGE) {
+                ApplyOsCursorCaptureLocked(st, want_cap, want_hide, true);
+            }
             return false;
         }
         default:
@@ -1278,6 +1636,14 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
     const SDL_Event* ev = reinterpret_cast<const SDL_Event*>(lp);
     if (!ev) return false;
     SDL_Window* win = static_cast<SDL_Window*>(window_handle ? window_handle : st.window_handle);
+    auto recover_sdl_focus = [&]() {
+        if (st.autotest_active.load(std::memory_order_relaxed)) return;
+        if (!st.window_focused.load(std::memory_order_relaxed)) {
+            st.window_focused.store(true, std::memory_order_release);
+            std::lock_guard<std::mutex> lk(st.lock);
+            ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
+        }
+    };
     auto update_sdl_ui_pos = [&](float mx, float my) {
         if (!win) return;
         int lw = 0, lh = 0;
@@ -1297,8 +1663,29 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
     switch (msg) {
         case SDL_EVENT_USER: {
             if (ev->user.code == kSdlEvSyncCursor) {
-                SyncImGuiNoMouseCursorFlag(st.overlay_open.load(std::memory_order_acquire));
-                ApplyOsCursorCaptureOnGuiThread(st, win, ev->user.data1 != nullptr);
+                st.cursor_tick_queued.store(false, std::memory_order_release);
+                SyncImGuiMouseFlags(st.overlay_open.load(std::memory_order_acquire));
+                if (!st.autotest_active.load(std::memory_order_relaxed) && win) {
+                    SDL_WindowFlags wf = SDL_GetWindowFlags(win);
+                    if ((wf & SDL_WINDOW_HIDDEN) == 0 && (wf & SDL_WINDOW_MINIMIZED) == 0) {
+                        const bool os_focused = (wf & SDL_WINDOW_INPUT_FOCUS) != 0;
+                        st.window_focused.store(os_focused, std::memory_order_release);
+                    }
+                }
+                bool want_cap = false;
+                bool want_hide = false;
+                {
+                    std::lock_guard<std::mutex> lk(st.lock);
+                    want_cap = ComputeWantCursorCapture(st);
+                    want_hide = ComputeWantHideCursor(st);
+                    st.cursor_captured.store(want_cap, std::memory_order_release);
+                    st.cursor_should_hide.store(want_hide || want_cap, std::memory_order_release);
+                    st.cursor_sync_initialized = true;
+                    st.last_requested_capture = want_cap;
+                    st.last_requested_hide = want_hide || want_cap;
+                }
+                const uintptr_t bits = reinterpret_cast<uintptr_t>(ev->user.data1);
+                ApplyOsCursorCaptureOnGuiThread(st, win, want_cap, want_hide, (bits & 4u) != 0);
                 if (result) *result = 0;
                 return true;
             }
@@ -1309,18 +1696,20 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             int32_t dx = int32_t(std::lround(ev->motion.xrel));
             int32_t dy = int32_t(std::lround(ev->motion.yrel));
             if (dx != 0 || dy != 0) {
-                bool was_mkb = (st.active_device.load(std::memory_order_relaxed) == ActiveDevice::Mkb);
                 MarkMkbActivity(st);
                 bool cap = st.cursor_captured.load(std::memory_order_acquire);
-                if (!cap && !was_mkb && ComputeWantCursorCapture(st)) {
+                if (!cap && ComputeWantCursorCapture(st)) {
                     std::lock_guard<std::mutex> lk(st.lock);
-                    ApplyOsCursorCaptureLocked(st, true);
+                    ApplyOsCursorCaptureLocked(st, true, true, true);
                     cap = true;
                 }
                 if (cap) {
-                    st.raw_dx.fetch_add(dx, std::memory_order_relaxed);
-                    st.raw_dy.fetch_add(dy, std::memory_order_relaxed);
-                } else if (!st.overlay_open.load(std::memory_order_acquire)) {
+                    if (st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::GameplayActive) {
+                        st.raw_dx.fetch_add(dx, std::memory_order_relaxed);
+                        st.raw_dy.fetch_add(dy, std::memory_order_relaxed);
+                    }
+                } else if (!st.cursor_should_hide.load(std::memory_order_acquire) &&
+                           !st.overlay_open.load(std::memory_order_acquire)) {
                     update_sdl_ui_pos(ev->motion.x, ev->motion.y);
                 }
             }
@@ -1341,22 +1730,35 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             if (kc != KeyCode::None) {
                 bool down = (msg == SDL_EVENT_MOUSE_BUTTON_DOWN);
                 if (down) {
+                    recover_sdl_focus();
                     MarkMkbActivity(st);
                     if (handle_rebind_key(kc)) return true;
-                    if (!st.cursor_captured.load(std::memory_order_acquire) &&
-                        !st.overlay_open.load(std::memory_order_acquire)) {
-                        update_sdl_ui_pos(ev->button.x, ev->button.y);
-                        std::lock_guard<std::mutex> lk(st.lock);
-                        if (kc == KeyCode::MouseLeft) {
-                            st.ui_lmb_down = true;
-                            st.ui_lmb_click_pending = true;
-                        } else if (kc == KeyCode::MouseRight) {
-                            st.ui_rmb_click_pending = true;
+                    if (!st.overlay_open.load(std::memory_order_acquire)) {
+                        if (!st.cursor_captured.load(std::memory_order_acquire) &&
+                            !st.cursor_should_hide.load(std::memory_order_acquire)) {
+                            update_sdl_ui_pos(ev->button.x, ev->button.y);
+                            std::lock_guard<std::mutex> lk(st.lock);
+                            if (kc == KeyCode::MouseLeft) {
+                                st.ui_lmb_down = true;
+                                st.ui_lmb_click_pending = true;
+                            } else if (kc == KeyCode::MouseRight) {
+                                st.ui_rmb_click_pending = true;
+                            }
+                        } else if (kc == KeyCode::MouseLeft &&
+                                   (st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::Fmv ||
+                                    st.cur_non_pointer_modal.load(std::memory_order_acquire))) {
+                            std::lock_guard<std::mutex> lk(st.lock);
+                            st.non_pointer_lmb_pending = true;
                         }
                     }
-                } else if (kc == KeyCode::MouseLeft) {
-                    std::lock_guard<std::mutex> lk(st.lock);
-                    st.ui_lmb_down = false;
+                } else {
+                    if (kc == KeyCode::MouseLeft) {
+                        std::lock_guard<std::mutex> lk(st.lock);
+                        st.ui_lmb_down = false;
+                    }
+                    if (st.cursor_captured.load(std::memory_order_acquire)) {
+                        ApplyOsCursorCaptureOnGuiThread(st, win, true, true, false);
+                    }
                 }
                 st.key_down[size_t(kc)].store(down, std::memory_order_relaxed);
             }
@@ -1371,8 +1773,12 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                 if (!handle_rebind_key(wk)) {
                     std::lock_guard<std::mutex> lk(st.lock);
                     if (st.cursor_captured.load(std::memory_order_acquire)) {
-                        if (st.wheel_queue.size() < 8) st.wheel_queue.push_back(notches);
-                    } else if (!st.overlay_open.load(std::memory_order_acquire)) {
+                        if (st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::GameplayActive &&
+                            st.wheel_queue.size() < 8) {
+                            st.wheel_queue.push_back(notches);
+                        }
+                    } else if (!st.cursor_should_hide.load(std::memory_order_acquire) &&
+                               !st.overlay_open.load(std::memory_order_acquire)) {
                         st.ui_wheel_pending += notches;
                     }
                 }
@@ -1384,11 +1790,13 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
             KeyCode kc = SdlScancodeToKeyCode(ev->key.scancode);
             bool down = (msg == SDL_EVENT_KEY_DOWN);
+            if (down) recover_sdl_focus();
             if (down && kc == KeyCode::F1 && !ev->key.repeat) {
                 bool next = !st.overlay_open.load(std::memory_order_relaxed);
                 st.overlay_open.store(next, std::memory_order_release);
+                SyncImGuiMouseFlags(next, true);
                 std::lock_guard<std::mutex> lk(st.lock);
-                ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), true);
+                ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
                 return true;
             }
             if (kc != KeyCode::None) {
@@ -1407,7 +1815,7 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             for (size_t i = 0; i < size_t(KeyCode::Count); ++i)
                 st.key_down[i].store(false, std::memory_order_relaxed);
             std::lock_guard<std::mutex> lk(st.lock);
-            ApplyOsCursorCaptureLocked(st, false, true);
+            ApplyOsCursorCaptureLocked(st, false, false, true);
             return false;
         }
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
@@ -1415,7 +1823,20 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
             st.window_focused.store(true, std::memory_order_release);
             std::lock_guard<std::mutex> lk(st.lock);
-            ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), true);
+            ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
+            return false;
+        }
+        case SDL_EVENT_WINDOW_RESIZED:
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        case SDL_EVENT_WINDOW_MOVED:
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED: {
+            if (st.autotest_active.load(std::memory_order_relaxed)) return false;
+            std::lock_guard<std::mutex> lk(st.lock);
+            bool want_cap = ComputeWantCursorCapture(st);
+            bool want_hide = ComputeWantHideCursor(st);
+            if (want_cap || want_hide) {
+                ApplyOsCursorCaptureLocked(st, want_cap, want_hide, true);
+            }
             return false;
         }
         default:
@@ -1531,180 +1952,222 @@ void OnPadPoll(int port, input::Pad& pad) {
         DefaultActionMap(act, pad);
     }
 
-    // Apply latched mouse-menu pulses (LMB Confirm / Start, RMB Back, Wheel Up/Down, Slider Left/Right)
-    if (!st.cursor_captured.load(std::memory_order_acquire)) {
+    // Apply latched mouse-menu pulses (LMB Confirm / Start, RMB Back, Wheel Up/Down, Slider Left/Right).
+    // During FMV and in-game non-pointer modals (Tips / Mission Objectives), LMB dismissal pulses A / START
+    // without ever unlocking or showing the OS cursor.
+    const bool captured_now = st.cursor_captured.load(std::memory_order_acquire);
+    const bool allow_confirm_pulses = !captured_now || (act.phase == perf::Phase::Fmv) ||
+                                      st.cur_non_pointer_modal.load(std::memory_order_acquire);
+    if (allow_confirm_pulses) {
         if (st.menu_confirm_hold > 0) pad.analog[0] = 0xFF;  // A
         if (st.menu_cancel_hold > 0) pad.analog[1] = 0xFF;   // B
         if (st.menu_start_hold > 0) pad.buttons |= 1u << 4;  // START
-        if (st.menu_nav_y_hold > 0) {
-            if (st.menu_nav_y_dir < 0) pad.buttons |= 1u << 0;  // DPAD_UP
-            else if (st.menu_nav_y_dir > 0) pad.buttons |= 1u << 1;  // DPAD_DOWN
-        }
-        if (st.menu_nav_x_hold > 0) {
-            if (st.menu_nav_x_dir < 0) pad.buttons |= 1u << 2;  // DPAD_LEFT
-            else if (st.menu_nav_x_dir > 0) pad.buttons |= 1u << 3;  // DPAD_RIGHT
+        if (!captured_now) {
+            if (st.menu_nav_y_hold > 0) {
+                if (st.menu_nav_y_dir < 0) pad.buttons |= 1u << 0;       // DPAD_UP
+                else if (st.menu_nav_y_dir > 0) pad.buttons |= 1u << 1;  // DPAD_DOWN
+            }
+            if (st.menu_nav_x_hold > 0) {
+                if (st.menu_nav_x_dir < 0) pad.buttons |= 1u << 2;       // DPAD_LEFT
+                else if (st.menu_nav_x_dir > 0) pad.buttons |= 1u << 3;  // DPAD_RIGHT
+            }
         }
     }
 }
 
 void OnPresent(uint64_t /*present_frame*/, perf::Phase phase, bool modal_ui_open,
-               std::filesystem::path& out_capture_bmp, bool& out_should_exit) {
+               std::filesystem::path& out_capture_bmp, bool& out_should_exit, bool non_pointer_modal) {
     MkbState& st = St();
-    SyncImGuiNoMouseCursorFlag(st.overlay_open.load(std::memory_order_acquire));
-    std::lock_guard<std::mutex> lk(st.lock);
-    st.cur_phase.store(phase, std::memory_order_relaxed);
-    st.cur_modal_ui.store(modal_ui_open, std::memory_order_relaxed);
+    const bool overlay_before = st.overlay_open.load(std::memory_order_acquire);
+    SyncImGuiMouseFlags(overlay_before);
+    bool overlay_after = overlay_before;
+    {
+        std::lock_guard<std::mutex> lk(st.lock);
+        st.cur_phase.store(phase, std::memory_order_relaxed);
+        st.cur_modal_ui.store(modal_ui_open, std::memory_order_relaxed);
+        st.cur_non_pointer_modal.store(non_pointer_modal, std::memory_order_relaxed);
 
-    // Advance in-process XBE_MKB_AUTOTEST schedule on shared stall-clamped eff_us clock
-    if (st.autotest_active.load(std::memory_order_relaxed)) {
-        uint64_t ms = input_rec::ElapsedEffUs() / 1000ull;
-        st.autotest_elapsed_ms.store(ms, std::memory_order_release);
-
-        // Apply scheduled set_ms toggles (skipped when replay bypasses M&K)
-        const bool bypassed = input_rec::ShouldBypassMkb();
-        if (!bypassed) {
-            for (auto& se : st.at_sets) {
-                if (!se.triggered && ms >= se.target_ms) {
-                    se.triggered = true;
-                    ApplyRuntimeOptionLocked(st, se.key, se.value);
-                }
-            }
+        // Discard any raw mouse delta outside active 3D gameplay so cursor motion during FMV/Loading/Pause
+        // never snaps the camera on the first frame of gameplay.
+        if (phase != perf::Phase::GameplayActive) {
+            st.raw_dx.store(0, std::memory_order_relaxed);
+            st.raw_dy.store(0, std::memory_order_relaxed);
+            st.smooth_dx = 0.0f;
+            st.smooth_dy = 0.0f;
         }
 
-        // Update synthetic held keys for the upcoming frame
-        std::memset(st.at_key_down, 0, sizeof(st.at_key_down));
-        bool any_at_key = false;
-        for (const auto& ke : st.at_keys) {
-            if (ms >= ke.start_ms && ms <= ke.end_ms) {
-                for (KeyCode k : ke.keys) {
-                    if (size_t(k) < size_t(KeyCode::Count)) {
-                        st.at_key_down[size_t(k)] = true;
-                        any_at_key = true;
+        // Advance in-process XBE_MKB_AUTOTEST schedule on shared stall-clamped eff_us clock
+        if (st.autotest_active.load(std::memory_order_relaxed)) {
+            uint64_t ms = input_rec::ElapsedEffUs() / 1000ull;
+            st.autotest_elapsed_ms.store(ms, std::memory_order_release);
+
+            // Apply scheduled set_ms toggles (skipped when replay bypasses M&K)
+            const bool bypassed = input_rec::ShouldBypassMkb();
+            if (!bypassed) {
+                for (auto& se : st.at_sets) {
+                    if (!se.triggered && ms >= se.target_ms) {
+                        se.triggered = true;
+                        ApplyRuntimeOptionLocked(st, se.key, se.value);
                     }
                 }
             }
-        }
-        if (any_at_key && !bypassed) MarkMkbActivity(st);
 
-        // Inject one-shot raw mouse count events (for next guest gameplay frame)
-        for (auto& me : st.at_mouse) {
-            if (!me.triggered && ms >= me.target_ms) {
-                me.triggered = true;
-                if (!bypassed) {
-                    MarkMkbActivity(st);
-                    st.raw_dx.fetch_add(me.dx, std::memory_order_relaxed);
-                    st.raw_dy.fetch_add(me.dy, std::memory_order_relaxed);
-                }
-            }
-        }
-
-        // Inject one-shot mouse wheel events
-        for (auto& we : st.at_wheel) {
-            if (!we.triggered && ms >= we.target_ms) {
-                we.triggered = true;
-                if (!bypassed) {
-                    MarkMkbActivity(st);
-                    if (st.cursor_captured.load(std::memory_order_acquire)) {
-                        if (st.wheel_queue.size() < 8) st.wheel_queue.push_back(we.delta);
-                    } else if (!st.overlay_open.load(std::memory_order_acquire)) {
-                        st.ui_wheel_pending += we.delta;
+            // Update synthetic held keys for the upcoming frame
+            std::memset(st.at_key_down, 0, sizeof(st.at_key_down));
+            bool any_at_key = false;
+            for (const auto& ke : st.at_keys) {
+                if (ms >= ke.start_ms && ms <= ke.end_ms) {
+                    for (KeyCode k : ke.keys) {
+                        if (size_t(k) < size_t(KeyCode::Count)) {
+                            st.at_key_down[size_t(k)] = true;
+                            any_at_key = true;
+                        }
                     }
                 }
             }
-        }
+            if (any_at_key && !bypassed) MarkMkbActivity(st);
 
-        // Inject scheduled menu cursor hover & LMB/RMB click events (for pure mouse-menu autotest)
-        for (auto& ce : st.at_cursors) {
-            if (!ce.triggered && ms >= ce.target_ms) {
-                ce.triggered = true;
-                if (!bypassed) {
-                    MarkMkbActivity(st);
-                    if (ce.has_pos) {
-                        st.ui_x = ce.ui_x;
-                        st.ui_y = ce.ui_y;
-                        st.ui_pos_valid = true;
-                        st.ui_moved_pending = true;
+            // Inject one-shot raw mouse count events (for next guest gameplay frame)
+            for (auto& me : st.at_mouse) {
+                if (!me.triggered && ms >= me.target_ms) {
+                    me.triggered = true;
+                    if (!bypassed) {
+                        MarkMkbActivity(st);
+                        st.raw_dx.fetch_add(me.dx, std::memory_order_relaxed);
+                        st.raw_dy.fetch_add(me.dy, std::memory_order_relaxed);
                     }
-                    if (ce.click_lmb) st.ui_lmb_click_pending = true;
-                    if (ce.click_rmb) st.ui_rmb_click_pending = true;
                 }
             }
-        }
 
-        // Trigger scheduled captures & clean exit (only when replay is not owning exit)
-        if (!bypassed) {
-            bool any_pending_cap = false;
-            for (auto& ce : st.at_caps) {
+            // Inject one-shot mouse wheel events
+            for (auto& we : st.at_wheel) {
+                if (!we.triggered && ms >= we.target_ms) {
+                    we.triggered = true;
+                    if (!bypassed) {
+                        MarkMkbActivity(st);
+                        if (st.cursor_captured.load(std::memory_order_acquire)) {
+                            if (st.wheel_queue.size() < 8) st.wheel_queue.push_back(we.delta);
+                        } else if (!st.overlay_open.load(std::memory_order_acquire)) {
+                            st.ui_wheel_pending += we.delta;
+                        }
+                    }
+                }
+            }
+
+            // Inject scheduled menu cursor hover & LMB/RMB click events (for pure mouse-menu autotest)
+            for (auto& ce : st.at_cursors) {
                 if (!ce.triggered && ms >= ce.target_ms) {
-                    if (out_capture_bmp.empty()) {
-                        ce.triggered = true;
-                        out_capture_bmp = ce.path;
-                        LOGR("mkb: capture triggered ms=%llu -> %s", (unsigned long long)ms,
-                             ce.path.string().c_str());
-                    } else {
+                    ce.triggered = true;
+                    if (!bypassed) {
+                        MarkMkbActivity(st);
+                        if (ce.has_pos) {
+                            st.ui_x = ce.ui_x;
+                            st.ui_y = ce.ui_y;
+                            st.ui_pos_valid = true;
+                            st.ui_moved_pending = true;
+                        }
+                        if (ce.click_lmb) {
+                            if (phase == perf::Phase::Fmv || non_pointer_modal) {
+                                st.non_pointer_lmb_pending = true;
+                            } else {
+                                st.ui_lmb_click_pending = true;
+                            }
+                        }
+                        if (ce.click_rmb) st.ui_rmb_click_pending = true;
+                    }
+                }
+            }
+
+            // Trigger scheduled captures & clean exit (only when replay is not owning exit)
+            if (!bypassed) {
+                bool any_pending_cap = false;
+                for (auto& ce : st.at_caps) {
+                    if (!ce.triggered && ms >= ce.target_ms) {
+                        if (out_capture_bmp.empty()) {
+                            ce.triggered = true;
+                            out_capture_bmp = ce.path;
+                            LOGR("mkb: capture triggered ms=%llu -> %s", (unsigned long long)ms,
+                                 ce.path.string().c_str());
+                        } else {
+                            any_pending_cap = true;
+                        }
+                    } else if (!ce.triggered && st.at_exit_ms > 0 && ce.target_ms <= st.at_exit_ms) {
                         any_pending_cap = true;
                     }
-                } else if (!ce.triggered && st.at_exit_ms > 0 && ce.target_ms <= st.at_exit_ms) {
-                    any_pending_cap = true;
+                }
+                if (!any_pending_cap && out_capture_bmp.empty() && st.at_exit_ms > 0 && !st.at_exit_posted &&
+                    ms >= st.at_exit_ms) {
+                    st.at_exit_posted = true;
+                    out_should_exit = true;
+                    LOGR("mkb: autotest clean exit requested at ms=%llu", (unsigned long long)ms);
                 }
             }
-            if (!any_pending_cap && out_capture_bmp.empty() && st.at_exit_ms > 0 && !st.at_exit_posted &&
-                ms >= st.at_exit_ms) {
-                st.at_exit_posted = true;
-                out_should_exit = true;
-                LOGR("mkb: autotest clean exit requested at ms=%llu", (unsigned long long)ms);
+        }
+
+        // Advance latched Esc / wheel / menu-mouse pulse hold counters once per present
+        if (st.esc_hold_frames > 0) --st.esc_hold_frames;
+        if (st.menu_confirm_hold > 0) --st.menu_confirm_hold;
+        if (st.menu_cancel_hold > 0) --st.menu_cancel_hold;
+        if (st.menu_start_hold > 0) --st.menu_start_hold;
+        if (st.menu_nav_y_hold > 0) {
+            --st.menu_nav_y_hold;
+            if (st.menu_nav_y_hold == 0) st.menu_nav_y_dir = 0;
+        }
+        if (st.menu_nav_x_hold > 0) {
+            --st.menu_nav_x_hold;
+            if (st.menu_nav_x_hold == 0) st.menu_nav_x_dir = 0;
+        }
+        if (st.wheel_hold_frames > 0) {
+            --st.wheel_hold_frames;
+            if (st.wheel_hold_frames == 0) st.active_wheel_dir = 0;
+        }
+        if (st.active_wheel_dir == 0 && !st.wheel_queue.empty()) {
+            st.active_wheel_dir = st.wheel_queue.front();
+            st.wheel_queue.pop_front();
+            st.wheel_hold_frames = 3;
+            st.frame_wheel_pulse = st.active_wheel_dir;
+        }
+
+        // Re-evaluate Smart OS Cursor Capture & Hide state every present.
+        // On real (non-autotest) runs, coalesce a lightweight per-present GUI-thread check so
+        // GetClipCursor, blank sprite, and post-splash focus handover self-heal within 1 frame.
+        const bool want_capture = ComputeWantCursorCapture(st);
+        const bool want_hide = ComputeWantHideCursor(st);
+        const bool want_tick = !st.autotest_active.load(std::memory_order_relaxed) &&
+                               (want_capture || want_hide || !st.window_focused.load(std::memory_order_relaxed));
+        ApplyOsCursorCaptureLocked(st, want_capture, want_hide, false, want_tick);
+
+        // Allow LMB click dismissal during FMV (skip cutscene) and in-game non-pointer modals
+        // (Tutorial Tips / Mission Objectives) without ever showing or unlocking the OS cursor.
+        if (st.non_pointer_lmb_pending) {
+            st.non_pointer_lmb_pending = false;
+            if (!st.overlay_open.load(std::memory_order_acquire) && !input_rec::ShouldBypassMkb()) {
+                if (phase == perf::Phase::Fmv) {
+                    st.menu_start_hold = std::max(st.menu_start_hold, 4);
+                    st.menu_confirm_hold = std::max(st.menu_confirm_hold, 4);
+                } else if (non_pointer_modal) {
+                    st.menu_confirm_hold = std::max(st.menu_confirm_hold, 4);
+                    st.non_pointer_ui_confirm_pending.store(true, std::memory_order_release);
+                }
             }
         }
-    }
 
-    // Advance latched Esc / wheel / menu-mouse pulse hold counters once per present
-    if (st.esc_hold_frames > 0) --st.esc_hold_frames;
-    if (st.menu_confirm_hold > 0) --st.menu_confirm_hold;
-    if (st.menu_cancel_hold > 0) --st.menu_cancel_hold;
-    if (st.menu_start_hold > 0) --st.menu_start_hold;
-    if (st.menu_nav_y_hold > 0) {
-        --st.menu_nav_y_hold;
-        if (st.menu_nav_y_hold == 0) st.menu_nav_y_dir = 0;
-    }
-    if (st.menu_nav_x_hold > 0) {
-        --st.menu_nav_x_hold;
-        if (st.menu_nav_x_hold == 0) st.menu_nav_x_dir = 0;
-    }
-    if (st.wheel_hold_frames > 0) {
-        --st.wheel_hold_frames;
-        if (st.wheel_hold_frames == 0) st.active_wheel_dir = 0;
-    }
-    if (st.active_wheel_dir == 0 && !st.wheel_queue.empty()) {
-        st.active_wheel_dir = st.wheel_queue.front();
-        st.wheel_queue.pop_front();
-        st.wheel_hold_frames = 3;
-        st.frame_wheel_pulse = st.active_wheel_dir;
-    }
-
-    // Re-evaluate Smart OS Cursor Capture state every present
-    const bool want_capture = ComputeWantCursorCapture(st);
-    ApplyOsCursorCaptureLocked(st, want_capture);
-
-    // During FMV / cutscenes (where HUD::Update UIManager is inactive), allow LMB click to skip cleanly via Start pulse.
-    if (want_capture || st.overlay_open.load(std::memory_order_acquire) || input_rec::ShouldBypassMkb()) {
-        st.ui_moved_pending = false;
-        st.ui_lmb_click_pending = false;
-        st.ui_rmb_click_pending = false;
-        st.ui_wheel_pending = 0;
-        if (want_capture) {
-            st.ui_screen_name.clear();
-            st.ui_hovered_idx = -1;
-            st.ui_item_count = 0;
-        }
-    } else if (phase == perf::Phase::Fmv) {
-        if (st.ui_lmb_click_pending) {
+        if (want_capture || want_hide || st.overlay_open.load(std::memory_order_acquire) ||
+            input_rec::ShouldBypassMkb()) {
+            st.ui_moved_pending = false;
             st.ui_lmb_click_pending = false;
-            st.menu_start_hold = std::max(st.menu_start_hold, 4);
-            st.menu_confirm_hold = std::max(st.menu_confirm_hold, 4);
+            st.ui_rmb_click_pending = false;
+            st.ui_wheel_pending = 0;
+            if (want_capture || want_hide) {
+                st.ui_screen_name.clear();
+                st.ui_hovered_idx = -1;
+                st.ui_item_count = 0;
+            }
         }
-        st.ui_moved_pending = false;
-        st.ui_rmb_click_pending = false;
-        st.ui_wheel_pending = 0;
+        overlay_after = st.overlay_open.load(std::memory_order_acquire);
+    }
+    if (overlay_after != overlay_before) {
+        SyncImGuiMouseFlags(overlay_after, true);
     }
 }
 
@@ -1719,7 +2182,11 @@ bool ConsumeCameraMouseDelta(float& out_d_yaw_rad, float& out_d_pitch_rad, int32
     int64_t dy64 = st.raw_dy.exchange(0, std::memory_order_acq_rel);
 
     std::lock_guard<std::mutex> lk(st.lock);
-    if (input_rec::ShouldBypassMkb() || !st.cursor_captured.load(std::memory_order_relaxed)) {
+    const bool mkb_owns = (st.cfg.input_mode == InputMode::Mkb) ||
+                          (st.cfg.input_mode == InputMode::Auto &&
+                           st.active_device.load(std::memory_order_relaxed) == ActiveDevice::Mkb);
+    if (input_rec::ShouldBypassMkb() || !st.cursor_captured.load(std::memory_order_relaxed) || !mkb_owns ||
+        st.cur_phase.load(std::memory_order_relaxed) != perf::Phase::GameplayActive) {
         st.smooth_dx = 0.0f;
         st.smooth_dy = 0.0f;
         st.frame_mouse_dx = 0;
@@ -1833,12 +2300,16 @@ bool IsOverlayOpen() { return St().overlay_open.load(std::memory_order_relaxed);
 void SetOverlayOpen(bool open) {
     MkbState& st = St();
     st.overlay_open.store(open, std::memory_order_release);
-    SyncImGuiNoMouseCursorFlag(open);
+    SyncImGuiMouseFlags(open, true);
     std::lock_guard<std::mutex> lk(st.lock);
-    ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), true);
+    ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
 }
 bool IsAutotestActive() { return St().autotest_active.load(std::memory_order_relaxed); }
 void SetActionMapCallback(ActionMapCallback cb) { St().action_cb.store(cb, std::memory_order_release); }
+
+bool ConsumeNonPointerModalConfirm() {
+    return St().non_pointer_ui_confirm_pending.exchange(false, std::memory_order_acq_rel);
+}
 
 bool ConsumeMenuMouseEvent(MenuMouseState& out) {
     MkbState& st = St();
@@ -2019,9 +2490,7 @@ void DrawOverlayUi(double fps) {
     }
     ImGui::End();
     if (!open) {
-        st.overlay_open.store(false, std::memory_order_release);
-        std::lock_guard<std::mutex> lk(st.lock);
-        ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st));
+        SetOverlayOpen(false);
     }
 }
 

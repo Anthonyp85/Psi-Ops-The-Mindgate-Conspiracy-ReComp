@@ -38,7 +38,7 @@ namespace {
 struct OverlayState {
     bool initialized = false;
     bool theme_applied = false;
-    bool show_hud = true;
+    bool show_hud = false;
     int active_tab = 0;
     bool chord_prev = false;
     upscale::PluginProbe probe{};
@@ -46,6 +46,8 @@ struct OverlayState {
     std::vector<app::MonitorInfo> monitors;
     std::string diag_status;
 };
+
+std::atomic<bool> g_show_hud{false};
 
 OverlayState& St() {
     static OverlayState s;
@@ -99,12 +101,16 @@ void DrawLiveHud(double fps) {
 
 }  // namespace
 
+bool HasVisibleUi() { return mkb::IsOverlayOpen() || g_show_hud.load(std::memory_order_relaxed); }
+
 void Init() {
     OverlayState& st = St();
     st.probe = upscale::ProbePlugins(false);
     st.gpus = app::EnumerateGpuAdapters();
     st.monitors = app::EnumerateMonitors();
     st.initialized = true;
+    g_show_hud.store(st.show_hud, std::memory_order_relaxed);
+    gpu::SetUiVisibleCallback(HasVisibleUi);
     if (CheckOpenSettingsCliOrEnv()) {
         mkb::SetOverlayOpen(true);
     }
@@ -153,7 +159,9 @@ void Draw(double fps) {
 
     if (ImGui::Begin("Psi-Ops: The Mindgate Conspiracy - Live Settings (F1 / BACK+L3)", &keep_open,
                      ImGuiWindowFlags_NoCollapse)) {
-        ImGui::Checkbox("Show Performance & Upscaler HUD", &st.show_hud);
+        if (ImGui::Checkbox("Show Performance & Upscaler HUD", &st.show_hud)) {
+            g_show_hud.store(st.show_hud, std::memory_order_relaxed);
+        }
         ImGui::SameLine();
         ImGui::TextDisabled("  |  LB / RB switch tabs  |  Changes save & apply live");
         ImGui::Separator();

@@ -103,7 +103,7 @@ void OnWindowCreated(void* window_handle);
 bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* result);
 void OnPadPoll(int port, input::Pad& pad);
 void OnPresent(uint64_t present_frame, perf::Phase phase, bool modal_ui_open, std::filesystem::path& out_capture_bmp,
-               bool& out_should_exit);
+               bool& out_should_exit, bool non_pointer_modal = false);
 void DrawOverlayUi(double fps);
 
 // Query state for Psi-Ops binary-verified camera/input hooks.
@@ -131,6 +131,8 @@ struct MenuMouseState {
 };
 // Consumed on the guest main thread inside Hook_HudUpdate; returns true if menu input should be processed.
 bool ConsumeMenuMouseEvent(MenuMouseState& out);
+// Consumed once by Hook_HudUpdate when LMB is clicked during an in-game non-pointer modal (Tips / Objectives).
+bool ConsumeNonPointerModalConfirm();
 // Pulses Xbox pad A / B / Start for screens driven by XInput (e.g. AttractMode / FMV skip).
 void PulseMenuPad(bool confirm_a, bool cancel_b, bool start);
 // Reports active UI screen / hovered widget telemetry for --state-log JSONL verification.

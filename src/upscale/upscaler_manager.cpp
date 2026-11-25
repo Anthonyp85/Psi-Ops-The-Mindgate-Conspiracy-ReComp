@@ -284,6 +284,42 @@ public:
         if (!EnsureTemporalTargets(render_w, render_h, vp_w, vp_h)) return;
         auto* cmd = static_cast<ID3D12GraphicsCommandList*>(cmd_list);
         if (cmd && tb->Prewarm(cmd, render_w, render_h, vp_w, vp_h, s.upscale_quality, s.dlss_preset)) {
+            // Execute one dummy temporal evaluation at boot so retail upscaler drivers (e.g. DLSS 4 NGX)
+            // JIT their internal compute/tensor pipelines during startup instead of on frame 1 of 3D gameplay.
+            ComPtr<ID3D12Resource> dummy_color;
+            D3D12_RESOURCE_STATES dummy_state = D3D12_RESOURCE_STATE_COMMON;
+            if (MakeTex2D(DXGI_FORMAT_B8G8R8A8_UNORM, render_w, render_h, D3D12_RESOURCE_FLAG_NONE, dummy_color,
+                          dummy_state)) {
+                TemporalExecDesc td{};
+                td.cmd = cmd;
+                td.color = dummy_color.Get();
+                td.color_state = &dummy_state;
+                td.color_fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+                td.depth = depth_r32f_tex_.Get();
+                td.depth_state = &depth_r32f_state_;
+                td.motion_vectors = mv_tex_.Get();
+                td.mv_state = &mv_state_;
+                td.reactive_mask = reactive_tex_.Get();
+                td.reactive_state = &reactive_state_;
+                td.output = temporal_out_tex_.Get();
+                td.output_state = &temporal_out_state_;
+                td.render_w = render_w;
+                td.render_h = render_h;
+                td.out_w = vp_w;
+                td.out_h = vp_h;
+                td.sharpness = std::clamp(float(s.upscale_sharpness) / 100.0f, 0.0f, 1.0f);
+                td.dt_ms = 16.667f;
+                td.near_plane = 0.1f;
+                td.far_plane = 1000.0f;
+                td.fov_y_rad = 1.0f;
+                td.reset = true;
+                td.quality = s.upscale_quality;
+                td.dlss_preset = s.dlss_preset;
+                tb->Execute(td);
+                if (host_.flush) host_.flush(host_.ctx);
+                tb->ResetHistory();
+                force_reset_ = true;
+            }
             std::lock_guard<std::mutex> lk(status_lock_);
             status_.dlss_available = dlss_tried_ ? (dlss_ && dlss_->IsAvailable()) : dlss_avail_hint_;
             status_.fsr3_available = fsr3_tried_ ? (fsr3_ && fsr3_->IsAvailable()) : fsr3_avail_hint_;
@@ -396,8 +432,10 @@ private:
     void UpdateStatus(app::UpscalerMode req, app::UpscalerMode active, const gpu::UpscalerFrameDesc& fd, bool temporal,
                       bool fallback, const std::string& detail) {
         std::lock_guard<std::mutex> lk(status_lock_);
-        bool changed = (status_.active_mode != uint32_t(active) || status_.temporal_active != temporal ||
-                        status_.render_w != fd.render_w || status_.vp_w != fd.vp_w);
+        // Only emit LOGR on genuine mode/fallback/resolution changes, not transient 2D/menu/FMV temporal toggles.
+        bool changed = (status_.requested_mode != uint32_t(req) || status_.active_mode != uint32_t(active) ||
+                        status_.fallback_active != fallback || status_.render_w != fd.render_w ||
+                        status_.render_h != fd.render_h || status_.vp_w != fd.vp_w || status_.vp_h != fd.vp_h);
         status_.requested_mode = uint32_t(req);
         status_.active_mode = uint32_t(active);
         status_.render_w = fd.render_w;

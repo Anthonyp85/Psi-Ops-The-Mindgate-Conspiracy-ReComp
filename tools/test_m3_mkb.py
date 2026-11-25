@@ -18,8 +18,9 @@ Verifies quantitatively across Win64 & WSL2 Linux (zero OS SendInput):
   6. WASD diagonal normalization (W, W+D, W+A, S+D, S+A magnitude == 1.000 +/- 0.002)
   7. Queued WheelUp/WheelDown pulses, direct 1-key bindings, context-aware latched Esc,
      and Auto hot-switching (mkb <-> controller)
-  8. Smart OS Cursor Capture & Release states (captured ONLY in focused unpaused 3D
-     gameplay; released on Title, Main Menu, FMV, Pause, F1 Overlay, Focus Loss)
+  8. Smart OS Cursor Capture & Release states (locked & invisible across focused
+     GameplayActive including Level 00 tutorial/objective popups, FMV, and Loading;
+     released & visible ONLY on TitleMenu, Paused, F1 Overlay, and Focus Loss)
   9. Portable OS-independent settings.toml [controls] & [controls.bindings]
      (Primary + Secondary string tokens) save/load parity across Windows & Linux.
 """
@@ -165,11 +166,12 @@ key_ms 67200 67600 W,A
 key_ms 67800 68200 S,D
 key_ms 68400 68800 S,A
 
-# 13. Queued WheelUp/WheelDown pulses, direct 1-key bindings, LMB fire, jump & gameplay PNG
+# 13. Queued WheelUp/WheelDown pulses, direct 1-key bindings, LMB fire, RMB aim, jump & gameplay PNG
 wheel_ms 69200 1
 wheel_ms 69500 -1
 key_ms 69800 70200 1
 key_ms 70400 70800 LMB
+key_ms 70820 70980 RMB
 key_ms 71000 71400 Space
 capture_ms 71600 mkb_gameplay.bmp
 
@@ -440,11 +442,15 @@ def evaluate_mkb_state_log(state_log_path: Path) -> tuple[list[str], list[str], 
 
     # 8. Smart OS Cursor Capture, real OS-level visibility (GetCursorInfo / SDL_CursorVisible), & Mouse Menus
     cursor_windows = {
-        "cursor_fmv": (7500, 8500, False, True, None),
+        "cursor_fmv": (7500, 8500, True, False, None),
         "cursor_title": (25800, 26300, False, True, "title_menu"),
         "cursor_main_menu": (28200, 28800, False, True, "title_menu"),
-        "cursor_cutscene": (33800, 34400, False, True, None),
+        "cursor_cutscene": (33800, 34400, True, False, None),
+        "cursor_level00_tip_popup": (58950, 59450, True, False, None),
+        "cursor_level00_post_tip": (59550, 60400, True, False, "gameplay_active"),
         "cursor_gameplay": (60900, 61300, True, False, "gameplay_active"),
+        "cursor_after_lmb_rmb": (70850, 71500, True, False, "gameplay_active"),
+        "cursor_auto_controller_hidden": (72050, 72350, True, False, "gameplay_active"),
         "cursor_overlay_open": (73100, 73350, False, True, None),
         "cursor_overlay_closed": (73500, 73750, True, False, "gameplay_active"),
         "cursor_focus_lost": (73900, 74150, False, True, None),
@@ -480,6 +486,34 @@ def evaluate_mkb_state_log(state_log_path: Path) -> tuple[list[str], list[str], 
             errs.append(f"Phase '{label}' mismatch: expected '{want_phase}', got {sample.get('phase')!r}.")
     metrics["cursor_states"] = cursor_states
     metrics["os_cursor_states"] = os_cursor_states
+
+    # 8a. Continuous GameplayActive + Tip (state==4) cursor invariant: 0 unlock leaks and 0 visible-cursor leaks
+    #     across Level 00 opening tutorial/objectives popup, fire (LMB), aim (RMB), and Auto hot-switch [58850..72900ms].
+    gp_cont = [
+        r
+        for r in _window(records, 58850, 72900)
+        if (str(r.get("phase", "")) == "gameplay_active" or int(r.get("state", -1)) == 4)
+        and not bool(r.get("overlay_open", False))
+        and bool(r.get("window_focused", True))
+    ]
+    metrics["gameplay_cursor_checked_frames"] = len(gp_cont)
+    if not gp_cont:
+        errs.append("No continuous gameplay_active/tip frames found in [58850..72900ms] for cursor leak invariant.")
+    else:
+        unlock_leaks = [r for r in gp_cont if not bool(r.get("cursor_captured", False))]
+        vis_leaks = [r for r in gp_cont if bool(r.get("os_cursor_visible", True))]
+        metrics["gameplay_cursor_unlock_leaks"] = len(unlock_leaks)
+        metrics["gameplay_os_cursor_visible_leaks"] = len(vis_leaks)
+        if unlock_leaks:
+            errs.append(
+                f"Gameplay cursor unexpectedly unlocked on {len(unlock_leaks)}/{len(gp_cont)} frames in [58850..72900ms] "
+                f"(first at {_rec_ms(unlock_leaks[0]):.1f}ms)."
+            )
+        if vis_leaks:
+            errs.append(
+                f"OS cursor leaked visible on {len(vis_leaks)}/{len(gp_cont)} gameplay frames in [58850..72900ms] "
+                f"(first at {_rec_ms(vis_leaks[0]):.1f}ms)."
+            )
 
     # 8b. Verify pure mouse menu hover detection on RootMenuContent and Pause Menu
     w_main_hover = _window(records, 28550, 28950)
@@ -714,12 +748,14 @@ def _self_test_mkb_logic(tmp_dir: Path) -> None:
     rpc = 0.0007853981633974483
     cm360 = ((2.0 * math.pi) / rpc) / 800.0 * 2.54
     rows = [
-        {"eff_us": 8000_000, "phase": "fmv", "cursor_captured": False, "os_cursor_visible": True},
+        {"eff_us": 8000_000, "phase": "fmv", "cursor_captured": True, "os_cursor_visible": False},
         {"eff_us": 26000_000, "phase": "title_menu", "cursor_captured": False, "os_cursor_visible": True, "ui_screen": "AttractMode"},
         {"eff_us": 28500_000, "phase": "title_menu", "cursor_captured": False, "os_cursor_visible": True, "ui_screen": "RootMenuContent"},
         {"eff_us": 28700_000, "phase": "title_menu", "cursor_captured": False, "os_cursor_visible": True, "ui_screen": "RootMenuContent", "ui_hovered_idx": 0, "ui_item_count": 4},
-        {"eff_us": 34000_000, "phase": "fmv", "cursor_captured": False, "os_cursor_visible": True},
-        {"eff_us": 61100_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False},
+        {"eff_us": 34000_000, "phase": "fmv", "cursor_captured": True, "os_cursor_visible": False},
+        {"eff_us": 59100_000, "phase": "paused", "state": 4, "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False},
+        {"eff_us": 59700_000, "phase": "gameplay_active", "state": 0, "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False},
+        {"eff_us": 61100_000, "phase": "gameplay_active", "state": 0, "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False},
         {"eff_us": 61400_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "mouse_dx": 1, "mouse_dy": 0, "d_yaw": rpc, "d_pitch": 0.0, "cm_per_360": cm360},
         {"eff_us": 61700_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "mouse_dx": 0, "mouse_dy": 1, "d_yaw": 0.0, "d_pitch": rpc, "cm_per_360": cm360},
         {"eff_us": 62100_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "mouse_dx": 400, "mouse_dy": 0, "d_yaw": 400.0 * rpc, "d_pitch": 0.0},
@@ -737,7 +773,8 @@ def _self_test_mkb_logic(tmp_dir: Path) -> None:
         {"eff_us": 68600_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "wasd_x": -0.707107, "wasd_y": -0.707107, "wasd_mag": 1.0},
         {"eff_us": 69220_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "wheel_pulse": 1},
         {"eff_us": 69520_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "wheel_pulse": -1},
-        {"eff_us": 72150_000, "phase": "gameplay_active", "input_device": "controller", "cursor_captured": False, "os_cursor_visible": True},
+        {"eff_us": 71100_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False},
+        {"eff_us": 72150_000, "phase": "gameplay_active", "input_device": "controller", "cursor_captured": True, "os_cursor_visible": False},
         {"eff_us": 72650_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False},
         {"eff_us": 73200_000, "phase": "gameplay_active", "input_device": "mkb", "overlay_open": True, "cursor_captured": False, "os_cursor_visible": True},
         {"eff_us": 73600_000, "phase": "gameplay_active", "input_device": "mkb", "overlay_open": False, "cursor_captured": True, "os_cursor_visible": False},
