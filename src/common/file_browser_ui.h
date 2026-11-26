@@ -43,6 +43,9 @@ private:
     app::DiscValidation validation_{};
     bool has_validation_ = false;
     std::string status_error_;
+    // Set when the folder changes from the list / Up / Open Folder so gamepad & keyboard focus lands on the
+    // new listing instead of a widget that no longer exists.
+    bool focus_list_pending_ = false;
 };
 
 }  // namespace file_browser_ui

@@ -4,7 +4,9 @@
 
 Enforces copyright-clean distribution, full Git history hygiene, pure-LF patch parity,
 Win64 signed retail upscaler integrity, Linux ELF64 GLIBC_2.35 / $ORIGIN RPATH isolation,
-and untouched local source media verification.
+and untouched local source media verification. Gate 2b scans project-built PE/ELF/.lib binaries
+(out/build/* or --build-dir / --scan-binary) and the packaged project binaries for leaked host paths
+(user profiles, home dirs, drive/WSL workspace roots, CMake build/_deps trees, absolute PDB paths).
 """
 
 from __future__ import annotations
@@ -28,8 +30,10 @@ from typing import Any
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_REPO_NAME = "Psi-Ops-The-Mindgate-Conspiracy-ReComp"
-DEFAULT_VERSION = "v1.0.0"
+DEFAULT_VERSION = "v1.1.0"
 PINNED_SDK_SHA = "cc9edda3a821a4204dc28783f429b88a27ade4f9"
+ALLOWED_OWNER_NAME = "anthonyp85"
+ALLOWED_OWNER_EMAIL = "214066322+anthonyp85@users.noreply.github.com"
 
 # Expected immutable source media ground truth (located dynamically in Gate 6)
 EXPECTED_XISO_SIZE = 2801008640
@@ -62,22 +66,86 @@ PINNED_VENDOR_DLLS: dict[str, tuple[str, str]] = {
 
 # Hex-encoded sanitization tokens (case-insensitive) so this auditor carries zero literal matches
 _SANITIZE_TOKENS_HEX = [
-    "616672696361",                  # personal profile username
-    "76696d6d",                      # companion site token
-    "643a5c5f30335f7073696f7073",    # local drive workspace path (backslash)
-    "643a2f5f30335f7073696f7073",    # local drive workspace path (slash)
-    "737566666572696e67",            # foreign title token
-    "3464353730303162",              # foreign title id
-    "7375727265616c",                # foreign developer token
-    "746f72717565",                  # foreign protagonist token
-    "6361726e617465",                # foreign setting token
-    "6162626f7474",                  # foreign setting token
-    "3535633930326636",              # foreign hash token
+    "616672696361",                              # personal profile username
+    "616e74686f6e79707269746368657474",          # private email local-part
+    "676d61696c2e636f6d",                        # private webmail domain
+    "76696d6d",                                  # companion site token
+    "5f30335f7073696f7073",                      # local workspace directory token
+    "643a5c5f30335f7073696f7073",                # local drive workspace path (backslash)
+    "643a2f5f30335f7073696f7073",                # local drive workspace path (slash)
+    "5f30325f746865737566666572696e67",          # foreign local workspace token
+    "737566666572696e677562756e7475",            # local WSL distro token
+    "633a5c75736572735c",                        # Windows user profile path (backslash)
+    "633a2f75736572732f",                        # Windows user profile path (slash)
+    "2f6d6e742f642f",                            # WSL host drive mount path
+    "737566666572696e67",                        # foreign title token
+    "3464353730303162",                          # foreign title id
+    "7375727265616c",                            # foreign developer token
+    "746f72717565",                              # foreign protagonist token
+    "6361726e617465",                            # foreign setting token
+    "6162626f7474",                              # foreign setting token
+    "3535633930326636",                          # foreign hash token
 ]
 SANITIZE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (f"token_{i}", re.compile(re.escape(bytes.fromhex(h).decode("ascii")), re.IGNORECASE))
     for i, h in enumerate(_SANITIZE_TOKENS_HEX)
 ]
+
+# Hex-encoded PII tokens scanned in both ASCII & UTF-16LE across EVERY packaged archive member (including binaries)
+_BINARY_PII_STRICT_HEX = [
+    ("email_local", "616e74686f6e79707269746368657474"),
+    ("email_domain", "676d61696c2e636f6d"),
+    ("ws_psiops", "5f30335f7073696f7073"),
+    ("ws_foreign", "5f30325f746865737566666572696e67"),
+    ("wsl_distro", "737566666572696e677562756e7475"),
+    ("win_users_bs", "633a5c75736572735c"),
+    ("win_users_fs", "633a2f75736572732f"),
+    ("wsl_mnt_d", "2f6d6e742f642f"),
+    ("profile_bs", "75736572735c616672696361"),
+    ("profile_fs", "75736572732f616672696361"),
+    ("profile_home", "686f6d652f616672696361"),
+    ("profile_dir_bs", "5c6166726963615c"),
+    ("profile_dir_fs", "2f6166726963612f"),
+]
+_BINARY_PII_STRICT: list[tuple[str, bytes, bytes]] = [
+    (
+        name,
+        bytes.fromhex(h),
+        bytes.fromhex(h).decode("ascii").encode("utf-16le"),
+    )
+    for name, h in _BINARY_PII_STRICT_HEX
+]
+# Bare tokens strictly forbidden in all project-owned binaries and all text/doc/source files
+# (upstream third-party compiler/ICU/vendor libraries legitimately embed Unicode/CLDR/locale
+# geographic tables and LLVM instruction mnemonics).
+_PROJECT_ONLY_BARE_TOKENS: list[tuple[str, bytes, bytes]] = [
+    (
+        "profile_bare",
+        bytes.fromhex("616672696361"),
+        bytes.fromhex("616672696361").decode("ascii").encode("utf-16le"),
+    ),
+    (
+        "companion_site",
+        bytes.fromhex("76696d6d"),
+        bytes.fromhex("76696d6d").decode("ascii").encode("utf-16le"),
+    ),
+]
+_UPSTREAM_THIRD_PARTY_BINARIES = {
+    "compiler/clang.exe",
+    "compiler/lld-link.exe",
+    "compiler/clang",
+    "compiler/ld.lld",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll",
+    "msvcp140.dll",
+    "compiler/vcruntime140.dll",
+    "compiler/vcruntime140_1.dll",
+    "compiler/msvcp140.dll",
+    "plugins/nvngx_dlss.dll",
+    "plugins/amd_fidelityfx_loader_dx12.dll",
+    "plugins/amd_fidelityfx_upscaler_dx12.dll",
+    "plugins/libxess.dll",
+}
 
 FORBIDDEN_GIT_EXTS = {
     ".exe", ".dll", ".so", ".dylib", ".lib", ".a", ".obj", ".o", ".pdb", ".dmp",
@@ -106,7 +174,7 @@ LINUX_CORE_LIBS = {
 
 @dataclass
 class GateResult:
-    gate: int
+    gate: int | str
     name: str
     passed: bool = False
     errors: list[str] = field(default_factory=list)
@@ -152,6 +220,210 @@ def _scan_sanitization(path_str: str, data: bytes) -> list[str]:
     return hits
 
 
+def _is_upstream_third_party_binary(member_name: str) -> bool:
+    norm = member_name.replace("\\", "/").lstrip("./")
+    if norm in _UPSTREAM_THIRD_PARTY_BINARIES:
+        return True
+    return norm.startswith("compiler/lib/") and ".so" in pathlib.Path(norm).name
+
+
+def _scan_binary_and_text_pii(member_name: str, data: bytes) -> list[str]:
+    """Scan raw member bytes (both ASCII and UTF-16LE, case-insensitive) for personal/host PII."""
+    low = data.lower()
+    hits: list[str] = []
+    for rule_name, ascii_needle, utf16_needle in _BINARY_PII_STRICT:
+        if ascii_needle in low:
+            hits.append(f"{member_name}: matched forbidden PII rule ({rule_name}, ASCII)")
+        if utf16_needle in low:
+            hits.append(f"{member_name}: matched forbidden PII rule ({rule_name}, UTF-16LE)")
+
+    if not _is_upstream_third_party_binary(member_name):
+        for rule_name, ascii_needle, utf16_needle in _PROJECT_ONLY_BARE_TOKENS:
+            if ascii_needle in low:
+                hits.append(f"{member_name}: matched forbidden PII rule ({rule_name}, ASCII)")
+            if utf16_needle in low:
+                hits.append(f"{member_name}: matched forbidden PII rule ({rule_name}, UTF-16LE)")
+
+    return hits
+
+
+# --- Gate 2b: generic host-path leak scanner for project-built PE/ELF/COFF-archive binaries -----------------------
+# Complements the hex-token PII rules above with structural patterns, so any builder's machine (other user names,
+# drives, WSL mounts, CI runners) is caught too. Anchored to avoid false positives on legitimate strings such as
+# https:// URLs, C:\Windows\..., C:\ProgramData, ~/.local/share or /usr/include/... .
+_BINARY_ASCII_STR_RE = re.compile(rb"[\x20-\x7e]{5,}")
+_BINARY_UTF16LE_STR_RE = re.compile(rb"(?:[\x20-\x7e]\x00){5,}")
+_URL_STRIP_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+# Prebuilt Microsoft CRT/STL static objects carry Microsoft's own build-agent paths (<drive>:\a\_work\N\s\src\vctools\...)
+_MSVC_CRT_INTERNAL_RE = re.compile(
+    r"[A-Za-z]:[/\\]a[/\\]_work[/\\]\d+[/\\]s[/\\](?:src[/\\]vctools[/\\]crt|binaries)[/\\][^\s\"'<>]+",
+    re.IGNORECASE,
+)
+_POSIX_ANCHOR = r"(?<![A-Za-z0-9_.:/-])"
+BINARY_PATH_LEAK_REGEXES: list[tuple[str, re.Pattern[str]]] = [
+    ("windows_users_path", re.compile(r"[A-Za-z]:[/\\]Users[/\\][A-Za-z0-9_. -]+", re.IGNORECASE)),
+    ("posix_home_or_users_path", re.compile(_POSIX_ANCHOR + r"/(?:home|Users)/[A-Za-z0-9_.-]+[/\\]")),
+    ("wsl_mnt_path", re.compile(_POSIX_ANCHOR + r"/mnt/[A-Za-z]/[A-Za-z0-9_.-]+")),
+    ("worktree_or_agent_dir", re.compile(r"(?:[/\\]\.gemini[/\\]|[/\\]worktrees[/\\][0-9a-f-]{8,})", re.IGNORECASE)),
+    ("cmake_build_dir", re.compile(r"(?:^|[/\\])out[/\\]build(?:[/\\]|$)", re.IGNORECASE)),
+    ("fetchcontent_deps_dir", re.compile(r"(?:^|[/\\])_deps[/\\][A-Za-z0-9_.-]+-(?:src|build)(?:[/\\]|$)", re.IGNORECASE)),
+    ("abs_pdb_path", re.compile(r"(?:[A-Za-z]:[/\\]|" + _POSIX_ANCHOR + r"/)[A-Za-z0-9_./\\: -]{1,240}\.pdb\b", re.IGNORECASE)),
+    ("abs_win_underscore_root", re.compile(r"[A-Za-z]:[/\\]_[A-Za-z0-9_.-]{2,}")),
+    (
+        "abs_win_source_path",
+        re.compile(r"[A-Za-z]:[/\\][A-Za-z0-9_./\\+ -]{1,240}\.(?:c|cc|cpp|cxx|h|hpp|inl|obj|o)\b", re.IGNORECASE),
+    ),
+    (
+        "abs_posix_build_source_path",
+        re.compile(
+            _POSIX_ANCHOR
+            + r"/(?:root|tmp|var/folders|private/var|opt|work|workspace|runner|srv)/[A-Za-z0-9_./+-]{1,240}"
+            r"\.(?:c|cc|cpp|cxx|h|hpp|inl|o)\b"
+        ),
+    ),
+]
+# Generic directory / account names that must not become dynamic leak patterns
+_GENERIC_PATH_NAMES = {
+    "user", "users", "public", "default", "root", "admin", "administrator", "runner", "ubuntu", "deck",
+    "app", "src", "source", "bin", "lib", "opt", "cpu", "gpu", "xdk", "sdk", "build", "work", "workspace",
+    "repo", "recomp", "psiops", "psi-ops", "github", "home",
+}
+
+# Project-built binaries scanned inside the release archives (vendor/toolchain binaries are pinned elsewhere)
+PROJECT_WIN64_ARCHIVE_BINARIES = {"PsiOps.exe", "compiler/xbe_recomp.exe", "compiler/PsiOps.lib"}
+PROJECT_LINUX_ARCHIVE_BINARIES = {"PsiOps", "compiler/xbe_recomp"}
+# Project-built binaries looked up (relative) inside each scanned CMake build directory
+PROJECT_BUILD_DIR_BINARIES = (
+    "PsiOps.exe",
+    "PsiOps.dll",
+    "xbe_symbols.exe",
+    "compiler/xbe_recomp.exe",
+    "compiler/PsiOps.lib",
+    "PsiOps",
+    "libPsiOps.so",
+    "xbe_symbols",
+    "compiler/xbe_recomp",
+)
+DEFAULT_BINARY_BUILD_DIRS = (
+    "release",
+    "relwithdebinfo",
+    "linux-release",
+    "linux-cross-release",
+    "headers-only-win",
+    "headers-only-linux",
+)
+
+
+def _pe_codeview_pdb_paths(data: bytes) -> list[str]:
+    """Pure-Python PE/COFF CodeView (RSDS/NB10) debug-directory PDB path extractor (PE32 and PE32+)."""
+    out: list[str] = []
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return out
+    e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    if e_lfanew + 24 > len(data) or data[e_lfanew : e_lfanew + 4] != b"PE\x00\x00":
+        return out
+    coff = e_lfanew + 4
+    num_sections = struct.unpack_from("<H", data, coff + 2)[0]
+    size_opt = struct.unpack_from("<H", data, coff + 16)[0]
+    opt = coff + 20
+    if opt + size_opt > len(data) or size_opt < 96:
+        return out
+    magic = struct.unpack_from("<H", data, opt)[0]
+    if magic == 0x20B and size_opt >= 112 + 7 * 8:
+        num_dd, dd_base = struct.unpack_from("<I", data, opt + 108)[0], opt + 112
+    elif magic == 0x10B and size_opt >= 96 + 7 * 8:
+        num_dd, dd_base = struct.unpack_from("<I", data, opt + 92)[0], opt + 96
+    else:
+        return out
+    if num_dd <= 6:
+        return out
+    dbg_rva, dbg_size = struct.unpack_from("<II", data, dd_base + 6 * 8)
+    if dbg_rva == 0 or dbg_size < 28:
+        return out
+    sections: list[tuple[int, int, int, int]] = []
+    sec_base = opt + size_opt
+    for i in range(num_sections):
+        so = sec_base + i * 40
+        if so + 40 > len(data):
+            break
+        vsize, va, raw_size, raw_ptr = struct.unpack_from("<IIII", data, so + 8)
+        sections.append((va, max(vsize, raw_size), raw_ptr, raw_size))
+
+    def rva_to_off(rva: int) -> int | None:
+        for va, span, raw_ptr, raw_size in sections:
+            if va <= rva < va + span:
+                delta = rva - va
+                return raw_ptr + delta if delta < raw_size and raw_ptr + delta < len(data) else None
+        return None
+
+    dir_off = rva_to_off(dbg_rva)
+    if dir_off is None:
+        return out
+    for i in range(dbg_size // 28):
+        eo = dir_off + i * 28
+        if eo + 28 > len(data):
+            break
+        dbg_type, size_of_data, _addr, ptr_raw = struct.unpack_from("<IIII", data, eo + 12)
+        if dbg_type != 2 or ptr_raw == 0 or size_of_data < 16 or ptr_raw + size_of_data > len(data):
+            continue
+        cv = data[ptr_raw : ptr_raw + size_of_data]
+        raw: bytes | None = None
+        if cv[:4] == b"RSDS" and len(cv) >= 24:
+            raw = cv[24:]
+        elif cv[:4] == b"NB10" and len(cv) >= 16:
+            raw = cv[16:]
+        if raw is not None:
+            nul = raw.find(b"\x00")
+            out.append((raw[:nul] if nul >= 0 else raw).decode("utf-8", errors="replace"))
+    return out
+
+
+def _dynamic_leak_regexes(repo_root: pathlib.Path = REPO_ROOT) -> list[tuple[str, re.Pattern[str]]]:
+    """Leak patterns derived at runtime from this checkout's directory name and the auditing account name."""
+    extra: list[tuple[str, re.Pattern[str]]] = []
+    repo_dir = repo_root.name.strip()
+    if len(repo_dir) >= 4 and repo_dir.lower() not in _GENERIC_PATH_NAMES | {DEFAULT_REPO_NAME.lower()}:
+        extra.append(("repo_checkout_dir", re.compile(rf"[/\\]{re.escape(repo_dir)}(?:[/\\]|$)", re.IGNORECASE)))
+    for env_key in ("USERNAME", "USER", "LOGNAME"):
+        uname = os.environ.get(env_key, "").strip()
+        if len(uname) >= 3 and uname.lower() not in _GENERIC_PATH_NAMES:
+            extra.append(("host_username_dir", re.compile(rf"[/\\]{re.escape(uname)}(?:[/\\]|$)", re.IGNORECASE)))
+            break
+    return extra
+
+
+def scan_binary_paths(data: bytes, repo_root: pathlib.Path = REPO_ROOT) -> list[str]:
+    """Scan compiled binary bytes (ASCII/UTF-8, UTF-16LE strings and PE CodeView records) for host path leaks."""
+    findings: list[str] = []
+    seen: set[str] = set()
+
+    def record(tag: str, sample: str) -> None:
+        key = f"{tag}:{sample.strip()[:160]}"
+        if key not in seen:
+            seen.add(key)
+            findings.append(key)
+
+    for pdb in _pe_codeview_pdb_paths(data):
+        if "/" in pdb or "\\" in pdb or ":" in pdb:
+            record("pe_codeview_abs_pdb", pdb)
+
+    checks = BINARY_PATH_LEAK_REGEXES + _dynamic_leak_regexes(repo_root)
+
+    def check(strings: Any, enc: str) -> None:
+        for s in strings:
+            cleaned = _MSVC_CRT_INTERNAL_RE.sub("", _URL_STRIP_RE.sub("", s))
+            if not cleaned:
+                continue
+            for label, rx in checks:
+                m = rx.search(cleaned)
+                if m:
+                    record(f"{enc}:{label}", m.group(0))
+
+    check((m.group(0).decode("ascii", errors="ignore") for m in _BINARY_ASCII_STR_RE.finditer(data)), "ascii")
+    check((m.group(0).decode("utf-16le", errors="ignore") for m in _BINARY_UTF16LE_STR_RE.finditer(data)), "utf16le")
+    return findings
+
+
 def _is_pe_or_elf(data: bytes) -> str | None:
     if len(data) >= 4 and data[:4] == b"\x7fELF":
         return "ELF binary"
@@ -187,7 +459,7 @@ def _verify_authenticode_win32(path: pathlib.Path, expected_signer_substr: str) 
         return False, f"Authenticode verification error: {exc}"
 
 
-def _check_win64_exe_resources_and_exports(exe_path: pathlib.Path) -> list[str]:
+def _check_win64_exe_resources_and_exports(exe_path: pathlib.Path, version: str = DEFAULT_VERSION) -> list[str]:
     errors: list[str] = []
     try:
         import pefile
@@ -203,6 +475,32 @@ def _check_win64_exe_resources_and_exports(exe_path: pathlib.Path) -> list[str]:
         for rid, rname in ((3, "RT_ICON"), (14, "RT_GROUP_ICON"), (16, "RT_VERSION"), (24, "RT_MANIFEST")):
             if rid not in res_ids:
                 errors.append(f"{exe_path.name}: missing Win32 PE resource {rname}")
+
+        # Verify RT_VERSION FileVersion / ProductVersion match expected release version
+        want_ver = version.lstrip("v")
+        ver_strings: dict[str, str] = {}
+        if hasattr(pe, "FileInfo"):
+            for fi in pe.FileInfo:
+                for st in fi:
+                    if hasattr(st, "StringTable"):
+                        for tbl in st.StringTable:
+                            for k, v in tbl.entries.items():
+                                ver_strings[k.decode("utf-8", errors="replace")] = v.decode("utf-8", errors="replace")
+        for key in ("FileVersion", "ProductVersion"):
+            got = ver_strings.get(key, "")
+            if got != want_ver and not got.startswith(want_ver + "."):
+                errors.append(f"{exe_path.name}: RT_VERSION {key}={got!r} does not match {want_ver!r}")
+
+        # Verify PE RSDS debug record does not leak absolute build-machine PDB paths
+        if hasattr(pe, "DIRECTORY_ENTRY_DEBUG"):
+            for dbg in pe.DIRECTORY_ENTRY_DEBUG:
+                entry = getattr(dbg, "entry", None)
+                pdb_raw = getattr(entry, "PdbFileName", None)
+                if pdb_raw:
+                    pdb_str = pdb_raw.rstrip(b"\x00").decode("utf-8", errors="replace")
+                    if ":" in pdb_str or "\\" in pdb_str or "/" in pdb_str:
+                        errors.append(f"{exe_path.name}: RSDS PDB path leaks host directory ({pdb_str!r})")
+
         exports = set()
         if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
             for sym in pe.DIRECTORY_ENTRY_EXPORT.symbols:
@@ -330,7 +628,7 @@ def _git_out(repo: pathlib.Path, args: list[str], binary: bool = False) -> bytes
 
 
 def run_gate_1_git_history() -> GateResult:
-    res = GateResult(gate=1, name="Full Git Object History Scan")
+    res = GateResult(gate=1, name="Full Git Object History & Commit Metadata PII Scan")
     try:
         head_sha = str(_git_out(REPO_ROOT, ["rev-parse", "--verify", "HEAD"])).strip()
         commit_count = len(str(_git_out(REPO_ROOT, ["rev-list", "--all"])).splitlines())
@@ -341,6 +639,27 @@ def run_gate_1_git_history() -> GateResult:
     except Exception as exc:
         res.errors.append(f"Git HEAD unavailable (create local commit first): {exc}")
         return res
+
+    # Audit every commit's Author, Committer, and full Commit Message across HEAD/all refs
+    raw_log = str(_git_out(REPO_ROOT, ["log", "--all", "--format=%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B%x1e"]))
+    commits_audited = 0
+    for rec in raw_log.split("\x1e"):
+        rec = rec.strip("\r\n")
+        if not rec:
+            continue
+        parts = rec.split("\x1f", 5)
+        if len(parts) < 6:
+            continue
+        sha, an, ae, cn, ce, body = parts
+        commits_audited += 1
+        meta_blob = f"{an} <{ae}>\n{cn} <{ce}>\n{body}".encode("utf-8", errors="ignore")
+        res.errors.extend(_scan_sanitization(f"commit:{sha[:10]}", meta_blob)[:5])
+        for role, name, email in (("author", an, ae), ("committer", cn, ce)):
+            if name.strip().lower() == ALLOWED_OWNER_NAME and email.strip().lower() != ALLOWED_OWNER_EMAIL:
+                res.errors.append(
+                    f"commit {sha[:10]}: {role} email {email!r} must use noreply identity {ALLOWED_OWNER_EMAIL!r}"
+                )
+    res.details["commits_audited"] = commits_audited
 
     raw_objs = str(_git_out(REPO_ROOT, ["rev-list", "--objects", "--all"])).splitlines()
     blobs_checked = 0
@@ -528,6 +847,56 @@ def run_gate_2_head_hygiene() -> GateResult:
     return res
 
 
+def run_gate_2b_binary_hygiene(
+    build_dirs: list[pathlib.Path], explicit_binaries: list[pathlib.Path], require_any: bool = False
+) -> GateResult:
+    res = GateResult(gate="2b", name="Built Binary Path Hygiene (zero host/user/workspace/build/PDB paths)")
+    targets: list[pathlib.Path] = []
+    seen: set[pathlib.Path] = set()
+
+    def add(p: pathlib.Path) -> None:
+        rp = p.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            targets.append(p)
+
+    for b in explicit_binaries:
+        if b.is_file():
+            add(b)
+        else:
+            res.errors.append(f"Requested --scan-binary file does not exist: {b}")
+    dirs = build_dirs or [REPO_ROOT / "out" / "build" / d for d in DEFAULT_BINARY_BUILD_DIRS]
+    for d in dirs:
+        if not d.is_dir():
+            if build_dirs:
+                res.errors.append(f"Requested --build-dir directory does not exist: {d}")
+            continue
+        for rel in PROJECT_BUILD_DIR_BINARIES:
+            cand = d / rel
+            if cand.is_file():
+                add(cand)
+
+    scanned: list[dict[str, Any]] = []
+    for t in targets:
+        data = t.read_bytes()
+        leaks = scan_binary_paths(data)
+        try:
+            label = t.resolve().relative_to(REPO_ROOT).as_posix()
+        except ValueError:
+            label = t.name
+        scanned.append({"path": label, "bytes": len(data), "clean": not leaks, "leaks": leaks[:20]})
+        if leaks:
+            res.errors.append(f"{label}: binary host-path leak {leaks[:10]}")
+
+    if not targets:
+        msg = "No built project binaries found to scan (pass --build-dir / --scan-binary)."
+        (res.errors if require_any else res.warnings).append(msg)
+    res.details["binaries_scanned"] = len(scanned)
+    res.details["binaries"] = scanned
+    res.passed = len(res.errors) == 0
+    return res
+
+
 def run_gate_3_source_zip(dist_dir: pathlib.Path, repo_name: str, version: str) -> GateResult:
     res = GateResult(gate=3, name="source.zip Exact 1-to-1 HEAD Parity")
     src_zip = dist_dir / f"{repo_name}-{version}-source.zip"
@@ -563,6 +932,8 @@ def run_gate_3_source_zip(dist_dir: pathlib.Path, repo_name: str, version: str) 
             ext = pathlib.Path(rel).suffix.lower()
             if ext in FORBIDDEN_GIT_EXTS or _is_pe_or_elf(data):
                 res.errors.append(f"Forbidden binary inside source.zip: {rel}")
+            res.errors.extend(_scan_binary_and_text_pii(rel, data)[:5])
+            res.errors.extend(_scan_sanitization(rel, data)[:5])
 
     head_set = set(head_blobs)
     zip_set = set(zip_blobs)
@@ -685,15 +1056,21 @@ def run_gate_4_win64_zip(dist_dir: pathlib.Path, repo_name: str, version: str) -
                 ) or lower.startswith("compiler/work/"):
                     res.errors.append(f"Forbidden file inside win64-launcher.zip: {rel}")
 
+                data = zf.read(info)
+                res.errors.extend(_scan_binary_and_text_pii(rel, data)[:5])
+                if rel in PROJECT_WIN64_ARCHIVE_BINARIES:
+                    leaks = scan_binary_paths(data)
+                    if leaks:
+                        res.errors.append(f"{rel}: binary host-path leak {leaks[:10]}")
+
                 if lower.endswith((".exe", ".dll")):
-                    data = zf.read(info)
                     pe_ok, pe_msg = _inspect_pe64_bytes(data)
                     if not pe_ok:
                         res.errors.append(f"{rel}: {pe_msg}")
                     if rel == "PsiOps.exe":
                         tmp_exe = td_path / "PsiOps.exe"
                         tmp_exe.write_bytes(data)
-                        pe_err = _check_win64_exe_resources_and_exports(tmp_exe)
+                        pe_err = _check_win64_exe_resources_and_exports(tmp_exe, version)
                         res.errors.extend(pe_err)
                     if rel in PINNED_VENDOR_DLLS:
                         want_sha, want_signer = PINNED_VENDOR_DLLS[rel]
@@ -820,20 +1197,25 @@ def run_gate_5_linux_tarball(dist_dir: pathlib.Path, repo_name: str, version: st
             if rel.startswith("compiler/lib/"):
                 bundled_libs.add(pathlib.Path(rel).name)
 
-        # Second pass: pure-Python ELF64 audit on all binaries & bundled libs
+        # Second pass: pure-Python ELF64 & ASCII/UTF-16LE PII audit on all members
         for m in members:
             if not m.isfile():
                 continue
             rel = m.name.lstrip("./")
+            fh = tf.extractfile(m)
+            if fh is None:
+                continue
+            data = fh.read()
+            res.errors.extend(_scan_binary_and_text_pii(rel, data)[:5])
+            if rel in PROJECT_LINUX_ARCHIVE_BINARIES:
+                leaks = scan_binary_paths(data)
+                if leaks:
+                    res.errors.append(f"{rel}: binary host-path leak {leaks[:10]}")
             is_elf_target = rel in ("PsiOps", "compiler/xbe_recomp", "compiler/clang", "compiler/ld.lld") or rel.startswith(
                 "compiler/lib/"
             )
             if not is_elf_target:
                 continue
-            fh = tf.extractfile(m)
-            if fh is None:
-                continue
-            data = fh.read()
             try:
                 info = _parse_elf64(data)
             except Exception as exc:
@@ -939,16 +1321,21 @@ def run_gate_6_source_media() -> GateResult:
     return res
 
 
-def run_gate_4_ci_win64_unpacked() -> GateResult:
-    res = GateResult(gate=4, name="CI Win64 Headers-Only PE & Plugins Verification")
+def run_gate_4_ci_win64_unpacked(version: str = DEFAULT_VERSION) -> GateResult:
+    res = GateResult(gate=4, name="CI Win64 Headers-Only PE, PII & Plugins Verification")
     exe = REPO_ROOT / "out" / "build" / "headers-only-win" / "PsiOps.exe"
     if not exe.is_file():
         res.errors.append(f"Missing CI headers-only Win64 binary: {exe}")
     else:
-        ok, msg = _inspect_pe64_bytes(exe.read_bytes())
+        exe_data = exe.read_bytes()
+        ok, msg = _inspect_pe64_bytes(exe_data)
         if not ok:
             res.errors.append(f"PsiOps.exe: {msg}")
-        res.errors.extend(_check_win64_exe_resources_and_exports(exe))
+        res.errors.extend(_check_win64_exe_resources_and_exports(exe, version))
+        res.errors.extend(_scan_binary_and_text_pii("PsiOps.exe", exe_data)[:5])
+    recomp = REPO_ROOT / "out" / "build" / "headers-only-win" / "compiler" / "xbe_recomp.exe"
+    if recomp.is_file():
+        res.errors.extend(_scan_binary_and_text_pii("compiler/xbe_recomp.exe", recomp.read_bytes())[:5])
     plugins_dir = REPO_ROOT / "plugins"
     for rel, (want_sha, want_signer) in PINNED_VENDOR_DLLS.items():
         p = plugins_dir / pathlib.Path(rel).name
@@ -989,37 +1376,63 @@ def main(argv: list[str] | None = None) -> int:
         help="Platform scope when running with --ci (default: all).",
     )
     parser.add_argument("--out-json", type=pathlib.Path, default=None)
+    parser.add_argument(
+        "--build-dir",
+        type=pathlib.Path,
+        action="append",
+        default=[],
+        help="CMake build directory whose project binaries Gate 2b scans for host-path leaks (repeatable; "
+        "default: existing out/build/{" + ",".join(DEFAULT_BINARY_BUILD_DIRS) + "}).",
+    )
+    parser.add_argument(
+        "--scan-binary",
+        type=pathlib.Path,
+        action="append",
+        default=[],
+        help="Explicit PE/ELF/.lib file for Gate 2b to scan (repeatable).",
+    )
+    parser.add_argument("--skip-build-binaries", action="store_true", help="Skip Gate 2b (built binary path hygiene).")
     args = parser.parse_args(argv)
 
     dist_dir = args.dist_dir.resolve()
     if args.gates.strip():
-        selected = {int(tok.strip()) for tok in args.gates.split(",") if tok.strip()}
+        selected = {tok.strip().lower() for tok in args.gates.split(",") if tok.strip()}
     elif args.ci:
         if args.platform == "linux":
-            selected = {1, 2, 5}
+            selected = {"1", "2", "2b", "5"}
         elif args.platform == "win64":
-            selected = {1, 2, 4}
+            selected = {"1", "2", "2b", "4"}
         else:
-            selected = {1, 2, 3, 4, 5}
+            selected = {"1", "2", "2b", "3", "4", "5"}
     else:
-        selected = {1, 2, 3, 4, 5, 6}
+        selected = {"1", "2", "2b", "3", "4", "5", "6"}
+    if args.skip_build_binaries and not (args.build_dir or args.scan_binary):
+        selected.discard("2b")
 
     results: list[GateResult] = []
-    if 1 in selected:
+    if "1" in selected:
         results.append(run_gate_1_git_history())
-    if 2 in selected:
+    if "2" in selected:
         results.append(run_gate_2_head_hygiene())
-    if 3 in selected:
+    if "2b" in selected or args.build_dir or args.scan_binary:
+        results.append(
+            run_gate_2b_binary_hygiene(
+                [d.resolve() for d in args.build_dir],
+                [b.resolve() for b in args.scan_binary],
+                require_any=args.ci or bool(args.build_dir) or bool(args.scan_binary),
+            )
+        )
+    if "3" in selected:
         results.append(run_gate_3_source_zip(dist_dir, args.repo_name, args.version))
-    if 4 in selected:
+    if "4" in selected:
         win_zip = dist_dir / f"{args.repo_name}-{args.version}-win64-launcher.zip"
         if args.ci and not win_zip.is_file():
-            results.append(run_gate_4_ci_win64_unpacked())
+            results.append(run_gate_4_ci_win64_unpacked(args.version))
         else:
             results.append(run_gate_4_win64_zip(dist_dir, args.repo_name, args.version))
-    if 5 in selected:
+    if "5" in selected:
         results.append(run_gate_5_linux_tarball(dist_dir, args.repo_name, args.version))
-    if 6 in selected:
+    if "6" in selected:
         results.append(run_gate_6_source_media())
 
     all_passed = all(r.passed for r in results) and len(results) > 0

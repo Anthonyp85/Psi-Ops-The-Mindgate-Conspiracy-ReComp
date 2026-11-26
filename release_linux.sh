@@ -5,7 +5,7 @@
 set -euo pipefail
 
 REPO_NAME="Psi-Ops-The-Mindgate-Conspiracy-ReComp"
-VERSION="v1.0.0"
+VERSION="v1.1.0"
 SKIP_BUILD=0
 
 while [[ $# -gt 0 ]]; do
@@ -19,7 +19,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [--version v1.0.0] [--skip-build]"
+            echo "Usage: $0 [--version v1.1.0] [--skip-build]"
             exit 0
             ;;
         *)
@@ -58,6 +58,8 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     cmake -S "${SCRIPT_DIR}" -B "${BUILD_DIR}" -G Ninja \
         -DPSIOPS_ALLOW_NO_XBE=ON \
         -DCMAKE_BUILD_TYPE=Release \
+        "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG" \
+        "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG" \
         -DCMAKE_C_COMPILER=clang \
         -DCMAKE_CXX_COMPILER=clang++ \
         -DCMAKE_C_FLAGS=-march=x86-64-v2 \
@@ -124,6 +126,10 @@ if [[ -f "${SCRIPT_DIR}/XboxXBERecomp/xdk/5849/signatures.toml" ]]; then
     install -m 0644 "${SCRIPT_DIR}/XboxXBERecomp/xdk/5849/signatures.toml" "${STAGE_DIR}/compiler/xdk/5849/signatures.toml"
 fi
 rm -rf "${STAGE_DIR}/compiler/work"
+# Drop any residual debug sections (DWARF comp dirs / source paths) from project-built ELF binaries
+if command -v strip >/dev/null 2>&1; then
+    strip --strip-debug "${STAGE_DIR}/PsiOps" "${STAGE_DIR}/compiler/xbe_recomp"
+fi
 find "${STAGE_DIR}/compiler/config" "${STAGE_DIR}/compiler/include" "${STAGE_DIR}/compiler/xdk" -type f -exec chmod 0644 {} +
 find "${STAGE_DIR}/compiler" -type d -exec chmod 0755 {} +
 

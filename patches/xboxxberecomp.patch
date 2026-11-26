@@ -522,7 +522,7 @@ index 2b0454c..2bc0884 100644
  
  }  // namespace app
 diff --git a/runtime/app/game_code.cpp b/runtime/app/game_code.cpp
-index f3f0bff..13d0c5e 100644
+index f3f0bff..e8ed8ff 100644
 --- a/runtime/app/game_code.cpp
 +++ b/runtime/app/game_code.cpp
 @@ -1,7 +1,8 @@
@@ -546,12 +546,14 @@ index f3f0bff..13d0c5e 100644
  #include <fstream>
  #include <string_view>
  #include <thread>
-@@ -52,8 +55,10 @@ constexpr wchar_t kClangFlags[] =
+@@ -51,9 +54,11 @@ struct Image {
+ constexpr wchar_t kClangFlags[] =
      L"-target x86_64-pc-windows-msvc -fms-compatibility-version=19.40 -std=c++20 -O2 -march=x86-64-v2 "
      L"-fno-strict-aliasing -DNDEBUG -DX86_GAME_CODE -nostdinc -nostdinc++ -w";
- constexpr wchar_t kLinkFlags[] = L"/dll /noentry /nodefaultlib /machine:x64 /opt:noicf";
+-constexpr wchar_t kLinkFlags[] = L"/dll /noentry /nodefaultlib /machine:x64 /opt:noicf";
 -constexpr uint64_t kJobMemory = 512ull << 20;  // a compiler's peak on the biggest file is about half of this
 -constexpr uint64_t kDiskNeeded = 1ull << 30;    // both images' sources, objects and DLLs, with room to spare
++constexpr wchar_t kLinkFlags[] = L"/dll /Brepro /noentry /nodefaultlib /machine:x64 /opt:noicf";
 +constexpr uint64_t kJobMemory = 768ull << 20;     // conservative peak for Wave-1 largest partitions under LLVM -O2
 +constexpr uint64_t kMaxOsReserve = 2048ull << 20; // keep up to 2 GiB free for OS + UMA VRAM + UI + AV
 +constexpr size_t kMaxCompileSlots = 16;           // diminishing returns above 16 for 65 partitions
@@ -713,7 +715,7 @@ index f3f0bff..13d0c5e 100644
  bool PrepareGameCode(const GameFiles& game) {
      // one build at a time: a second copy of the game started meanwhile waits for it, then finds the DLL current
      std::wstring mutex_name = std::wstring(kGame.name) + L"-GameCode";
-@@ -770,3 +863,929 @@ bool PrepareGameCode(const GameFiles& game) {
+@@ -770,3 +863,930 @@ bool PrepareGameCode(const GameFiles& game) {
  }
  
  }  // namespace app
@@ -1299,6 +1301,7 @@ index f3f0bff..13d0c5e 100644
 +        "-shared",
 +        "-m",
 +        "elf_x86_64",
++        "--build-id=sha1",
 +        "--eh-frame-hdr",
 +        "--allow-shlib-undefined",
 +        "--icf=none",

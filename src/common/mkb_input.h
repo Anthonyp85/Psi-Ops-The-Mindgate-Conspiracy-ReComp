@@ -190,4 +190,10 @@ void SetActionMapCallback(ActionMapCallback cb);
 // Controls UI helper (4-column Click-to-Rebind table + sliders), embeddable in Launcher and F1 Overlay.
 void DrawControlsSettingsPanel(bool auto_save = true, bool* out_dirty = nullptr);
 
+// Click-to-rebind lifecycle: a pending "Press key..." capture is cancelled whenever the Controls panel stops
+// being shown (tab switch, overlay close, launcher exit) so it can never swallow a later gameplay key.
+// Must not be called from inside DrawControlsSettingsPanel.
+bool IsRebinding();
+void CancelRebind();
+
 }  // namespace mkb

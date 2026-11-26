@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <thread>
 #include <vector>
@@ -41,6 +42,73 @@ uint32_t ReadU32(const uint8_t* base, uint32_t va) {
     return v;
 }
 
+void WriteU32(uint8_t* base, uint32_t va, uint32_t v) { std::memcpy(base + va, &v, sizeof(v)); }
+
+uint8_t ReadU8(const uint8_t* base, uint32_t va) { return base[va]; }
+
+// Bounds check for every guest pointer a hook dereferences: rejects null / first-64 KiB (null + field offset)
+// pointers, 32-bit wrap-around, and any [va, va + bytes) whose first or last byte is not committed guest memory.
+// Callers pass the full span they touch (base + highest field + size), not a single probe byte.
+bool ValidGuest(uint32_t va, uint32_t bytes = 4u) {
+    if (kernel::g_base == nullptr || bytes == 0u || va < mem::kUserLow) return false;
+    if (va > 0xFFFFFFFFu - (bytes - 1u)) return false;
+    if (!mem::IsCommitted(va)) return false;
+    return bytes == 1u || mem::IsCommitted(va + (bytes - 1u));
+}
+
+// Re-entering recompiled guest code from inside a hook.
+// XboxXBERecomp models the guest x87 FPU purely in software inside X86Context (TOP, FCW, FSW, ST0-7, with MMX in
+// mm[8]); it is never mirrored into the host FPU / MXCSR (no fldcw/fesetround in the runtime), so host C++ float
+// math inside a hook cannot disturb it. What CAN corrupt the x87 stack, rounding/precision control or registers that
+// the interrupted guest function is still using is calling back into guest code from the hook: the callee may leave
+// values pushed, move TOP, reload FCW, or clobber GPRs/flags/XMM at a mid-function hook site.
+// GuestCallFrame snapshots the whole context on entry (a superset of a SavedX87State: GPRs, flags, x87
+// TOP/FCW/FSW/ST0-7, MMX, XMM, MXCSR) and restores it when the scope exits normally. If the guest call unwinds via a
+// host exception (x86_icall throws X86Resume for guest C++ catch continuations), the restore is skipped: the frame
+// that catches it owns esp/ctx from then on, and rolling ctx back underneath it would desync the guest stack.
+// The scratch window below esp that the guest callee will use is validated before anything is written.
+class GuestCallFrame {
+public:
+    static constexpr uint32_t kScratchBytes = 0x400u;  // pushed args + callee frame headroom below guest esp
+    static constexpr uint32_t kDummyReturn = 0xFFFFFFF0u;
+
+    GuestCallFrame(X86Context& ctx, uint8_t* base)
+        : ctx_(ctx),
+          base_(base),
+          saved_(ctx),
+          exceptions_(std::uncaught_exceptions()),
+          ok_(ValidGuest(ctx.esp - kScratchBytes, kScratchBytes)) {}
+    ~GuestCallFrame() {
+        if (std::uncaught_exceptions() == exceptions_) ctx_ = saved_;
+    }
+    GuestCallFrame(const GuestCallFrame&) = delete;
+    GuestCallFrame& operator=(const GuestCallFrame&) = delete;
+
+    bool ok() const { return ok_; }
+    void Push(uint32_t v) {
+        if (!ok_) return;
+        if (saved_.esp - ctx_.esp >= kScratchBytes / 2u) {
+            ok_ = false;  // never run a guest call with a half-built argument list
+            return;
+        }
+        ctx_.esp -= 4u;
+        WriteU32(base_, ctx_.esp, v);
+    }
+    // Pushes a dummy return address (recompiled `ret` returns to the host) and runs the guest function.
+    void Call(uint32_t fn) {
+        if (!ok_) return;
+        Push(kDummyReturn);
+        x86_icall(ctx_, base_, fn);
+    }
+
+private:
+    X86Context& ctx_;
+    uint8_t* base_;
+    X86Context saved_;
+    int exceptions_;
+    bool ok_;
+};
+
 // Saved guest LookSpring (GameStatus+0x240 @ 0x005ECEB8) so controller mode restores user's preference.
 std::atomic<bool> g_look_spring_overridden{false};
 std::atomic<uint32_t> g_saved_look_spring{1u};
@@ -56,7 +124,7 @@ std::atomic<uint32_t> g_mkb_reload_count{0u};
 
 void SyncLookSpring(uint8_t* base, bool mkb_active) {
     constexpr uint32_t kLookSpringVa = 0x005ECEB8u;
-    if (!mem::IsCommitted(kLookSpringVa)) return;
+    if (!ValidGuest(kLookSpringVa, 4u)) return;
     if (mkb_active) {
         if (!g_look_spring_overridden.exchange(true, std::memory_order_acq_rel)) {
             g_saved_look_spring.store(ReadU32(base, kLookSpringVa), std::memory_order_relaxed);
@@ -91,7 +159,9 @@ void Hook_AdxSpinYield(X86Context& ctx, uint8_t* base) {
 uint32_t PsiOpsLiveCameraVa() { return g_live_camera_va.load(std::memory_order_acquire); }
 
 void Hook_CameraApplyManualAim(X86Context& ctx, uint8_t* base) {
-    if (ctx.edi && mem::IsCommitted(ctx.edi + 0x380u)) {
+    // Camera fields used here and by game_info.cpp telemetry span [cam+0x2D8, cam+0x384).
+    constexpr uint32_t kCameraSpan = 0x384u;
+    if (ValidGuest(ctx.edi, kCameraSpan)) {
         g_live_camera_va.store(ctx.edi, std::memory_order_release);
     }
     if (input_rec::ShouldBypassMkb()) {
@@ -102,7 +172,7 @@ void Hook_CameraApplyManualAim(X86Context& ctx, uint8_t* base) {
     SyncLookSpring(base, mkb_active);
     if (!mkb_active) return;
 
-    if (!mem::IsCommitted(ctx.esp + 0x4u) || !mem::IsCommitted(ctx.esp + 0xCu)) return;
+    if (!ValidGuest(ctx.esp + 0x4u, 0xCu)) return;  // yaw_in, pitch_in, dt
     float dt = ReadF32(base, ctx.esp + 0xCu);
     if (!std::isfinite(dt) || dt <= 1e-6f || dt > 1.0f) return;
 
@@ -116,7 +186,7 @@ void Hook_CameraApplyManualAim(X86Context& ctx, uint8_t* base) {
     // Optional Sniper Scope FOV sensitivity scaling (20 deg -> 4 deg zoom)
     float fov_scale = 1.0f;
     uint32_t cam = ctx.edi;
-    if (cam && mem::IsCommitted(cam + 0x380u)) {
+    if (ValidGuest(cam + 0x37Cu, 8u)) {
         float sniper_timer = ReadF32(base, cam + 0x37Cu);
         if (std::isfinite(sniper_timer) && sniper_timer > 0.8f) {
             float zoom = std::clamp(ReadF32(base, cam + 0x380u), 0.0f, 1.0f);
@@ -131,7 +201,7 @@ void Hook_CameraApplyManualAim(X86Context& ctx, uint8_t* base) {
     // Query live guest yaw_spd (0x000DCDE0) and pitch_spd (0x000DCE00) so we cancel them cleanly
     float yaw_spd = 1.10330f;
     float pitch_spd = 1.08460f;
-    if (mem::IsCommitted(0x005ECD74u) && mem::IsCommitted(0x005CD28Cu)) {
+    if (ValidGuest(0x005ECD70u, 8u) && ValidGuest(0x005CD288u, 8u)) {
         float y_div = ReadF32(base, 0x005CD288u);
         float p_div = ReadF32(base, 0x005CD28Cu);
         int32_t opt13 = int32_t(ReadU32(base, 0x005ECD70u));
@@ -155,7 +225,7 @@ void Hook_CameraApplyManualAim(X86Context& ctx, uint8_t* base) {
 // Stack at call site: [esp+0] = float d_pitch_rad, [esp+4] = float d_yaw_rad, [esp+8] = float roll.
 void Hook_RemoteViewAim(X86Context& ctx, uint8_t* base) {
     if (input_rec::ShouldBypassMkb() || !mkb::IsMkbActiveForGameplay()) return;
-    if (!mem::IsCommitted(ctx.esp) || !mem::IsCommitted(ctx.esp + 0x4u)) return;
+    if (!ValidGuest(ctx.esp, 8u)) return;  // d_pitch, d_yaw
 
     float dyaw = 0.0f;
     float dpitch = 0.0f;
@@ -175,11 +245,11 @@ void Hook_RemoteViewAim(X86Context& ctx, uint8_t* base) {
 void Hook_UpdateTKPitch(X86Context& ctx, uint8_t* base) {
     if (input_rec::ShouldBypassMkb() || !mkb::IsMkbActiveForGameplay()) return;
     uint32_t player = ctx.edi;
-    if (!player || !mem::IsCommitted(player + 0x744u) || !mem::IsCommitted(player + 0x6F4u)) return;
+    if (!ValidGuest(player + 0x6F4u, 0x54u)) return;  // [player+0x6F4] psi_mgr .. [player+0x744] elevation
 
     // Only apply when Telekinesis psi state is active ({0x116BE0, 0x117380, 0x1174F0})
     uint32_t psi_mgr = ReadU32(base, player + 0x6F4u);
-    if (!psi_mgr || !mem::IsCommitted(psi_mgr + 0x4u)) return;
+    if (!ValidGuest(psi_mgr, 8u)) return;
     uint32_t psi_fn = ReadU32(base, psi_mgr + 0x4u);
     if (psi_fn != 0x00116BE0u && psi_fn != 0x00117380u && psi_fn != 0x001174F0u) return;
 
@@ -203,11 +273,11 @@ bool Hook_CameraAutoSteerBypass(X86Context& ctx, uint8_t* base) {
     if (mkb::IsActionHeld(mkb::Action::FineAim) && !g_im_sniper_weapon_or_scoped.load(std::memory_order_relaxed)) {
         return false;
     }
-    if (mem::IsCommitted(ctx.esp + 0x18u) && mem::IsCommitted(ctx.esp + 0x1Cu)) {
+    if (ValidGuest(ctx.esp + 0x18u, 8u)) {
         uint32_t out_yaw_va = ReadU32(base, ctx.esp + 0x18u);
         uint32_t out_pitch_va = ReadU32(base, ctx.esp + 0x1Cu);
-        if (out_yaw_va && mem::IsCommitted(out_yaw_va)) WriteF32(base, out_yaw_va, 0.0f);
-        if (out_pitch_va && mem::IsCommitted(out_pitch_va)) WriteF32(base, out_pitch_va, 0.0f);
+        if (ValidGuest(out_yaw_va, 4u)) WriteF32(base, out_yaw_va, 0.0f);
+        if (ValidGuest(out_pitch_va, 4u)) WriteF32(base, out_pitch_va, 0.0f);
     }
     return true;
 }
@@ -233,22 +303,11 @@ constexpr uint32_t kUiEvtConfirm = 0x3F2u;
 constexpr uint32_t kUiEvtBack = 0x3F3u;
 constexpr uint32_t kUiEvtStart = 0x81Au;
 
-bool SafeAddr(uint32_t va, uint32_t len) {
-    if (va < 0x10000u || len == 0u || va > 0xFFFFFFFFu - len) return false;
-    if (!mem::IsCommitted(va)) return false;
-    if (len > 1u && !mem::IsCommitted(va + len - 1u)) return false;
-    return true;
-}
-
-void WriteU32(uint8_t* base, uint32_t va, uint32_t v) { std::memcpy(base + va, &v, sizeof(v)); }
-
-uint8_t ReadU8(const uint8_t* base, uint32_t va) { return base[va]; }
-
 bool IsUiBusy(const uint8_t* base, uint32_t ui_mgr) {
     // Mirrors UIActionQueue::IsBusy @ 0x00250DE0(ui_mgr + 0x22C).
-    if (!SafeAddr(ui_mgr + 0x234u, 4u)) return false;
+    if (!ValidGuest(ui_mgr + 0x234u, 4u)) return false;
     uint32_t node = ReadU32(base, ui_mgr + 0x234u);
-    for (int i = 0; i < 256 && SafeAddr(node, 0x3Cu); ++i) {
+    for (int i = 0; i < 256 && ValidGuest(node, 0x3Cu); ++i) {
         if (ReadU32(base, node + 0x4u) != 0u && ReadU32(base, node + 0xCu) != 0u) return true;
         node = ReadU32(base, node + 0x38u);
     }
@@ -256,27 +315,22 @@ bool IsUiBusy(const uint8_t* base, uint32_t ui_mgr) {
 }
 
 void CallSetFocusedChild(X86Context& ctx, uint8_t* base, uint32_t active_parent, uint32_t child, uint32_t ui_mgr) {
-    if (!SafeAddr(ctx.esp - 0x20u, 0x20u)) return;
-    X86Context saved = ctx;
+    GuestCallFrame frame(ctx, base);
+    if (!frame.ok()) return;
     ctx.ebx = active_parent;
     ctx.edi = child;
     ctx.esi = 0u;
-    ctx.esp -= 4u;
-    WriteU32(base, ctx.esp, 1u);           // [esp+8] = send_events
-    ctx.esp -= 4u;
-    WriteU32(base, ctx.esp, ui_mgr);       // [esp+4] = ui_mgr
-    ctx.esp -= 4u;
-    WriteU32(base, ctx.esp, 0xFFFFFFF0u);  // dummy return address
-    x86_icall(ctx, base, 0x0024CAD0u);
-    ctx = saved;
+    frame.Push(1u);      // [esp+8] = send_events
+    frame.Push(ui_mgr);  // [esp+4] = ui_mgr
+    frame.Call(0x0024CAD0u);
 }
 
 void EnsurePlayerPortBound(uint8_t* base) {
-    if (!SafeAddr(0x0055673Cu, 16u)) return;
+    if (!ValidGuest(0x0055673Cu, 16u)) return;
     uint32_t p0 = ReadU32(base, 0x0055673Cu);
     if (p0 == 0u) return;
     bool p0_disconnected =
-        (p0 >= 4u) || (SafeAddr(0x005DED18u + p0 * 0x94u + 0x14u, 1u) && ReadU8(base, 0x005DED18u + p0 * 0x94u + 0x14u) == 0u);
+        (p0 >= 4u) || (ValidGuest(0x005DED18u + p0 * 0x94u + 0x14u, 1u) && ReadU8(base, 0x005DED18u + p0 * 0x94u + 0x14u) == 0u);
     bool mkb_owns =
         (mkb::GetActiveDevice() == mkb::ActiveDevice::Mkb && mkb::GetConfig().input_mode != mkb::InputMode::Controller);
     if (p0_disconnected || mkb_owns) {
@@ -290,47 +344,39 @@ void EnsurePlayerPortBound(uint8_t* base) {
 }
 
 void CallSendUiEvent(X86Context& ctx, uint8_t* base, uint32_t ui_mgr, uint32_t event_id) {
-    if (!SafeAddr(ctx.esp - 0x20u, 0x20u)) return;
-    X86Context saved = ctx;
-    ctx.esi = ui_mgr;
-    ctx.eax = 0u;
-    ctx.edx = 0u;
-    ctx.esp -= 4u;
-    WriteU32(base, ctx.esp, event_id);     // [esp+4] = event_id
-    ctx.esp -= 4u;
-    WriteU32(base, ctx.esp, 0xFFFFFFF0u);  // dummy return address
-    x86_icall(ctx, base, 0x0024DDC0u);
-    ctx = saved;
+    {
+        GuestCallFrame frame(ctx, base);
+        if (!frame.ok()) return;
+        ctx.esi = ui_mgr;
+        ctx.eax = 0u;
+        ctx.edx = 0u;
+        frame.Push(event_id);  // [esp+4] = event_id
+        frame.Call(0x0024DDC0u);
+    }
     EnsurePlayerPortBound(base);
 }
 
 void CallSldpStep(X86Context& ctx, uint8_t* base, uint32_t sldp, int32_t steps) {
-    if (steps == 0 || !SafeAddr(ctx.esp - 0x20u, 0x20u)) return;
+    if (steps == 0 || !ValidGuest(sldp, 4u)) return;
     uint32_t fn = (steps > 0) ? 0x0012D3E0u : 0x0012D490u;
     uint32_t count = uint32_t(steps > 0 ? steps : -steps);
-    X86Context saved = ctx;
+    GuestCallFrame frame(ctx, base);
+    if (!frame.ok()) return;
     ctx.ecx = sldp;
-    ctx.esp -= 4u;
-    WriteU32(base, ctx.esp, count);
-    ctx.esp -= 4u;
-    WriteU32(base, ctx.esp, 0xFFFFFFF0u);
-    x86_icall(ctx, base, fn);
-    ctx = saved;
+    frame.Push(count);
+    frame.Call(fn);
 }
 
 void CallListStep(X86Context& ctx, uint8_t* base, uint32_t list_obj, int32_t steps) {
-    if (steps == 0 || !SafeAddr(ctx.esp - 0x20u, 0x20u)) return;
+    if (steps == 0 || !ValidGuest(list_obj, 4u)) return;
     uint32_t fn = (steps > 0) ? 0x0012C270u : 0x0012C3F0u;
     int32_t n = std::clamp(steps > 0 ? steps : -steps, 1, 8);
     for (int32_t i = 0; i < n; ++i) {
-        X86Context saved = ctx;
+        GuestCallFrame frame(ctx, base);
+        if (!frame.ok()) return;
         ctx.ecx = list_obj;
-        ctx.esp -= 4u;
-        WriteU32(base, ctx.esp, 1u);
-        ctx.esp -= 4u;
-        WriteU32(base, ctx.esp, 0xFFFFFFF0u);
-        x86_icall(ctx, base, fn);
-        ctx = saved;
+        frame.Push(1u);
+        frame.Call(fn);
     }
 }
 
@@ -351,15 +397,15 @@ void ComputeWorldMat(const uint8_t* base, uint32_t xform, float out[16]) {
     // Unwrap CUIObject's [obj+0x48] transform wrapper -> TransformNode* ([wrapper+0x04], vtable 0x004FEF84),
     // matching UIChild::UpdateTransform @ 0x001358F7 -> TransformNode::GetWorldMatrix @ 0x001319F0.
     uint32_t cur = xform;
-    if (SafeAddr(cur, 0x0Cu) && ReadU32(base, cur) != kVtblTransformNode) {
+    if (ValidGuest(cur, 0x0Cu) && ReadU32(base, cur) != kVtblTransformNode) {
         uint32_t inner = ReadU32(base, cur + 0x4u);
-        if (SafeAddr(inner, 0x0Cu) && ReadU32(base, inner) == kVtblTransformNode) {
+        if (ValidGuest(inner, 0x0Cu) && ReadU32(base, inner) == kVtblTransformNode) {
             cur = inner;
         }
     }
-    for (int depth = 0; depth < 32 && SafeAddr(cur, 0x10u); ++depth) {
+    for (int depth = 0; depth < 32 && ValidGuest(cur, 0x10u); ++depth) {
         uint32_t m_va = ReadU32(base, cur + 0x4u);
-        if (SafeAddr(m_va, 64u)) {
+        if (ValidGuest(m_va, 64u)) {
             float m[16];
             bool ok = true;
             for (int i = 0; i < 16; ++i) {
@@ -385,14 +431,14 @@ void TransformUiPt(const float m[16], float x, float y, float& ox, float& oy) {
 }
 
 bool ObjectHasEvent(const uint8_t* base, uint32_t data, uint32_t want_evt) {
-    if (!SafeAddr(data, 0x1Cu)) return false;
+    if (!ValidGuest(data, 0x1Cu)) return false;
     uint32_t evt_arr = ReadU32(base, data + 0x10u);
-    if (!SafeAddr(evt_arr, 4u)) return false;
+    if (!ValidGuest(evt_arr, 4u)) return false;
     uint32_t count = ReadU32(base, evt_arr);
-    if (count == 0u || count > 128u || !SafeAddr(evt_arr + 4u, count * 4u)) return false;
+    if (count == 0u || count > 128u || !ValidGuest(evt_arr + 4u, count * 4u)) return false;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t entry = ReadU32(base, evt_arr + 4u + i * 4u);
-        if (SafeAddr(entry, 4u) && ReadU32(base, entry) == want_evt) return true;
+        if (ValidGuest(entry, 4u) && ReadU32(base, entry) == want_evt) return true;
     }
     return false;
 }
@@ -419,37 +465,37 @@ struct UiBounds {
 };
 
 void AccumObjectBounds(const uint8_t* base, uint32_t obj, uint32_t inherited_xform, UiBounds& out, int depth) {
-    if (depth > 8 || !SafeAddr(obj, 0x4Cu)) return;
+    if (depth > 8 || !ValidGuest(obj, 0x4Cu)) return;
     uint32_t data = ReadU32(base, obj + 0x1Cu);
-    if (!SafeAddr(data, 0x1Cu)) return;
+    if (!ValidGuest(data, 0x1Cu)) return;
     uint32_t children_arr = ReadU32(base, data + 0x18u);
-    if (!SafeAddr(children_arr, 4u)) return;
+    if (!ValidGuest(children_arr, 4u)) return;
     uint32_t count = ReadU32(base, children_arr);
-    if (count == 0u || count > 256u || !SafeAddr(children_arr + 4u, count * 4u)) return;
+    if (count == 0u || count > 256u || !ValidGuest(children_arr + 4u, count * 4u)) return;
 
     // Mirror CUIObject::Render @ 0x0024C660: inherit ancestor TransformNode when [obj+0x48] is NULL.
     uint32_t eff_xform = inherited_xform;
     uint32_t own_xform = ReadU32(base, obj + 0x48u);
-    if (SafeAddr(own_xform, 0x10u)) eff_xform = own_xform;
+    if (ValidGuest(own_xform, 0x10u)) eff_xform = own_xform;
 
     float wm[16];
     ComputeWorldMat(base, eff_xform, wm);
 
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t entry = ReadU32(base, children_arr + 4u + i * 4u);
-        if (!SafeAddr(entry, 0x30u)) continue;
+        if (!ValidGuest(entry, 0x30u)) continue;
         uint32_t fourcc = ReadU32(base, entry);
         uint32_t child_ptr = ReadU32(base, entry + 0x8u);
         if (fourcc == kFourccPoly) {
             UiBounds pb{};
             bool got_vb = false;
-            if (SafeAddr(child_ptr, 0x20u)) {
+            if (ValidGuest(child_ptr, 0x20u)) {
                 uint32_t vb = ReadU32(base, child_ptr + 0x1Cu);
                 float ox = ReadF32(base, child_ptr + 0x10u);
                 float oy = ReadF32(base, child_ptr + 0x14u);
                 if (!std::isfinite(ox)) ox = 0.0f;
                 if (!std::isfinite(oy)) oy = 0.0f;
-                if (SafeAddr(vb, 0x28u + 4u * 0x28u)) {
+                if (ValidGuest(vb, 0x28u + 4u * 0x28u)) {
                     for (uint32_t k = 0; k < 4u; ++k) {
                         float lx = ReadF32(base, vb + 0x28u + k * 0x28u) + ox;
                         float ly = ReadF32(base, vb + 0x28u + k * 0x28u + 4u) + oy;
@@ -460,7 +506,7 @@ void AccumObjectBounds(const uint8_t* base, uint32_t obj, uint32_t inherited_xfo
                     got_vb = pb.valid;
                 }
             }
-            if (!got_vb && SafeAddr(entry, 0x10u + 4u * 12u)) {
+            if (!got_vb && ValidGuest(entry, 0x10u + 4u * 12u)) {
                 for (uint32_t k = 0; k < 4u; ++k) {
                     float lx = ReadF32(base, entry + 0x10u + k * 12u);
                     float ly = ReadF32(base, entry + 0x10u + k * 12u + 4u);
@@ -483,7 +529,7 @@ void AccumObjectBounds(const uint8_t* base, uint32_t obj, uint32_t inherited_xfo
             if (!std::isfinite(ty)) ty = 0.0f;
             if (!std::isfinite(tw) || tw < 4.0f) tw = 140.0f;
             if (!std::isfinite(th) || th < 16.0f) th = 18.0f;
-            if (SafeAddr(child_ptr, 0x18u)) {
+            if (ValidGuest(child_ptr, 0x18u)) {
                 float dx = ReadF32(base, child_ptr + 0x10u);
                 float dy = ReadF32(base, child_ptr + 0x14u);
                 if (std::isfinite(dx) && std::isfinite(dy) && std::fabs(dx) < 600.0f && std::fabs(dy) < 600.0f) {
@@ -498,7 +544,7 @@ void AccumObjectBounds(const uint8_t* base, uint32_t obj, uint32_t inherited_xfo
             TransformUiPt(wm, tx + tw, ty + th, wx1, wy1);
             out.Include(wx0, wy0);
             out.Include(wx1, wy1);
-        } else if ((fourcc == kFourccObj || fourcc == kFourccGrop) && SafeAddr(child_ptr, 0x4Cu)) {
+        } else if ((fourcc == kFourccObj || fourcc == kFourccGrop) && ValidGuest(child_ptr, 0x4Cu)) {
             AccumObjectBounds(base, child_ptr, eff_xform, out, depth + 1);
         }
     }
@@ -516,15 +562,15 @@ struct UiCandidate {
 
 void CollectUiCandidates(const uint8_t* base, uint32_t node, uint32_t active_parent, uint32_t inherited_xform,
                          bool ancestors_live, std::vector<UiCandidate>& out, int depth) {
-    if (depth > 12 || !SafeAddr(node, 0x4Cu)) return;
+    if (depth > 12 || !ValidGuest(node, 0x4Cu)) return;
     uint32_t data = ReadU32(base, node + 0x1Cu);
-    if (!SafeAddr(data, 0x1Cu)) return;
+    if (!ValidGuest(data, 0x1Cu)) return;
 
     uint32_t fourcc = ReadU32(base, data);
     uint32_t flags = ReadU32(base, data + 0xCu);
     uint32_t eff_xform = inherited_xform;
     uint32_t own_xform = ReadU32(base, node + 0x48u);
-    if (SafeAddr(own_xform, 0x10u)) eff_xform = own_xform;
+    if (ValidGuest(own_xform, 0x10u)) eff_xform = own_xform;
 
     // Containers (active_parent / GROP) only need visible (bit 0); selectable leaf buttons require visible+enabled (0x3).
     const bool container_live = (node == active_parent) ? true : (ancestors_live && ((flags & 0x1u) != 0u));
@@ -545,7 +591,7 @@ void CollectUiCandidates(const uint8_t* base, uint32_t node, uint32_t active_par
             cand.vtable = vtbl;
             cand.is_slider = is_sldp;
             AccumObjectBounds(base, node, eff_xform, cand.rect, 0);
-            if (!cand.rect.valid && is_sldp && SafeAddr(node, 0xA4u)) {
+            if (!cand.rect.valid && is_sldp && ValidGuest(node, 0xA4u)) {
                 float wm[16];
                 ComputeWorldMat(base, eff_xform, wm);
                 float sx, sy, ex, ey;
@@ -555,7 +601,7 @@ void CollectUiCandidates(const uint8_t* base, uint32_t node, uint32_t active_par
                 cand.rect.Include(ex, ey + 12.0f);
             }
             if (cand.rect.valid) {
-                if (is_sldp && SafeAddr(node, 0xA4u)) {
+                if (is_sldp && ValidGuest(node, 0xA4u)) {
                     float wm[16];
                     ComputeWorldMat(base, eff_xform, wm);
                     float sx, sy, ex, ey;
@@ -592,15 +638,15 @@ void CollectUiCandidates(const uint8_t* base, uint32_t node, uint32_t active_par
     }
 
     uint32_t children_arr = ReadU32(base, data + 0x18u);
-    if (!SafeAddr(children_arr, 4u)) return;
+    if (!ValidGuest(children_arr, 4u)) return;
     uint32_t count = ReadU32(base, children_arr);
-    if (count == 0u || count > 256u || !SafeAddr(children_arr + 4u, count * 4u)) return;
+    if (count == 0u || count > 256u || !ValidGuest(children_arr + 4u, count * 4u)) return;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t entry = ReadU32(base, children_arr + 4u + i * 4u);
-        if (!SafeAddr(entry, 0xCu)) continue;
+        if (!ValidGuest(entry, 0xCu)) continue;
         uint32_t c_fourcc = ReadU32(base, entry);
         uint32_t c_ptr = ReadU32(base, entry + 0x8u);
-        if ((c_fourcc == kFourccObj || c_fourcc == kFourccGrop) && SafeAddr(c_ptr, 0x4Cu)) {
+        if ((c_fourcc == kFourccObj || c_fourcc == kFourccGrop) && ValidGuest(c_ptr, 0x4Cu)) {
             CollectUiCandidates(base, c_ptr, active_parent, eff_xform, container_live, out, depth + 1);
         }
     }
@@ -608,7 +654,7 @@ void CollectUiCandidates(const uint8_t* base, uint32_t node, uint32_t active_par
 
 bool TryHandleFocusedList(X86Context& ctx, uint8_t* base, uint32_t ui_mgr, uint32_t list_obj,
                           uint32_t fallback_xform, const mkb::MenuMouseState& mms, int& out_hovered, int& out_items) {
-    if (!SafeAddr(list_obj, 0xD0u) || ReadU32(base, list_obj) != kVtblList) return false;
+    if (!ValidGuest(list_obj, 0xD0u) || ReadU32(base, list_obj) != kVtblList) return false;
     int32_t sel = int32_t(ReadU32(base, list_obj + 0x64u));
     int32_t scroll_top = int32_t(ReadU32(base, list_obj + 0x68u));
     uint32_t slots_ptr = ReadU32(base, list_obj + 0x78u);
@@ -618,19 +664,19 @@ bool TryHandleFocusedList(X86Context& ctx, uint8_t* base, uint32_t ui_mgr, uint3
     int32_t slot_count = int32_t(ReadU32(base, list_obj + 0xC8u));
     bool wrap = (ReadU8(base, list_obj + 0xCCu) != 0u);
     int32_t item_count = (item_end > item_begin) ? int32_t((item_end - item_begin) / 28u) : 0;
-    if (item_count <= 0 || slot_count <= 0 || slot_count > 32 || !SafeAddr(slots_ptr, uint32_t(slot_count) * 4u)) {
+    if (item_count <= 0 || slot_count <= 0 || slot_count > 32 || !ValidGuest(slots_ptr, uint32_t(slot_count) * 4u)) {
         return false;
     }
     out_items = item_count;
     float wm[16];
     uint32_t lx = ReadU32(base, list_obj + 0x48u);
-    ComputeWorldMat(base, SafeAddr(lx, 0x10u) ? lx : fallback_xform, wm);
+    ComputeWorldMat(base, ValidGuest(lx, 0x10u) ? lx : fallback_xform, wm);
 
     int32_t hit_item = -1;
     if (mms.valid) {
         for (int32_t b = 0; b < slot_count; ++b) {
             uint32_t uitext = ReadU32(base, slots_ptr + uint32_t(b) * 4u);
-            if (!SafeAddr(uitext, 0x20u)) continue;
+            if (!ValidGuest(uitext, 0x20u)) continue;
             int32_t item_idx = -1;
             if (mode == 0u) {
                 item_idx = sel + b - 1;
@@ -645,7 +691,7 @@ bool TryHandleFocusedList(X86Context& ctx, uint8_t* base, uint32_t ui_mgr, uint3
             float tw = 260.0f;
             float th = 22.0f;
             uint32_t td = ReadU32(base, uitext + 0x1Cu);
-            if (SafeAddr(td, 0x2Cu)) {
+            if (ValidGuest(td, 0x2Cu)) {
                 float w0 = ReadF32(base, td + 0x24u);
                 float h0 = ReadF32(base, td + 0x28u);
                 if (std::isfinite(w0) && w0 > 8.0f && w0 < 512.0f) tw = w0;
@@ -698,12 +744,12 @@ void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
     if (mkb::IsCursorCaptured()) {
         if (mkb::ConsumeNonPointerModalConfirm()) {
             uint32_t hud = ctx.ecx;
-            if (!SafeAddr(hud, 0x260u) && SafeAddr(0x005CCB90u, 4u)) {
+            if (!ValidGuest(hud, 0x260u) && ValidGuest(0x005CCB90u, 4u)) {
                 hud = ReadU32(base, 0x005CCB90u);
             }
-            if (SafeAddr(hud, 0x300u)) {
+            if (ValidGuest(hud, 0x300u)) {
                 uint32_t ui_mgr = hud + 0xB0u;
-                if (SafeAddr(ui_mgr, 0x240u) && ReadU32(base, ui_mgr + 0x10u) == 0u &&
+                if (ValidGuest(ui_mgr, 0x240u) && ReadU32(base, ui_mgr + 0x10u) == 0u &&
                     ReadU32(base, ui_mgr + 0x14u) != 0u && !IsUiBusy(base, ui_mgr)) {
                     CallSendUiEvent(ctx, base, ui_mgr, kUiEvtConfirm);
                 }
@@ -720,15 +766,15 @@ void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
     }
 
     uint32_t hud = ctx.ecx;
-    if (!SafeAddr(hud, 0x260u) && SafeAddr(0x005CCB90u, 4u)) {
+    if (!ValidGuest(hud, 0x260u) && ValidGuest(0x005CCB90u, 4u)) {
         hud = ReadU32(base, 0x005CCB90u);
     }
-    if (!SafeAddr(hud, 0x300u)) {
+    if (!ValidGuest(hud, 0x300u)) {
         mkb::ReportMenuUiTelemetry("", -1, 0);
         return;
     }
     uint32_t ui_mgr = hud + 0xB0u;
-    if (!SafeAddr(ui_mgr, 0x240u)) {
+    if (!ValidGuest(ui_mgr, 0x240u)) {
         mkb::ReportMenuUiTelemetry("", -1, 0);
         return;
     }
@@ -742,7 +788,7 @@ void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
         return;
     }
     uint32_t top_screen = ReadU32(base, ui_mgr + 0x1A8u + uint32_t(stack_top) * 4u);
-    if (!SafeAddr(top_screen, 0x68u)) {
+    if (!ValidGuest(top_screen, 0x68u)) {
         mkb::ReportMenuUiTelemetry("", -1, 0);
         return;
     }
@@ -755,22 +801,22 @@ void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
     }
 
     uint32_t s54 = ReadU32(base, top_screen + 0x54u);
-    uint32_t s0c = SafeAddr(s54, 0x10u) ? ReadU32(base, s54 + 0xCu) : 0u;
-    uint32_t root_obj = SafeAddr(s0c, 0xCu) ? ReadU32(base, s0c + 0x8u) : 0u;
+    uint32_t s0c = ValidGuest(s54, 0x10u) ? ReadU32(base, s54 + 0xCu) : 0u;
+    uint32_t root_obj = ValidGuest(s0c, 0xCu) ? ReadU32(base, s0c + 0x8u) : 0u;
 
     uint32_t active_parent = root_obj;
     uint32_t active_parent_xform = 0u;
     uint32_t focused_leaf = 0u;
-    for (int depth = 0; depth < 16 && SafeAddr(active_parent, 0x4Cu); ++depth) {
+    for (int depth = 0; depth < 16 && ValidGuest(active_parent, 0x4Cu); ++depth) {
         uint32_t ax = ReadU32(base, active_parent + 0x48u);
-        if (SafeAddr(ax, 0x10u)) active_parent_xform = ax;
+        if (ValidGuest(ax, 0x10u)) active_parent_xform = ax;
         uint32_t next = ReadU32(base, active_parent + 0x28u);
-        if (!SafeAddr(next, 0x4Cu)) {
+        if (!ValidGuest(next, 0x4Cu)) {
             focused_leaf = 0u;
             break;
         }
         uint32_t next2 = ReadU32(base, next + 0x28u);
-        if (!SafeAddr(next2, 0x4Cu)) {
+        if (!ValidGuest(next2, 0x4Cu)) {
             focused_leaf = next;
             break;
         }
@@ -778,7 +824,7 @@ void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
     }
 
     std::vector<UiCandidate> cands;
-    if (SafeAddr(active_parent, 0x4Cu)) {
+    if (ValidGuest(active_parent, 0x4Cu)) {
         CollectUiCandidates(base, active_parent, active_parent, active_parent_xform, true, cands, 0);
     }
 
@@ -840,7 +886,7 @@ void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
     }
 
     // 3. Focused LIST control (SaveSystem, PlayMode, LevelSelect, sub-lists).
-    if (SafeAddr(focused_leaf, 0xD0u) && ReadU32(base, focused_leaf) == kVtblList) {
+    if (ValidGuest(focused_leaf, 0xD0u) && ReadU32(base, focused_leaf) == kVtblList) {
         int list_hov = -1, list_cnt = 0;
         if (TryHandleFocusedList(ctx, base, ui_mgr, focused_leaf, active_parent_xform, mms, list_hov, list_cnt)) {
             mkb::ReportMenuUiTelemetry(screen_name, list_hov, list_cnt);
@@ -871,14 +917,14 @@ void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
 
     if (hit_idx >= 0) {
         const UiCandidate& hit = cands[size_t(hit_idx)];
-        uint32_t cur_focus = SafeAddr(active_parent, 0x2Cu) ? ReadU32(base, active_parent + 0x28u) : 0u;
+        uint32_t cur_focus = ValidGuest(active_parent, 0x2Cu) ? ReadU32(base, active_parent + 0x28u) : 0u;
         // Only invoke SetFocusedChild on actual focus change -> zero repeat hover SFX spam.
         if (hit.obj != cur_focus) {
             CallSetFocusedChild(ctx, base, active_parent, hit.obj, ui_mgr);
         }
 
         if (hit.is_slider) {
-            if ((mms.lmb_clicked || mms.lmb_down) && SafeAddr(hit.obj, 0xB0u) &&
+            if ((mms.lmb_clicked || mms.lmb_down) && ValidGuest(hit.obj, 0xB0u) &&
                 ReadU32(base, hit.obj + 0xACu) != 0u) {
                 int32_t min_v = int32_t(ReadU32(base, hit.obj + 0x84u));
                 int32_t cur_v = int32_t(ReadU32(base, hit.obj + 0x88u));
@@ -956,7 +1002,7 @@ struct GuestMkbInputFrame {
 GuestMkbInputFrame g_im{};
 
 int ParsePsiPowerTag(const uint8_t* base, uint32_t str_va) {
-    if (!SafeAddr(str_va, 3u)) return -1;
+    if (!ValidGuest(str_va, 3u)) return -1;
     char c0 = char(ReadU8(base, str_va));
     char c1 = char(ReadU8(base, str_va + 1u));
     if (c0 == 'T' && c1 == 'K') return 0;
@@ -969,25 +1015,23 @@ int ParsePsiPowerTag(const uint8_t* base, uint32_t str_va) {
 }
 
 void CallWeaponReloadOnce(X86Context& ctx, uint8_t* base, uint32_t wpn, uint32_t reload_fn) {
-    if (!SafeAddr(ctx.esp - 0x40u, 0x40u)) return;
-    X86Context saved = ctx;
+    if (!ValidGuest(wpn, 4u)) return;
+    GuestCallFrame frame(ctx, base);
+    if (!frame.ok()) return;
     ctx.ecx = wpn;
-    ctx.esp -= 4u;
-    WriteU32(base, ctx.esp, 0xFFFFFFF0u);  // dummy return address (Weapon::Reload is __thiscall ret 0)
-    x86_icall(ctx, base, reload_fn);
-    ctx = saved;
+    frame.Call(reload_fn);  // Weapon::Reload is __thiscall ret 0
 }
 
 void TryManualWeaponReload(X86Context& ctx, uint8_t* base) {
     using namespace std::chrono;
-    if (!g_im.wpn || !SafeAddr(g_im.wpn, 0x54u)) return;
+    if (!g_im.wpn || !ValidGuest(g_im.wpn, 0x54u)) return;
     const auto now = steady_clock::now();
     if (g_im.has_reloaded_once && duration_cast<milliseconds>(now - g_im.last_reload_tp).count() < 400) {
         return;
     }
 
     uint32_t vtbl = ReadU32(base, g_im.wpn);
-    if (!SafeAddr(vtbl + 0x1Cu, 4u)) return;
+    if (!ValidGuest(vtbl + 0x1Cu, 4u)) return;
     uint32_t reload_fn = ReadU32(base, vtbl + 0x1Cu);
     if (reload_fn < 0x00011000u || reload_fn >= 0x004D0000u) return;
 
@@ -995,7 +1039,7 @@ void TryManualWeaponReload(X86Context& ctx, uint8_t* base) {
     int32_t clip_size = int32_t(ReadU32(base, g_im.wpn + 0x4Cu));
     uint32_t store = ReadU32(base, g_im.wpn + 0x44u);
     uint8_t inf_ammo = ReadU8(base, g_im.wpn + 0x50u);
-    int32_t reserve = (store && SafeAddr(store, 4u)) ? int32_t(ReadU32(base, store)) : -1;
+    int32_t reserve = (store && ValidGuest(store, 4u)) ? int32_t(ReadU32(base, store)) : -1;
 
     if (clip < 0 || clip_size <= 0 || clip_size >= 1000 || clip >= clip_size) return;
     if (inf_ammo == 0u && store != 0u && reserve <= 0) return;
@@ -1004,7 +1048,7 @@ void TryManualWeaponReload(X86Context& ctx, uint8_t* base) {
         // Shotgun::Reload (0x000C9990) loads 2 shells per call -> loop cleanly to full clip or empty reserve.
         for (int iter = 0; iter < 8; ++iter) {
             int32_t before = int32_t(ReadU32(base, g_im.wpn + 0x48u));
-            int32_t res_now = (store && SafeAddr(store, 4u)) ? int32_t(ReadU32(base, store)) : 1;
+            int32_t res_now = (store && ValidGuest(store, 4u)) ? int32_t(ReadU32(base, store)) : 1;
             if (before >= clip_size || (inf_ammo == 0u && store != 0u && res_now <= 0)) break;
             CallWeaponReloadOnce(ctx, base, g_im.wpn, reload_fn);
             int32_t after = int32_t(ReadU32(base, g_im.wpn + 0x48u));
@@ -1052,9 +1096,9 @@ void Hook_InputManagerUpdate(X86Context& ctx, uint8_t* base) {
     g_im.recent_flick_disp = snap.recent_flick_disp;
 
     uint32_t im = ctx.edi;
-    if (!SafeAddr(im, 0x28u)) im = kInputMgrSingletonVa;
-    uint32_t mode = SafeAddr(im + 0x14u, 4u) ? ReadU32(base, im + 0x14u) : 0u;
-    uint32_t override_cnt = SafeAddr(im + 0x24u, 4u) ? ReadU32(base, im + 0x24u) : 0u;
+    if (!ValidGuest(im, 0x28u)) im = kInputMgrSingletonVa;
+    uint32_t mode = ValidGuest(im + 0x14u, 4u) ? ReadU32(base, im + 0x14u) : 0u;
+    uint32_t override_cnt = ValidGuest(im + 0x24u, 4u) ? ReadU32(base, im + 0x24u) : 0u;
 
     g_im.valid = snap.mkb_active && !snap.overlay_open && (mode == 2u || mode == 3u || mode == 4u) &&
                  (override_cnt == 0u);
@@ -1079,23 +1123,23 @@ void Hook_InputManagerUpdate(X86Context& ctx, uint8_t* base) {
     g_im.turret_ptr = 0u;
     g_im.sniper_scoped = false;
 
-    uint32_t app = SafeAddr(0x00586A04u, 4u) ? ReadU32(base, 0x00586A04u) : 0u;
-    if (app && SafeAddr(app + 0xD0u, 4u)) {
+    uint32_t app = ValidGuest(0x00586A04u, 4u) ? ReadU32(base, 0x00586A04u) : 0u;
+    if (app && ValidGuest(app + 0xD0u, 4u)) {
         g_im.player = ReadU32(base, app + 0xD0u);
     }
     uint32_t psi_mgr = 0u;
-    if (g_im.player && SafeAddr(g_im.player, 0x870u)) {
+    if (g_im.player && ValidGuest(g_im.player, 0x870u)) {
         uint32_t wpn = ReadU32(base, g_im.player + 0x6FCu);
         if (!wpn) {
             uint32_t holder = ReadU32(base, g_im.player + 0x788u);
-            if (holder && SafeAddr(holder + 0x4u, 4u)) wpn = ReadU32(base, holder + 0x4u);
+            if (holder && ValidGuest(holder + 0x4u, 4u)) wpn = ReadU32(base, holder + 0x4u);
         }
         g_im.wpn = wpn;
-        if (wpn && SafeAddr(wpn, 0x14u)) {
+        if (wpn && ValidGuest(wpn, 0x14u)) {
             g_im.wpn_type = ReadU32(base, wpn + 0x10u);
         }
         psi_mgr = ReadU32(base, g_im.player + 0x6F4u);
-        if (psi_mgr && SafeAddr(psi_mgr, 8u)) {
+        if (psi_mgr && ValidGuest(psi_mgr, 8u)) {
             g_im.psi_fn = ReadU32(base, psi_mgr + 0x4u);
         }
         g_im.ground_wpn = ReadU32(base, g_im.player + 0x74Cu);
@@ -1104,14 +1148,14 @@ void Hook_InputManagerUpdate(X86Context& ctx, uint8_t* base) {
     }
 
     uint32_t cam = PsiOpsLiveCameraVa();
-    if (cam && SafeAddr(cam + 0x37Cu, 4u)) {
+    if (cam && ValidGuest(cam + 0x37Cu, 4u)) {
         float sniper_timer = ReadF32(base, cam + 0x37Cu);
         g_im.sniper_scoped = std::isfinite(sniper_timer) && sniper_timer > 0.8f;
     }
     g_im_sniper_weapon_or_scoped.store(g_im.wpn_type == 3u || g_im.sniper_scoped, std::memory_order_relaxed);
 
     // Sync active Psi slot (0..5: TK/PK/MD/MC/RV/AV) for LShift/Mouse5 PsiUse
-    if (!g_im.user_selected_psi && psi_mgr && SafeAddr(psi_mgr + 0x158u, 0x38u)) {
+    if (!g_im.user_selected_psi && psi_mgr && ValidGuest(psi_mgr + 0x158u, 0x38u)) {
         uint32_t idx = ReadU32(base, psi_mgr + 0x158u);
         if (idx < 6u) {
             uint32_t tag_va = ReadU32(base, psi_mgr + 0x160u + idx * 8u);
@@ -1194,12 +1238,12 @@ bool Hook_InputManagerGetActionValue(X86Context& ctx, uint8_t* base) {
     if (!g_im.valid) return false;
 
     uint32_t im = ctx.esi;
-    if (!SafeAddr(im, 0x28u)) im = kInputMgrSingletonVa;
-    if (!SafeAddr(im, 0x28u)) return false;
+    if (!ValidGuest(im, 0x28u)) im = kInputMgrSingletonVa;
+    if (!ValidGuest(im, 0x28u)) return false;
     uint32_t mode = ReadU32(base, im + 0x14u);
     if (mode != 2u && mode != 3u && mode != 4u) return false;
     if (ReadU32(base, im + 0x24u) != 0u) return false;
-    if (!SafeAddr(ctx.esp + 0x4u, 4u)) return false;
+    if (!ValidGuest(ctx.esp + 0x4u, 4u)) return false;
 
     uint32_t action_id = ReadU32(base, ctx.esp + 0x4u);
     float val = 0.0f;

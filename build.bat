@@ -2,6 +2,8 @@
 setlocal enabledelayedexpansion
 rem SPDX-License-Identifier: GPL-2.0-or-later
 rem Psi-Ops: The Mindgate Conspiracy (Original Xbox) - Windows x64 build script
+rem Keep %%_PDB%% undefined so cmd.exe-wrapped link steps pass /PDBALTPATH:%%_PDB%% to lld-link verbatim
+set "_PDB="
 
 set "GAME_TITLE=Psi-Ops: The Mindgate Conspiracy"
 set "GAME_EXE=PsiOps"

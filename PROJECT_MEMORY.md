@@ -5,8 +5,8 @@
 - **Title ID:** `0x4D570016` (`MW-022`, publisher `'MW'`, decimal `22`, cert UTF-16LE title `PsiOps`, Region `0x00000001` NA, Allowed Media `0x00000202` `DVD_X2 | MEDIA_BOARD`, `init_flags = 0x00000005` `MountUtilityDrive | Limit64MB`)
 - **Architecture:** Static x86 → C++20 recompilation via pinned **`XboxXBERecomp`** (`cc9edda3a821a4204dc28783f429b88a27ade4f9`) + pure-LF `patches/xboxxberecomp.patch`.
 - **Dual Target Platforms:**
-  - **Windows x64:** D3D12 + XAudio2 + static SDL3 (`PsiOps.exe` + freestanding `PsiOps.dll`), Clang/LLD (`C:\Program Files\LLVM\bin`, LLVM 23.1.6) + MSVC SDK (`10.0.26100.0`).
-  - **Linux x86_64 / SteamOS 3.x:** Native Vulkan 1.2 + static SDL3 + static `glslang`/SPIR-V (`PsiOps` + freestanding `libPsiOps.so`), compiled in WSL2 Ubuntu 22.04.5 LTS (`glibc 2.35`, `GLIBCXX_3.4.30`, `-fuse-ld=lld -rdynamic -shared-libgcc`).
+  - **Windows x64:** D3D12 + XAudio2 + static SDL3 (`PsiOps.exe` + freestanding `PsiOps.dll`), Clang/LLD (`C:\Program Files\LLVM\bin`) + Windows SDK.
+  - **Linux x86_64 / SteamOS 3.x:** Native Vulkan 1.2 + static SDL3 + static `glslang`/SPIR-V (`PsiOps` + freestanding `libPsiOps.so`), compiled on Ubuntu 22.04 LTS (`glibc 2.35`, `GLIBCXX_3.4.30`, `-fuse-ld=lld -rdynamic -shared-libgcc`).
 - **Copyright-Clean Mode:** `-DPSIOPS_ALLOW_NO_XBE=ON` (`XBE_NO_IMAGE=ON`, `xbe_recomp --headers-only`) builds host runtime + headers without requiring any `.xbe` or disc image.
 
 ---
@@ -69,15 +69,14 @@
 
 ---
 
-## 4. Verified Host Hardware & Toolchain Notes
-- **Host OS & Hardware:** Windows 11 Pro 25H2 (Build `26200.9974`), **AMD Ryzen 7 9800X3D** (8C/16T, single CCD, homogeneous Zen 5, 96 MiB L3 V-Cache), `61.64 GiB` RAM, **NVIDIA GeForce RTX 3090** (`24 GiB`, Driver `616.92`, Vulkan `1.4.351`) + AMD Radeon iGPU (`26.6.1`), signed local NGX DLSS `310.9.16.0` & `310.4.0.0`.
-- **Windows Toolchain:** Standalone LLVM/Clang **`23.1.6`** at `C:\Program Files\LLVM\bin` (NOT in default PATH; prepended by `CMakePresets.json` & `build.bat`), VS Community 2026 (`18.8.0`, MSVC `14.51.36231`) & VS Build Tools 2022 (`17.14.13`, MSVC `14.44.35207`), WinSDK `10.0.26100.0` (`rc/mt/fxc/dxc`), `cmake 4.4.4`, `ninja 1.13.0`, `python 3.11.0`, `7-Zip 25.01`.
+## 4. Reference Verification & Toolchain Notes
+- **Reference Test Environment:** Windows 11 x64 desktop workstation (8C/16T x86-64 CPU, discrete NVIDIA RTX D3D12 GPU + integrated AMD Radeon UMA GPU) and Linux x86_64 (Ubuntu 22.04 LTS / Vulkan 1.2 / Mesa `lavapipe` via `xvfb-run`).
+- **Windows Toolchain:** Standalone LLVM/Clang at `C:\Program Files\LLVM\bin` (prepended by `CMakePresets.json` & `build.bat`), Visual Studio 2022/2026 C++ Build Tools + Windows 10/11 SDK (`rc/mt/fxc/dxc`), CMake `>= 3.22`, Ninja, Python `>= 3.11`.
 - **Reverse Engineering Tools:**
-  - **Ghidra `12.1.4 PUBLIC`** (`$GHIDRA_INSTALL_DIR`) with **`ghidra-xbe` (`XboxExecutableLoader` v12.1.4)** installed in `%APPDATA%\ghidra\ghidra_12.1.4_PUBLIC\Extensions\`. **Gotcha:** override `JAVA_HOME` to a JDK 21+ installation (e.g. Eclipse Temurin JDK 25) for headless `analyzeHeadless.bat` if system `JAVA_HOME` is Java 8.
-  - **IDA Pro `9.4`** with `loaders\xbe.dll` and headless `idat.exe`.
-- **WSL2 Ubuntu 22.04.5 LTS Environment:**
-  - Use the host Ubuntu 22.04.5 LTS WSL2 distro (`wsl -l -v`; default WSL distro is `docker-desktop`, so always pass `-d <ubuntu2204-distro>`).
-  - Kernel `6.6.87.2-microsoft-standard-WSL2`, **`glibc 2.35`**, `g++ 11.4.0` (`GLIBCXX_3.4.30`), `cmake 3.22.1`, `ninja 1.10.1`, `clang 14.0.0` / `clang-15 15.0.7`, `ld.lld 14.0.0` / `lld-15`, `glslang-dev 11.8.0`, `libvulkan-dev 1.3.204`, `mesa-vulkan-drivers 23.2.1` (`lavapipe` `llvmpipe` Vulkan `1.3.255` via `xvfb-run`), `patchelf 0.14.3`, and all 15 SDL3 dev packages pre-installed (`0` missing packages).
+  - **Ghidra** (`$GHIDRA_INSTALL_DIR`) with the **`ghidra-xbe` (`XboxExecutableLoader`)** extension for headless `analyzeHeadless.bat` symbol analysis (requires JDK 21+ via `JAVA_HOME`).
+- **Ubuntu 22.04 LTS / WSL2 Build Environment:**
+  - Any Ubuntu 22.04 LTS native or WSL2 distro (`wsl -l -v`; pass `-d <ubuntu2204-distro>` or set `PSIOPS_WSL_DISTRO` when running cross-platform test runners from Windows).
+  - Targets **`glibc 2.35`**, `GLIBCXX_3.4.30`, `cmake >= 3.22`, `ninja`, `clang` + `lld`, `glslang-dev`, `libvulkan-dev`, `mesa-vulkan-drivers` (`lavapipe` via `xvfb-run`), `patchelf`, and standard SDL3 development headers.
 
 ---
 
@@ -232,7 +231,7 @@
   - 5-tab live-synced settings overlay embedding `mkb::DrawControlsSettingsPanel()`, calling `mkb::SetOverlayOpen(bool)` for smart cursor release, plus upgraded HUD (`FPS | ms | Upscaler | Render -> Display | Input | F1 Settings`) and `--open-settings` / `--capture-ui-bmp`.
 - **Branded Assets & Win32 PE Resources (`tools/gen_icon.py`, `resources/{psiops.png,psiops.ico,app.manifest,psiops.rc}`):**
   - Compiled via `llvm-rc.exe` with `-Xlinker /MANIFEST:NO` (zero duplicate manifest); embeds `RT_ICON`, `RT_GROUP_ICON` (7 sizes), `RT_MANIFEST` (`PerMonitorV2`), and `RT_VERSION` (`ProductName="Psi-Ops: The Mindgate Conspiracy"`).
-- **Steam Deck Native Installer & Scripts (`packaging/steamdeck/{install-steamdeck.sh,psi-ops-recomp.desktop}`, `.local/{send_to_steamdeck,update_steamdeck}.ps1`):**
+- **Steam Deck Native Installer (`packaging/steamdeck/{install-steamdeck.sh,psi-ops-recomp.desktop}`):**
   - Adds native Linux `PsiOps` to Steam `shortcuts.vdf` (NEVER Proton!) with backup, idempotent re-install, and clean `--uninstall`; `--create-shortcut` sanitizes NTFS illegal `:` (`Psi-Ops - The Mindgate Conspiracy.lnk` / `psiops-recomp.desktop`).
 
 ### Verified Milestone 5 Builds & Full Test Matrix
@@ -343,3 +342,24 @@
 - **Live Level 00 In-Game State Proofs (`tools/test_m3_mkb.py --platform both` -> `2/2 PASS`, `0` warnings):**
   - Win64 D3D12 (`105.27s`, `5,524` frames) & Linux Vulkan 1.2 (`119.67s`, `3,441` frames): `E` `delta_y=0.0` (`0x1F` only), `Space` `delta_y=+0.5962/+0.5919` (`0x23` only, zero melee), `Q` `delta_y=0.0` + `melee_timer=0.0` + `anim_changed=true` (`0x20` only), `LCtrl` `crouch_anim_changed=true` (`0x26`), `LMB` `ammo_clip 12->11` (`0x1A+0x1B`), `R` `ammo_clip 11->12` + `reload_count_delta=1` + `weapon_type 2->2` (zero `0x18`/`0x19`), `WheelUp`/`WheelDown` (`0x18`/`0x19`, zero reload), `RMB` (`0x2B/0x2C/0x33`), `LAlt` (`0x36`), `1`/`2` + `LShift` (`psi_selected` + `0x10+0x11+0x12/0x13`), `0` DualSense Edge `deadzone=0` flip-flops (`1145`/`537` frames), `0` cursor unlock/visible leaks (`1346`/`633` frames), and Win64 <-> Linux `settings_portable.toml` parity.
   - Regression gates: `test_m3_replay.py` (fixed rotated `psiops*.log` lookup; 4/4 Win64 runs `Exit (0)`, `0` divergence, `100%` M&K isolation), `test_shader_precompile.py --platform win64` (`2/2 PASS`, `mid_game_compiles=0`), `test_m5_ux.py --platform win64 --skip-unpacked-compile` (`4/4 PASS`).
+
+---
+
+## 13. Public Release `v1.1.0` — Reproducible Path-Private Builds, Hardening & Zero-PII Audit
+- **Version Bump (`1.0.0` -> `1.1.0`):** Updated `CMakeLists.txt` (`project(PsiOps VERSION 1.1.0)` + `PSIOPS_VERSION_STR`), `resources/psiops.rc` (`FILEVERSION`/`PRODUCTVERSION` `1,1,0,0`, `"1.1.0"`), `resources/app.manifest` (`1.1.0.0`), `src/common/{ui_common.{h,cpp},launcher_ui.cpp,settings_ui.cpp}`, `release.bat`, `release_linux.sh`, `tools/audit_release.py`, `README.md`, `PROJECT_MEMORY.md`, and `handoff.md`.
+- **Reproducible, Path-Private Builds & Compiler Hardening (`CMakeLists.txt`, `CMakePresets.json`, `build.bat`, `release.bat`, `release_linux.sh`, `.github/workflows/build.yml`):**
+  - Enforced explicit `-O3 -DNDEBUG` Release flags across all presets and scripts; added `_psiops_register_prefix` (`-ffile-prefix-map` / `-ffile-compilation-dir=.` / `-gno-record-command-line`) across source, build, FetchContent deps, SDK, temp, and user-profile prefixes before `FetchContent_MakeAvailable`.
+  - Added Win64 LLD `LINKER:/Brepro` + `LINKER:/PDBALTPATH:%_PDB%` (with `set "_PDB="` in `build.bat`/`release.bat` so `%_PDB%` stays literal, producing bare `PsiOps.pdb` RSDS records) and Linux `LINKER:--build-id=sha1` + `LINKER:--strip-debug` + `strip --strip-debug` in `release_linux.sh`.
+- **Runtime, UI & Upscaler Hardening (`src/game/hooks.cpp`, `src/common/{game_info,mkb_input,ui_common,launcher_ui,settings_ui,file_browser_ui}.*`, `src/upscale/upscaler_{dlss,manager,vulkan}.cpp`, `XboxXBERecomp/runtime/app/game_code.cpp`):**
+  - Added committed-span `ValidGuest` bounds validation and exception-safe `GuestCallFrame` x86/x87 context preservation for re-entrant guest calls.
+  - Added click-to-rebind auto-cancel (`IsRebinding`/`CancelRebind`), dynamic `ImGuiBackendFlags_HasGamepad` sync (`SyncGamepadBackendFlag`), latched-button release (`ReleaseGamepadNavKeys`), and folder-change list focus in the XISO File Browser.
+  - Hardened DLSS `CreateFeature` fallback across legacy/unsupported `PerfQuality`/preset buckets without per-frame retry loops and improved live HUD labels (`DLSS (DLAA)`, `DLSS (2D)`, `FSR 1.0 (Fallback)`).
+  - Re-exported pure-LF `patches/xboxxberecomp.patch` (`1,132,258` B, `0` CR bytes, `SHA-256 = fe3d675d0326f897588545490c6b45931325522d7f1547785f8a045d6a3ae48a`, `git apply --reverse --check` rc=0).
+- **Upgraded Release Auditor (`tools/audit_release.py`):**
+  - Gate 1 now scans all Git commit Author/Committer/Message metadata and enforces the public GitHub noreply identity (`Anthonyp85 <214066322+Anthonyp85@users.noreply.github.com>`).
+  - Gate 2b audits built project binaries across `out/build/{release,headers-only-win,linux-release,headers-only-linux}` for zero host/workspace/user/PDB path leaks.
+  - Gates 3, 4, and 5 scan every archive member in both case-insensitive ASCII and UTF-16LE for personal/host PII, verify Win32 `RT_VERSION` `1.1.0` and relative RSDS `PsiOps.pdb`, and verify Linux `GLIBC <= 2.35` & `$ORIGIN` RPATH isolation.
+- **Verified `v1.1.0` Release Archives (`dist/`):**
+  - `dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.1.0-win64-launcher.zip`: `199,704,027` B (`36` files), `SHA-256 = 09bc065923d1b648837fe049615848a96461b6bdef953ca5e76a5e921c89d854`.
+  - `dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.1.0-linux-x86_64.tar.gz`: `71,860,355` B (`0` symlinks, `12` isolated `compiler/lib/*.so*`, `GLIBC <= 2.35`), `SHA-256 = 879c8f39b3b82d3eb2f683f15654b23baba39f53fd8d953cfd508439199c28b2`.
+  - `dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.1.0-source.zip`: exact 1-to-1 `git archive --format=zip HEAD` snapshot (zero binaries, zero `.xbe`/`.iso`, zero `plugins/`).

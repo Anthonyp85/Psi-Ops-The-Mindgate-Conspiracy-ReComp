@@ -309,6 +309,8 @@ struct MkbState {
     int rebind_action = -1;
     int rebind_slot = -1;
     uint64_t rebind_arm_frame = 0;
+    int rebind_arm_ui_frame = 0;      // ImGui frame the capture was armed on (launcher has no present frames)
+    bool rebind_committed = false;    // set when the window-message path stores a binding; panel marks dirty
 
     // Per-frame telemetry latched for --state-log
     int32_t frame_mouse_dx = 0;
@@ -995,6 +997,10 @@ void ApplyRuntimeOptionLocked(MkbState& st, const std::string& key_raw, const st
         st.cfg.mouse_smoothing = bval;
     } else if (k == "overlay_open") {
         st.overlay_open.store(bval, std::memory_order_release);
+        if (!bval) {
+            st.rebind_action = -1;
+            st.rebind_slot = -1;
+        }
     } else if (k == "window_focused") {
         st.window_focused.store(bval, std::memory_order_release);
     } else if (k == "fps_cap") {
@@ -1289,9 +1295,16 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
         if (k == KeyCode::None) return false;
         std::lock_guard<std::mutex> lk(st.lock);
         if (st.rebind_action < 0) return false;
+        if (!st.overlay_open.load(std::memory_order_acquire)) {
+            // The Controls panel isn't visible: drop a stale capture instead of eating a gameplay key.
+            st.rebind_action = -1;
+            st.rebind_slot = -1;
+            return false;
+        }
         if (k == KeyCode::MouseLeft && input_rec::CurrentPresentFrame() <= st.rebind_arm_frame) return false;
         if (k != KeyCode::Escape) {
             st.cfg.bindings[st.rebind_action][st.rebind_slot] = k;
+            st.rebind_committed = true;
         }
         st.rebind_action = -1;
         st.rebind_slot = -1;
@@ -1567,12 +1580,17 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                 st.overlay_open.store(next, std::memory_order_release);
                 SyncImGuiMouseFlags(next, true);
                 std::lock_guard<std::mutex> lk(st.lock);
+                if (!next) {
+                    st.rebind_action = -1;
+                    st.rebind_slot = -1;
+                }
                 ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
                 return true;
             }
             if (kc != KeyCode::None) {
                 MarkMkbActivity(st);
-                if (handle_rebind_key(kc)) return true;
+                // Ignore auto-repeat so holding the key that armed the capture (Enter/Space) can't bind itself.
+                if (((lp & (1LL << 30)) == 0) && handle_rebind_key(kc)) return true;
                 st.key_down[size_t(kc)].store(true, std::memory_order_relaxed);
             }
             return false;
@@ -1811,13 +1829,17 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                 st.overlay_open.store(next, std::memory_order_release);
                 SyncImGuiMouseFlags(next, true);
                 std::lock_guard<std::mutex> lk(st.lock);
+                if (!next) {
+                    st.rebind_action = -1;
+                    st.rebind_slot = -1;
+                }
                 ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
                 return true;
             }
             if (kc != KeyCode::None) {
                 if (down) {
                     MarkMkbActivity(st);
-                    if (handle_rebind_key(kc)) return true;
+                    if (!ev->key.repeat && handle_rebind_key(kc)) return true;
                 }
                 st.key_down[size_t(kc)].store(down, std::memory_order_relaxed);
             }
@@ -2443,7 +2465,22 @@ void SetOverlayOpen(bool open) {
     st.overlay_open.store(open, std::memory_order_release);
     SyncImGuiMouseFlags(open, true);
     std::lock_guard<std::mutex> lk(st.lock);
+    if (!open) {
+        st.rebind_action = -1;
+        st.rebind_slot = -1;
+    }
     ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
+}
+bool IsRebinding() {
+    MkbState& st = St();
+    std::lock_guard<std::mutex> lk(st.lock);
+    return st.rebind_action >= 0;
+}
+void CancelRebind() {
+    MkbState& st = St();
+    std::lock_guard<std::mutex> lk(st.lock);
+    st.rebind_action = -1;
+    st.rebind_slot = -1;
 }
 bool IsAutotestActive() { return St().autotest_active.load(std::memory_order_relaxed); }
 void SetActionMapCallback(ActionMapCallback cb) { St().action_cb.store(cb, std::memory_order_release); }
@@ -2512,18 +2549,85 @@ MenuMouseState GetMenuMouseState() {
     return m;
 }
 
+// ImGui-side rebind capture. The pre-game launcher windows don't route messages through OnWindowMessage, so
+// without this a "Press key..." armed in the launcher could never complete and would leak into gameplay.
+// In-game the window-message path normally wins (it consumes the key before ImGui sees it).
+static KeyCode PollImGuiRebindInput() {
+    struct KeyMap {
+        ImGuiKey key;
+        KeyCode code;
+    };
+    static constexpr KeyMap kKeys[] = {
+        {ImGuiKey_Space, KeyCode::Space},          {ImGuiKey_Enter, KeyCode::Enter},
+        {ImGuiKey_KeypadEnter, KeyCode::Enter},    {ImGuiKey_Tab, KeyCode::Tab},
+        {ImGuiKey_Backspace, KeyCode::Backspace},  {ImGuiKey_LeftShift, KeyCode::LShift},
+        {ImGuiKey_RightShift, KeyCode::RShift},    {ImGuiKey_LeftCtrl, KeyCode::LCtrl},
+        {ImGuiKey_RightCtrl, KeyCode::RCtrl},      {ImGuiKey_LeftAlt, KeyCode::LAlt},
+        {ImGuiKey_RightAlt, KeyCode::RAlt},        {ImGuiKey_UpArrow, KeyCode::Up},
+        {ImGuiKey_DownArrow, KeyCode::Down},       {ImGuiKey_LeftArrow, KeyCode::Left},
+        {ImGuiKey_RightArrow, KeyCode::Right},     {ImGuiKey_Minus, KeyCode::Minus},
+        {ImGuiKey_Equal, KeyCode::Equals},         {ImGuiKey_LeftBracket, KeyCode::LBracket},
+        {ImGuiKey_RightBracket, KeyCode::RBracket}, {ImGuiKey_Backslash, KeyCode::Backslash},
+        {ImGuiKey_Semicolon, KeyCode::Semicolon},  {ImGuiKey_Apostrophe, KeyCode::Apostrophe},
+        {ImGuiKey_Comma, KeyCode::Comma},          {ImGuiKey_Period, KeyCode::Period},
+        {ImGuiKey_Slash, KeyCode::Slash},          {ImGuiKey_GraveAccent, KeyCode::Grave},
+    };
+    for (int i = 0; i < 26; ++i) {
+        if (ImGui::IsKeyPressed(ImGuiKey(ImGuiKey_A + i), false)) return KeyCode(uint16_t(KeyCode::A) + i);
+    }
+    for (int i = 0; i < 10; ++i) {
+        if (ImGui::IsKeyPressed(ImGuiKey(ImGuiKey_0 + i), false)) return KeyCode(uint16_t(KeyCode::Num0) + i);
+    }
+    // F1 is reserved for the overlay toggle (in-game it never reaches the action map).
+    for (int i = 1; i < 12; ++i) {
+        if (ImGui::IsKeyPressed(ImGuiKey(ImGuiKey_F1 + i), false)) return KeyCode(uint16_t(KeyCode::F1) + i);
+    }
+    for (const KeyMap& m : kKeys) {
+        if (ImGui::IsKeyPressed(m.key, false)) return m.code;
+    }
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) return KeyCode::MouseLeft;
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) return KeyCode::MouseRight;
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) return KeyCode::MouseMiddle;
+    if (ImGui::IsMouseClicked(3)) return KeyCode::Mouse4;
+    if (ImGui::IsMouseClicked(4)) return KeyCode::Mouse5;
+    const float wheel = ImGui::GetIO().MouseWheel;
+    if (wheel > 0.0f) return KeyCode::WheelUp;
+    if (wheel < 0.0f) return KeyCode::WheelDown;
+    return KeyCode::None;
+}
+
 void DrawControlsSettingsPanel(bool auto_save, bool* out_dirty) {
     MkbState& st = St();
     std::lock_guard<std::mutex> lk(st.lock);
     bool dirty = false;
 
+    // A binding stored by the window-message capture path still has to be saved.
+    if (st.rebind_committed) {
+        st.rebind_committed = false;
+        dirty = true;
+    }
+    if (st.rebind_action >= 0 && ImGui::GetFrameCount() > st.rebind_arm_ui_frame) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) {
+            st.rebind_action = -1;  // Esc / gamepad B cancels without changing the binding
+            st.rebind_slot = -1;
+        } else if (KeyCode cap = PollImGuiRebindInput(); cap != KeyCode::None) {
+            st.cfg.bindings[st.rebind_action][st.rebind_slot] = cap;
+            st.rebind_action = -1;
+            st.rebind_slot = -1;
+            dirty = true;
+        }
+    }
+
     const char* modes[] = {"Auto (Instant Hot-Switch)", "Mouse & Keyboard", "Controller"};
-    int mode_idx = int(st.cfg.input_mode);
+    int mode_idx = std::clamp(int(st.cfg.input_mode), 0, 2);
     if (ImGui::Combo("Input Mode", &mode_idx, modes, 3)) {
         st.cfg.input_mode = InputMode(mode_idx);
         if (st.cfg.input_mode == InputMode::Mkb) st.active_device.store(ActiveDevice::Mkb, std::memory_order_relaxed);
-        else if (st.cfg.input_mode == InputMode::Controller)
+        else if (st.cfg.input_mode == InputMode::Controller) {
             st.active_device.store(ActiveDevice::Controller, std::memory_order_relaxed);
+            st.rebind_action = -1;
+            st.rebind_slot = -1;
+        }
         dirty = true;
     }
 
@@ -2579,6 +2683,10 @@ void DrawControlsSettingsPanel(bool auto_save, bool* out_dirty) {
         ImGui::TableSetupColumn("Clear", ImGuiTableColumnFlags_WidthFixed, 64.0f);
         ImGui::TableHeadersRow();
 
+        // While a capture is pending the table is modal: keyboard-nav Space/Enter or a click must bind the
+        // pending slot, not re-arm/clear another button on the same frame.
+        const bool capturing = (st.rebind_action >= 0);
+        ImGui::BeginDisabled(capturing);
         for (int i = 0; i < int(Action::Count); ++i) {
             ImGui::TableNextRow();
             ImGui::PushID(i);
@@ -2589,16 +2697,17 @@ void DrawControlsSettingsPanel(bool auto_save, bool* out_dirty) {
                 ImGui::TableSetColumnIndex(1 + slot);
                 bool waiting = (st.rebind_action == i && st.rebind_slot == slot);
                 const char* tok = KeyCodeToToken(st.cfg.bindings[i][slot]);
-                std::string btn_label = waiting ? "Press key..." : (tok[0] ? tok : "---");
+                std::string btn_label = waiting ? "Press key... (Esc / B cancels)" : (tok[0] ? tok : "---");
                 btn_label += slot == 0 ? "##p" : "##s";
-                if (ImGui::Button(btn_label.c_str(), ImVec2(-1.0f, 0.0f))) {
+                if (ImGui::Button(btn_label.c_str(), ImVec2(-1.0f, 0.0f)) && !capturing) {
                     st.rebind_action = i;
                     st.rebind_slot = slot;
                     st.rebind_arm_frame = input_rec::CurrentPresentFrame();
+                    st.rebind_arm_ui_frame = ImGui::GetFrameCount();
                 }
             }
             ImGui::TableSetColumnIndex(3);
-            if (ImGui::Button("Clear##c", ImVec2(-1.0f, 0.0f))) {
+            if (ImGui::Button("Clear##c", ImVec2(-1.0f, 0.0f)) && !capturing) {
                 st.cfg.bindings[i][0] = KeyCode::None;
                 st.cfg.bindings[i][1] = KeyCode::None;
                 if (st.rebind_action == i) {
@@ -2609,6 +2718,7 @@ void DrawControlsSettingsPanel(bool auto_save, bool* out_dirty) {
             }
             ImGui::PopID();
         }
+        ImGui::EndDisabled();
         ImGui::EndTable();
     }
 

@@ -105,6 +105,9 @@ void LoadUiFont(ImGuiIO& io, float dpi_scale) {
     float sc = std::clamp(dpi_scale, 0.85f, 2.5f);
     float px = std::round(16.0f * sc);
     std::error_code ec;
+    // Safe to call again on DPI change: rebuild the atlas from scratch (callers invalidate the backend's font
+    // texture before and recreate it after).
+    io.Fonts->Clear();
 
 #ifdef _WIN32
     static const char* const kFonts[] = {
@@ -212,7 +215,8 @@ void DrawUpscalingGraphicsPanel(const upscale::PluginProbe& probe, bool in_game,
         "Steam Deck (1280x800)", "Handheld / iGPU", "1080p Mainstream", "1440p High", "4K Ultra", "Custom"};
     for (int i = 0; i < 6; ++i) {
         if (i > 0) ImGui::SameLine();
-        bool active = (s.hardware_preset == kPresets[i]);
+        // Snapshot before the button: clicking it changes s.hardware_preset, and Push/Pop must stay paired.
+        const bool active = (s.hardware_preset == kPresets[i]);
         if (active) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.50f, 0.64f, 1.0f));
         }
@@ -392,7 +396,7 @@ void DrawDisplayGpuPanel(const std::vector<app::GpuAdapterInfo>& gpus,
     SectionHeading("Display Output & Frame Pacing");
 
     const char* dmodes[] = {"Exclusive Fullscreen", "Borderless Fullscreen", "Windowed"};
-    int dm = int(s.display_mode);
+    int dm = std::clamp(int(s.display_mode), 0, 2);
     if (ImGui::Combo("Display Mode", &dm, dmodes, 3)) {
         s.display_mode = app::DisplayMode(dm);
         dirty = true;
@@ -415,12 +419,15 @@ void DrawDisplayGpuPanel(const std::vector<app::GpuAdapterInfo>& gpus,
         }
         for (const auto& m : monitors) {
             bool sel = (s.monitor == m.device);
+            // Identical monitor models share a label; scope the ID by the unique device name.
+            ImGui::PushID(m.device.c_str());
             if (ImGui::Selectable(m.label.c_str(), sel)) {
                 s.monitor = m.device;
                 dirty = true;
                 needs_display_apply = true;
             }
             if (sel) ImGui::SetItemDefaultFocus();
+            ImGui::PopID();
         }
         ImGui::EndCombo();
     }
@@ -437,10 +444,13 @@ void DrawDisplayGpuPanel(const std::vector<app::GpuAdapterInfo>& gpus,
             dirty = true;
             needs_display_apply = true;
         }
-        for (const auto& m : modes) {
+        for (size_t mi = 0; mi < modes.size(); ++mi) {
+            const auto& m = modes[mi];
             char lb[64];
             std::snprintf(lb, sizeof(lb), "%ux%u", m.width, m.height);
             bool sel = (s.width == m.width && s.height == m.height);
+            // The mode list can repeat a WxH (one entry per refresh rate); scope IDs by index.
+            ImGui::PushID(int(mi));
             if (ImGui::Selectable(lb, sel)) {
                 s.width = m.width;
                 s.height = m.height;
@@ -448,6 +458,7 @@ void DrawDisplayGpuPanel(const std::vector<app::GpuAdapterInfo>& gpus,
                 needs_display_apply = true;
             }
             if (sel) ImGui::SetItemDefaultFocus();
+            ImGui::PopID();
         }
         ImGui::EndCombo();
     }
@@ -468,7 +479,7 @@ void DrawDisplayGpuPanel(const std::vector<app::GpuAdapterInfo>& gpus,
 
     // Present Mode selector
     const char* pmodes[] = {"Auto (Smart VSync / VRR)", "VSync (Locked)", "VRR / Allow Tearing", "Tear-Free Mailbox"};
-    int pm = int(s.present_mode);
+    int pm = std::clamp(int(s.present_mode), 0, 3);
     if (ImGui::Combo("Present / VSync Mode", &pm, pmodes, 4)) {
         s.present_mode = app::PresentMode(pm);
         s.vsync = (s.present_mode == app::PresentMode::Auto || s.present_mode == app::PresentMode::VSync);
@@ -495,12 +506,15 @@ void DrawDisplayGpuPanel(const std::vector<app::GpuAdapterInfo>& gpus,
             std::snprintf(lb, sizeof(lb), "%s (%llu MB VRAM%s)", g.name.c_str(),
                           (unsigned long long)(g.dedicated_vram >> 20), g.likely_uma ? ", UMA/iGPU" : "");
             bool sel = (s.gpu_adapter == g.key);
+            // Two identical GPUs produce the same label; scope the ID by the unique adapter key.
+            ImGui::PushID(g.key.c_str());
             if (ImGui::Selectable(lb, sel)) {
                 s.gpu_adapter = g.key;
                 app::MarkGpuAdapterUserEdited();
                 dirty = true;
             }
             if (sel) ImGui::SetItemDefaultFocus();
+            ImGui::PopID();
         }
         ImGui::EndCombo();
     }
@@ -560,6 +574,7 @@ void DrawToolsDiagnosticsPanel(const upscale::PluginProbe& probe, bool in_game, 
     ImGui::TextDisabled("Built-in spatial upscalers (FSR 1.0, NIS v1.0.3, CAS, Bicubic 5-Tap, Integer, Bilinear) are always [Ready].");
 
     SectionHeading("Shader Cache, Shortcuts & Diagnostics");
+    ImGui::Text("Build Version: v%s", PSIOPS_VERSION_STR);
     gpu::CacheStats cs = gpu::GetCacheStats();
     ImGui::Text("Shader/PSO Disk Cache: %s | Shaders: %u | PSOs: %u | Size: %.2f MB",
                 cs.enabled ? "Enabled" : "Standby", cs.shaders, cs.psos, double(cs.disk_bytes) / (1024.0 * 1024.0));
@@ -611,7 +626,26 @@ void ResetGamepadNavState(bool prime_held) {
     g_nav_primed = true;
 }
 
+void SyncGamepadBackendFlag(ImGuiIO& io) {
+    if (input::GetDeviceInfo(0).connected) io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    else io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+}
+
+void ReleaseGamepadNavKeys(ImGuiIO& io) {
+    static constexpr ImGuiKey kPadKeys[] = {
+        ImGuiKey_GamepadDpadUp,   ImGuiKey_GamepadDpadDown,  ImGuiKey_GamepadDpadLeft, ImGuiKey_GamepadDpadRight,
+        ImGuiKey_GamepadFaceDown, ImGuiKey_GamepadFaceRight, ImGuiKey_GamepadFaceLeft, ImGuiKey_GamepadFaceUp,
+        ImGuiKey_GamepadL1,       ImGuiKey_GamepadR1,
+    };
+    for (ImGuiKey k : kPadKeys) io.AddKeyEvent(k, false);
+    // Next poll primes from whatever is physically held then, so a held chord isn't seen as a fresh press.
+    g_nav_primed = false;
+}
+
 GamepadNavEvents PollGamepadNavToImGui(ImGuiIO& io) {
+    // On disconnect HeldOnAnyController() drops to 0, so every key below is released on the same frame;
+    // HasGamepad is cleared too so ImGui stops gamepad navigation until a pad is back.
+    SyncGamepadBackendFlag(io);
     uint16_t now = input::HeldOnAnyController();
     if (!g_nav_primed) {
         g_nav_prev_mask = now;

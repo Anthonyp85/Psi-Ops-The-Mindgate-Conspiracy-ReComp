@@ -18,7 +18,9 @@
                 "CMAKE_C_COMPILER": "clang",
                 "CMAKE_CXX_COMPILER": "clang++",
                 "CMAKE_C_FLAGS": "-march=x86-64-v2",
-                "CMAKE_CXX_FLAGS": "-march=x86-64-v2"
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v2",
+                "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG",
+                "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG"
             },
             "condition": {
                 "type": "equals",
@@ -59,7 +61,9 @@
                 "CMAKE_C_COMPILER": "clang",
                 "CMAKE_CXX_COMPILER": "clang++",
                 "CMAKE_C_FLAGS": "-march=x86-64-v2",
-                "CMAKE_CXX_FLAGS": "-march=x86-64-v2"
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v2",
+                "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG",
+                "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG"
             },
             "condition": {
                 "type": "equals",
@@ -95,7 +99,9 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_C_FLAGS": "-march=x86-64-v2",
-                "CMAKE_CXX_FLAGS": "-march=x86-64-v2"
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v2",
+                "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG",
+                "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG"
             },
             "condition": {
                 "type": "equals",

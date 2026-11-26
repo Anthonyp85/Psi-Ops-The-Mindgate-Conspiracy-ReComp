@@ -24,6 +24,16 @@ uint32_t PsiOpsGetMkbReloadCount();
 
 namespace {
 
+// Bounds check for guest pointer chains read by telemetry/camera callbacks (same contract as hooks.cpp ValidGuest):
+// rejects null / first-64 KiB (null + field offset) pointers, 32-bit wrap-around, and spans whose first or last
+// byte is not committed. These run on host threads while the guest mutates the objects, so check the full span.
+bool ValidGuest(uint32_t va, uint32_t bytes) {
+    if (kernel::g_base == nullptr || bytes == 0u || va < mem::kUserLow) return false;
+    if (va > 0xFFFFFFFFu - (bytes - 1u)) return false;
+    if (!mem::IsCommitted(va)) return false;
+    return bytes == 1u || mem::IsCommitted(va + (bytes - 1u));
+}
+
 float ReadGuestF32(uint32_t va) {
     uint32_t raw = kernel::R32(va);
     float f = 0.0f;
@@ -41,12 +51,11 @@ void WriteGuestF32(uint32_t va, float v) {
 // Cancels the NTSC 10/11 CRT non-square PAR multiplier (0x002F6C76..0x002F6C89) so
 // BuildProj (0x002F5840) computes exact 16:9 (1.777778) and MWSFD FMVs (0x0026D0D0) stay 4:3 pillarboxed.
 void ApplyPsiOpsAspectFix() {
-    if (!kernel::g_base || !mem::IsCommitted(0x005DEFC8u) || !mem::IsCommitted(0x005CCBD0u) ||
-        !mem::IsCommitted(0x005CCBCCu)) {
+    if (!ValidGuest(0x005DEFC8u, 4u) || !ValidGuest(0x005CCBD0u, 1u) || !ValidGuest(0x005CCBCCu, 4u)) {
         return;
     }
     uint32_t renderer = kernel::R32(0x005DEFC8u);
-    if (!renderer || !mem::IsCommitted(renderer + 0x14u)) return;
+    if (!ValidGuest(renderer + 0x10u, 4u)) return;
     if (app::Widescreen() && kernel::G<uint8_t>(0x005CCBD0u) != 0u) {
         const float target_par = app::Get().aspect_correct_render ? (4.0f / 3.0f) : ((4.0f / 3.0f) * (10.0f / 11.0f));
         float cur_r = ReadGuestF32(renderer + 0x10u);
@@ -90,17 +99,17 @@ const char* PhaseToString(perf::Phase p) {
 // Binary-verified Psi-Ops (XDK 5849, default.xbe) GameApp, HUD modal UI & timing telemetry VAs.
 PsiOpsRawPhase ReadPsiOpsPhaseRaw() {
     PsiOpsRawPhase out{};
-    if (!kernel::g_base || !mem::IsCommitted(0x00586A04u)) return out;
+    if (!ValidGuest(0x00586A04u, 4u)) return out;
 
     // When menus are confirmed via PC mouse (CallSendUiEvent 0x3F2) without a physical controller button held,
     // Psi-Ops's BindActivePort (sub_00294500) scans ports 3..0 with strict '>' against -1.0f, so Port 3 (disconnected)
     // wins the 0.0f tie and swaps into active_player_port[0] (0x0055673C), muting all subsequent FMV skip & gameplay
     // input on Port 0. Restore Port 0 whenever M&K owns Port 0 or Player 0 is bound to an invalid/disconnected port.
-    if (mem::IsCommitted(0x0055673Cu) && mem::IsCommitted(0x00556748u)) {
+    if (ValidGuest(0x0055673Cu, 16u)) {
         uint32_t p0 = kernel::R32(0x0055673Cu);
         bool p0_disconnected =
             (p0 >= 4u) ||
-            (mem::IsCommitted(0x005DED18u + p0 * 0x94u + 0x14u) && kernel::G<uint8_t>(0x005DED18u + p0 * 0x94u + 0x14u) == 0u);
+            (ValidGuest(0x005DED18u + p0 * 0x94u + 0x14u, 1u) && kernel::G<uint8_t>(0x005DED18u + p0 * 0x94u + 0x14u) == 0u);
         bool mkb_owns = (mkb::GetActiveDevice() == mkb::ActiveDevice::Mkb &&
                          mkb::GetConfig().input_mode != mkb::InputMode::Controller);
         if (p0 != 0u && (p0_disconnected || mkb_owns)) {
@@ -114,7 +123,7 @@ PsiOpsRawPhase ReadPsiOpsPhaseRaw() {
     }
 
     uint32_t app = kernel::R32(0x00586A04u);
-    if (!app || !mem::IsCommitted(app) || !mem::IsCommitted(app + 0xD8u)) return out;
+    if (!ValidGuest(app, 0xD8u)) return out;  // fields read below span [app+0x38, app+0xD8)
     out.app = app;
 
     float dt_s = ReadGuestF32(app + 0x38u);
@@ -128,16 +137,16 @@ PsiOpsRawPhase ReadPsiOpsPhaseRaw() {
     double sim_s = double(kernel::R64(app + 0x50u)) + double(ReadGuestF32(app + 0x58u));
     out.sim_s = std::isfinite(sim_s) ? sim_s : 0.0;
 
-    out.fmv_active = mem::IsCommitted(0x005C4198u) && mem::IsCommitted(0x005C4250u) &&
+    out.fmv_active = ValidGuest(0x005C4198u, 4u) && ValidGuest(0x005C4250u, 4u) &&
                      kernel::R32(0x005C4198u) != 0u && kernel::R32(0x005C4250u) == 0u;
-    out.status_ready = mem::IsCommitted(0x005ED2B8u) && ((kernel::G<uint8_t>(0x005ED2B8u) & 1u) != 0u);
-    out.in_shell = !out.status_ready || !mem::IsCommitted(0x005ECEA7u) || (kernel::G<uint8_t>(0x005ECEA7u) != 0u);
+    out.status_ready = ValidGuest(0x005ED2B8u, 1u) && ((kernel::G<uint8_t>(0x005ED2B8u) & 1u) != 0u);
+    out.in_shell = !out.status_ready || !ValidGuest(0x005ECEA7u, 1u) || (kernel::G<uint8_t>(0x005ECEA7u) != 0u);
 
     bool hud_modal_lock_on = false;
     bool objectives_open_on = false;
-    if (mem::IsCommitted(0x005CCB90u)) {
+    if (ValidGuest(0x005CCB90u, 4u)) {
         uint32_t hud = kernel::R32(0x005CCB90u);
-        if (hud && mem::IsCommitted(hud + 0x3B8u)) {
+        if (ValidGuest(hud + 0x324u, 0x98u)) {  // [hud+0x324] .. [hud+0x3BB]
             out.hud = hud;
             uint8_t hud_modal_lock = kernel::G<uint8_t>(hud + 0x324u);
             uint8_t pause_open = kernel::G<uint8_t>(hud + 0x3B4u);
@@ -148,9 +157,9 @@ PsiOpsRawPhase ReadPsiOpsPhaseRaw() {
         }
     }
 
-    if (mem::IsCommitted(0x005DEFC8u)) {
+    if (ValidGuest(0x005DEFC8u, 4u)) {
         uint32_t swap_obj = kernel::R32(0x005DEFC8u);
-        if (swap_obj && mem::IsCommitted(swap_obj + 0x1Cu)) out.pi.g_frame = kernel::R32(swap_obj + 0x1Cu);
+        if (ValidGuest(swap_obj + 0x1Cu, 4u)) out.pi.g_frame = kernel::R32(swap_obj + 0x1Cu);
     }
 
     if (out.fmv_active) {
@@ -197,10 +206,10 @@ gpu::CameraFrameData QueryPsiOpsCamera() {
     out.dt_ms = (raw.pi.g_dt_ms > 0.5f && raw.pi.g_dt_ms < 200.0f) ? raw.pi.g_dt_ms : 16.667f;
     out.is_3d_gameplay = ((raw.pi.phase == perf::Phase::GameplayActive) || (raw.state == 4u)) &&
                          (raw.world != 0u) && !raw.in_shell && !raw.fmv_active && !raw.pause_open;
-    if (!out.is_3d_gameplay || !kernel::g_base || !mem::IsCommitted(0x005DEFC8u)) return out;
+    if (!out.is_3d_gameplay || !ValidGuest(0x005DEFC8u, 4u)) return out;
 
     uint32_t renderer = kernel::R32(0x005DEFC8u);
-    if (!renderer || !mem::IsCommitted(renderer + 0xE4u)) return out;
+    if (!ValidGuest(renderer + 0x24u, 0xC0u)) return out;  // View [+0x24] and Proj [+0xA4] matrices
 
     float v_guest[16];
     float p_guest[16];
@@ -232,15 +241,15 @@ gpu::CameraFrameData QueryPsiOpsCamera() {
     out.cam_fwd[2] = -v_guest[10];
 
     bool got_pos = false;
-    uint32_t active_cam = mem::IsCommitted(0x005CC6E8u) ? kernel::R32(0x005CC6E8u) : 0u;
+    uint32_t active_cam = ValidGuest(0x005CC6E8u, 4u) ? kernel::R32(0x005CC6E8u) : 0u;
     out.session = active_cam;
-    if (active_cam && mem::IsCommitted(active_cam + 0x84u)) {
+    if (ValidGuest(active_cam + 0x24u, 0x60u)) {  // [cam+0x24] world .. [cam+0x80] fovY
         float fov = ReadGuestF32(active_cam + 0x80u);
         if (std::isfinite(fov) && fov > 0.1f && fov < 2.8f) out.fov_y_rad = fov;
         else out.fov_y_rad = 2.0f * std::atan(1.0f / p_guest[5]);
 
         uint32_t cam_world = kernel::R32(active_cam + 0x24u);
-        if (cam_world && mem::IsCommitted(cam_world + 0x40u)) {
+        if (ValidGuest(cam_world + 0x30u, 0xCu)) {
             float cx = ReadGuestF32(cam_world + 0x30u);
             float cy = ReadGuestF32(cam_world + 0x34u);
             float cz = ReadGuestF32(cam_world + 0x38u);
@@ -268,9 +277,8 @@ gpu::CameraFrameData QueryPsiOpsCamera() {
 }
 
 bool IsSniperScopeActive() {
-    if (!kernel::g_base) return false;
     uint32_t cam = PsiOpsLiveCameraVa();
-    if (!cam || !mem::IsCommitted(cam + 0x37Cu)) return false;
+    if (!ValidGuest(cam + 0x37Cu, 4u)) return false;
     float sniper_timer = ReadGuestF32(cam + 0x37Cu);
     return std::isfinite(sniper_timer) && sniper_timer > 0.8f;
 }
@@ -308,7 +316,7 @@ void PsiOpsActionMap(const mkb::ActionPadState& act, input::Pad& pad) {
     // Active 3D gameplay pad fallback (InputManager::GetActionValue @ 0x294160 decouples every gameplay action
     // directly by Action ID in modes 2/3/4; keep pad bits clean & accurate for any passthrough / mode transition).
     uint32_t cfg = 2u;
-    if (kernel::g_base && mem::IsCommitted(0x005ECEB4u)) {
+    if (ValidGuest(0x005ECEB4u, 4u)) {
         uint32_t v = kernel::R32(0x005ECEB4u);
         if (v >= 2u && v <= 4u) cfg = v;
     }
@@ -390,18 +398,18 @@ input_rec::GuestStateSnapshot QueryPsiOpsGuestState() {
     s.g_frame = raw.pi.g_frame;
 
     // Guest Invert-Y option (GlobalOption[8] @ 0x005ECD5C: 0=Xbox default inverted, 1=normal)
-    if (raw.status_ready && mem::IsCommitted(0x005ECD5Cu)) {
+    if (raw.status_ready && ValidGuest(0x005ECD5Cu, 4u)) {
         s.has_guest_invert_y = true;
         s.guest_invert_y = (kernel::R32(0x005ECD5Cu) == 0u);
     }
 
     uint32_t psi_fn = 0u;
     uint32_t player = raw.player;
-    if (!player && raw.hud && mem::IsCommitted(raw.hud + 0x3B8u)) player = kernel::R32(raw.hud + 0x3B8u);
-    if (player && mem::IsCommitted(player + 0x78Cu)) {
+    if (!player && ValidGuest(raw.hud + 0x3B8u, 4u)) player = kernel::R32(raw.hud + 0x3B8u);
+    if (ValidGuest(player + 0x70u, 0x71Cu)) {  // [player+0x70] .. [player+0x78B]
         // Player world position (Transform @ [player+0x70] -> vec3 at +0x04/+0x08/+0x0C)
         uint32_t tr = kernel::R32(player + 0x70u);
-        if (tr && mem::IsCommitted(tr + 0x10u)) {
+        if (ValidGuest(tr + 0x04u, 0xCu)) {
             float px = ReadGuestF32(tr + 0x04u);
             float py = ReadGuestF32(tr + 0x08u);
             float pz = ReadGuestF32(tr + 0x0Cu);
@@ -428,15 +436,15 @@ input_rec::GuestStateSnapshot QueryPsiOpsGuestState() {
         uint32_t wpn = kernel::R32(player + 0x6FCu);
         if (!wpn) {
             uint32_t holder = kernel::R32(player + 0x788u);
-            if (holder && mem::IsCommitted(holder + 0x4u)) wpn = kernel::R32(holder + 0x4u);
+            if (ValidGuest(holder + 0x4u, 4u)) wpn = kernel::R32(holder + 0x4u);
         }
-        if (wpn && mem::IsCommitted(wpn + 0x54u)) {
+        if (ValidGuest(wpn + 0x10u, 0x44u)) {  // [wpn+0x10] type .. [wpn+0x50]
             int32_t clip = int32_t(kernel::R32(wpn + 0x48u));
             int32_t clip_size = int32_t(kernel::R32(wpn + 0x4Cu));
             int32_t wtype = int32_t(kernel::R32(wpn + 0x10u));
             int32_t reserve = 0;
             uint32_t reserve_ptr = kernel::R32(wpn + 0x44u);
-            if (reserve_ptr && mem::IsCommitted(reserve_ptr)) reserve = int32_t(kernel::R32(reserve_ptr));
+            if (ValidGuest(reserve_ptr, 4u)) reserve = int32_t(kernel::R32(reserve_ptr));
             if (clip >= 0 && clip < 10000 && reserve >= 0 && reserve < 100000) {
                 s.has_vitals = true;
                 s.ammo_clip = clip;
@@ -448,7 +456,7 @@ input_rec::GuestStateSnapshot QueryPsiOpsGuestState() {
 
         // Active Psi power state fn + AnimStateMachine state + Melee timer + Lock-On state
         uint32_t psi_mgr = kernel::R32(player + 0x6F4u);
-        if (psi_mgr && mem::IsCommitted(psi_mgr + 0x4u)) psi_fn = kernel::R32(psi_mgr + 0x4u);
+        if (ValidGuest(psi_mgr + 0x4u, 4u)) psi_fn = kernel::R32(psi_mgr + 0x4u);
 
         s.has_player_actions = true;
         s.psi_fn = psi_fn;
@@ -456,24 +464,24 @@ input_rec::GuestStateSnapshot QueryPsiOpsGuestState() {
         s.sniper_scoped = IsSniperScopeActive();
         s.mkb_actions_fired = PsiOpsConsumeMkbActionsFired();
         s.mkb_reload_count = PsiOpsGetMkbReloadCount();
-        if (mem::IsCommitted(player + 0x43Cu)) {
+        {
             uint32_t asm_ptr = kernel::R32(player + 0x438u);
-            if (asm_ptr && mem::IsCommitted(asm_ptr + 0x48u)) {
+            if (ValidGuest(asm_ptr + 0x44u, 4u)) {
                 s.anim_state = kernel::R32(asm_ptr + 0x44u);
             }
         }
-        if (mem::IsCommitted(player + 0x860u)) {
+        if (ValidGuest(player + 0x85Cu, 4u)) {
             float mt = ReadGuestF32(player + 0x85Cu);
             if (std::isfinite(mt) && mt >= 0.0f && mt < 1e6f) s.melee_timer = mt;
         }
-        if (mem::IsCommitted(player + 0x744u)) {
+        {
             s.lock_on_active = (kernel::R32(player + 0x740u) != 0u) || (kernel::G<uint8_t>(player + 0x710u) != 0u);
         }
     }
 
     // Camera yaw/pitch/mode from exact live Camera* captured in Camera::ApplyManualAim (edi)
     uint32_t cam = PsiOpsLiveCameraVa();
-    if (cam && mem::IsCommitted(cam + 0x380u)) {
+    if (ValidGuest(cam + 0x2D8u, 0xACu)) {  // [cam+0x2D8] yaw .. [cam+0x383]
         float cyaw = ReadGuestF32(cam + 0x2D8u);
         float cpitch = ReadGuestF32(cam + 0x2DCu);
         if (std::isfinite(cyaw) && std::isfinite(cpitch) && std::fabs(cyaw) < 1e4f && std::fabs(cpitch) < 1e4f) {

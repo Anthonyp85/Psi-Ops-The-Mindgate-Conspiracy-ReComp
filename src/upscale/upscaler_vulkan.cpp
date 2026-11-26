@@ -496,7 +496,8 @@ public:
             status_.dlss_available = false;
             status_.fsr3_available = false;
             status_.xess_available = false;
-            status_.active_label = ModeShortName(active);
+            // Temporal backends are Windows-only; label a requested DLSS / FSR 3.1 / XeSS as a fallback like D3D12.
+            status_.active_label = fallback ? std::string("FSR 1.0 (Fallback)") : std::string(ModeShortName(active));
             status_.status_detail = fallback ? "Linux Vulkan spatial fallback -> FSR 1.0" : ModeName(active);
             if (changed) {
                 LOGR("upscale: vulkan active=%s (req=%s, fallback=%d, %ux%u -> %ux%u)", status_.active_label.c_str(),

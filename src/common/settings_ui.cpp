@@ -41,6 +41,7 @@ struct OverlayState {
     bool show_hud = false;
     int active_tab = 0;
     bool chord_prev = false;
+    bool was_open = false;
     upscale::PluginProbe probe{};
     std::vector<app::GpuAdapterInfo> gpus;
     std::vector<app::MonitorInfo> monitors;
@@ -140,10 +141,22 @@ void Draw(double fps) {
     if (st.show_hud || open_now) {
         DrawLiveHud(fps);
     }
-    if (!open_now) return;
+    if (!open_now) {
+        if (st.was_open) {
+            // Overlay just closed (F1 / Esc / BACK+L3 / Resume): don't leave gamepad keys latched in ImGui,
+            // and drop any half-finished click-to-rebind capture.
+            st.was_open = false;
+            ui_common::ReleaseGamepadNavKeys(ImGui::GetIO());
+            mkb::CancelRebind();
+        }
+        return;
+    }
+    st.was_open = true;
 
     ImGuiIO& io = ImGui::GetIO();
     ui_common::GamepadNavEvents nav = ui_common::PollGamepadNavToImGui(io);
+    // LB/RB tab switching is suspended while a rebind capture is pending on the Controls tab.
+    if (mkb::IsRebinding()) nav.tab_prev = nav.tab_next = false;
     if (nav.tab_prev) st.active_tab = (st.active_tab + 4) % 5;
     if (nav.tab_next) st.active_tab = (st.active_tab + 1) % 5;
 
@@ -157,8 +170,8 @@ void Draw(double fps) {
     bool dirty = false;
     bool needs_display_apply = false;
 
-    if (ImGui::Begin("Psi-Ops: The Mindgate Conspiracy - Live Settings (F1 / BACK+L3)", &keep_open,
-                     ImGuiWindowFlags_NoCollapse)) {
+    if (ImGui::Begin("Psi-Ops: The Mindgate Conspiracy v" PSIOPS_VERSION_STR " - Live Settings (F1 / BACK+L3)",
+                     &keep_open, ImGuiWindowFlags_NoCollapse)) {
         if (ImGui::Checkbox("Show Performance & Upscaler HUD", &st.show_hud)) {
             g_show_hud.store(st.show_hud, std::memory_order_relaxed);
         }
@@ -220,6 +233,8 @@ void Draw(double fps) {
             }
             ImGui::EndTabBar();
         }
+        // A rebind capture only lives while the Controls tab is the one on screen.
+        if (st.active_tab != 3) mkb::CancelRebind();
 
         ImGui::Separator();
         if (ImGui::Button("Resume Game (F1)", ImVec2(180.0f, 32.0f))) {

@@ -213,7 +213,7 @@ void DrawPlayAndDiscTab(LauncherState& st, void* native_owner_win) {
     ImGui::TextUnformatted("PSI-OPS: THE MINDGATE CONSPIRACY");
     ImGui::PopStyleColor();
     ImGui::SameLine();
-    ui_common::DrawBadge("Native x64 Static Recompilation", ImVec4(0.11f, 0.34f, 0.48f, 1.0f));
+    ui_common::DrawBadge("v" PSIOPS_VERSION_STR "  |  Native x64 Static Recompilation", ImVec4(0.11f, 0.34f, 0.48f, 1.0f));
     ImGui::TextDisabled("Original Xbox (Title ID 0x4D570016, XDK 5849)  |  Native 60 FPS  |  16:9 Widescreen  |  9-Upscaler Suite");
     ImGui::Spacing();
 
@@ -331,7 +331,9 @@ void DrawPlayAndDiscTab(LauncherState& st, void* native_owner_win) {
 void DrawLauncherFrame(LauncherState& st, void* native_owner_win) {
     ImGuiIO& io = ImGui::GetIO();
     ui_common::GamepadNavEvents nav = ui_common::PollGamepadNavToImGui(io);
-    if (!st.browser.IsOpen()) {
+    // LB/RB/Start are suspended while a modal is up: the file browser, or a pending click-to-rebind capture.
+    const bool modal_blocking = st.browser.IsOpen() || mkb::IsRebinding();
+    if (!modal_blocking) {
         if (nav.tab_prev) {
             st.active_tab = (st.active_tab + 5) % 6;
             st.tab_switch_requested = true;
@@ -353,7 +355,7 @@ void DrawLauncherFrame(LauncherState& st, void* native_owner_win) {
     if (ImGui::Begin("##PsiOpsLauncherRoot", nullptr, root_flags)) {
         // Header strip
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.32f, 0.88f, 0.98f, 1.0f));
-        ImGui::TextUnformatted("Psi-Ops: The Mindgate Conspiracy - Pre-Game Launcher");
+        ImGui::TextUnformatted("Psi-Ops: The Mindgate Conspiracy v" PSIOPS_VERSION_STR " - Pre-Game Launcher");
         ImGui::PopStyleColor();
         ImGui::SameLine();
         ImGui::TextDisabled("   (LB / RB switch tabs  |  F1 in-game overlay  |  Start to Play)");
@@ -437,6 +439,8 @@ void DrawLauncherFrame(LauncherState& st, void* native_owner_win) {
             st.tab_switch_requested = false;
             ImGui::EndTabBar();
         }
+        // A rebind capture only lives while the Controls tab is the one on screen.
+        if (st.active_tab != 4) mkb::CancelRebind();
 
         // Bottom Footer Bar
         ImGui::Separator();
@@ -490,6 +494,7 @@ struct Win32LauncherApp {
     bool quit_msg = false;
     bool programmatic_destroy = false;
     bool launching_game = false;
+    UINT pending_dpi = 0;  // set by WM_DPICHANGED, consumed on the render loop
 
     ComPtr<ID3D12Device> dev;
     ComPtr<ID3D12CommandQueue> queue;
@@ -570,6 +575,23 @@ struct Win32LauncherApp {
         return ok;
     }
 
+    // Resizes the swapchain to the current client rect and recreates the backbuffer RTVs. GPU must be idle.
+    void ResizeSwapchain(uint32_t w, uint32_t h) {
+        for (auto& b : bb) b.Reset();
+        if (SUCCEEDED(swap->ResizeBuffers(kBuffers, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, 0))) {
+            width = w;
+            height = h;
+        } else {
+            LOGW("launcher: swapchain ResizeBuffers(%ux%u) failed; keeping %ux%u", w, h, width, height);
+        }
+        for (uint32_t i = 0; i < kBuffers; ++i) {
+            swap->GetBuffer(i, IID_PPV_ARGS(&bb[i]));
+            D3D12_CPU_DESCRIPTOR_HANDLE rh = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+            rh.ptr += size_t(i) * rtv_inc;
+            dev->CreateRenderTargetView(bb[i].Get(), nullptr, rh);
+        }
+    }
+
     void ShutdownD3D() {
         WaitGpu();
         if (fence_ev) {
@@ -605,6 +627,16 @@ struct Win32LauncherApp {
         auto* self = reinterpret_cast<Win32LauncherApp*>(GetWindowLongPtrW(h, GWLP_USERDATA));
         if (msg == WM_CLOSE) {
             if (self) self->quit_msg = true;
+            return 0;
+        }
+        if (msg == WM_DPICHANGED) {
+            // Per-Monitor-V2: moved to a monitor with a different scale. Adopt the suggested window rect now;
+            // fonts, style and swapchain are rebuilt on the render loop (never mid-frame).
+            if (self) self->pending_dpi = HIWORD(wp);
+            if (const RECT* r = reinterpret_cast<const RECT*>(lp)) {
+                SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
             return 0;
         }
         if (msg == WM_DESTROY) {
@@ -650,8 +682,9 @@ struct Win32LauncherApp {
         int x = std::max(0, (GetSystemMetrics(SM_CXSCREEN) - ww) / 2);
         int y = std::max(0, (GetSystemMetrics(SM_CYSCREEN) - wh) / 2);
 
-        hwnd = CreateWindowExW(0, wc.lpszClassName, L"Psi-Ops: The Mindgate Conspiracy - Launcher", style, x, y, ww, wh,
-                               nullptr, nullptr, inst, nullptr);
+        hwnd = CreateWindowExW(0, wc.lpszClassName,
+                               L"Psi-Ops: The Mindgate Conspiracy v" PSIOPS_WVERSION_STR L" - Launcher", style, x, y, ww,
+                               wh, nullptr, nullptr, inst, nullptr);
         if (!hwnd) {
             UnregisterClassW(wc.lpszClassName, inst);
             return false;
@@ -751,8 +784,32 @@ struct Win32LauncherApp {
             }
             if (quit_msg) break;
 
+            if (pending_dpi != 0) {
+                const float new_scale = std::clamp(float(pending_dpi) / 96.0f, 1.0f, 2.0f);
+                pending_dpi = 0;
+                RECT cr{};
+                GetClientRect(hwnd, &cr);
+                const uint32_t cw = uint32_t(std::max<LONG>(1, cr.right - cr.left));
+                const uint32_t ch = uint32_t(std::max<LONG>(1, cr.bottom - cr.top));
+                const bool scale_changed = std::fabs(new_scale - dpi_scale) > 0.01f;
+                if (scale_changed || cw != width || ch != height) {
+                    WaitGpu();
+                    // Release the backend's font texture/SRV *before* the atlas is rebuilt, then recreate it.
+                    ImGui_ImplDX12_InvalidateDeviceObjects();
+                    if (scale_changed) {
+                        dpi_scale = new_scale;
+                        ui_common::LoadUiFont(io, dpi_scale);
+                        ui_common::ApplyMindgateTheme(dpi_scale);
+                    }
+                    if (cw != width || ch != height) ResizeSwapchain(cw, ch);
+                    ImGui_ImplDX12_CreateDeviceObjects();
+                    LOGR("launcher: DPI change -> scale %.2f, %ux%u", dpi_scale, width, height);
+                }
+            }
+
             ImGui_ImplDX12_NewFrame();
             ImGui_ImplWin32_NewFrame();
+            ui_common::SyncGamepadBackendFlag(io);  // after the backend (which only knows XInput pads)
             ImGui::NewFrame();
             DrawLauncherFrame(st, hwnd);
             ImGui::Render();
@@ -812,6 +869,7 @@ struct Win32LauncherApp {
         }
         // Strictly ZERO settings.toml write on unconfigured Exit!
 
+        mkb::CancelRebind();  // never carry a pending capture into the game window
         launching_game = launch_game;
         WaitGpu();
         ImGui_ImplDX12_Shutdown();
@@ -850,7 +908,8 @@ bool RunLinuxLauncher(const LauncherCli& cli) {
 
     SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (is_deck || (desk.width == 1280 && desk.height == 800)) flags |= SDL_WINDOW_BORDERLESS;
-    SDL_Window* win = SDL_CreateWindow("Psi-Ops: The Mindgate Conspiracy - Launcher", win_w, win_h, flags);
+    SDL_Window* win =
+        SDL_CreateWindow("Psi-Ops: The Mindgate Conspiracy v" PSIOPS_VERSION_STR " - Launcher", win_w, win_h, flags);
     if (!win) {
         LOGE("launcher: SDL_CreateWindow failed: %s", SDL_GetError());
         return false;
@@ -898,6 +957,7 @@ bool RunLinuxLauncher(const LauncherCli& cli) {
 
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
+        ui_common::SyncGamepadBackendFlag(io);  // SDL3 backend runs in Manual mode with no pads of its own
         ImGui::NewFrame();
         DrawLauncherFrame(st, win);
         ImGui::Render();
@@ -942,6 +1002,7 @@ bool RunLinuxLauncher(const LauncherCli& cli) {
     }
     // Strictly ZERO settings.toml write on unconfigured Exit!
 
+    mkb::CancelRebind();  // never carry a pending capture into the game window
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

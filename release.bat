@@ -2,9 +2,11 @@
 setlocal enabledelayedexpansion
 rem SPDX-License-Identifier: GPL-2.0-or-later
 rem Psi-Ops: The Mindgate Conspiracy - Copyright-clean Win64 launcher & source release packager.
+rem Keep %%_PDB%% undefined so cmd.exe-wrapped link steps pass /PDBALTPATH:%%_PDB%% to lld-link verbatim
+set "_PDB="
 
 set "REPO_NAME=Psi-Ops-The-Mindgate-Conspiracy-ReComp"
-set "VERSION=v1.0.0"
+set "VERSION=v1.1.0"
 set "SKIP_BUILD=0"
 
 :parse_args
@@ -68,6 +70,8 @@ echo [1/5] Building copyright-clean Win64 --headers-only target...
 cmake -S "%REPO_ROOT%" -B "%BUILD_DIR%" -G Ninja ^
     -DPSIOPS_ALLOW_NO_XBE=ON ^
     -DCMAKE_BUILD_TYPE=Release ^
+    "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG" ^
+    "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG" ^
     -DCMAKE_C_COMPILER=clang ^
     -DCMAKE_CXX_COMPILER=clang++ ^
     -DCMAKE_C_FLAGS=-march=x86-64-v2 ^
@@ -110,8 +114,8 @@ for %%F in (LICENSE THIRD_PARTY_NOTICES.md README.md) do (
     copy /y "%REPO_ROOT%\%%F" "%STAGE_DIR%\%%F" >nul || exit /b 1
 )
 
-rem Stage clean self-contained compiler/ (never include compiler\work)
-robocopy "%BUILD_DIR%\compiler" "%STAGE_DIR%\compiler" /E /XD work /NFL /NDL /NJH /NJS /NC /NS >nul
+rem Stage clean self-contained compiler/ (never include compiler\work or linker debug/side files)
+robocopy "%BUILD_DIR%\compiler" "%STAGE_DIR%\compiler" /E /XD work /XF *.pdb *.ilk *.exp /NFL /NDL /NJH /NJS /NC /NS >nul
 if errorlevel 8 (
     echo   ERROR: Failed to stage compiler directory.
     exit /b 1

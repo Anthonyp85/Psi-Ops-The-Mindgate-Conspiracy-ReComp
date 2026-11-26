@@ -241,6 +241,7 @@ bool FileBrowserUi::Draw(fs::path& out_selected) {
         if (ImGui::Button("Up (..)")) {
             if (current_dir_.has_parent_path() && current_dir_.parent_path() != current_dir_) {
                 NavigateTo(current_dir_.parent_path());
+                focus_list_pending_ = true;
             }
         }
         ImGui::SameLine();
@@ -288,6 +289,10 @@ bool FileBrowserUi::Draw(fs::path& out_selected) {
                 ImGui::TableSetColumnIndex(0);
                 std::string label = (e.is_dir ? "[DIR]  " : "[ISO]  ") + e.name;
                 bool sel = (selected_idx_ == i);
+                if (i == 0 && focus_list_pending_) {
+                    ImGui::SetKeyboardFocusHere();
+                    focus_list_pending_ = false;
+                }
                 if (ImGui::Selectable(label.c_str(), sel,
                                       ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick,
                                       ImVec2(0.0f, 28.0f))) {
@@ -297,6 +302,7 @@ bool FileBrowserUi::Draw(fs::path& out_selected) {
                         inspected_path_.clear();
                         if (ImGui::IsMouseDoubleClicked(0)) {
                             NavigateTo(e.path);
+                            focus_list_pending_ = true;
                             break;
                         }
                     } else {
@@ -316,6 +322,7 @@ bool FileBrowserUi::Draw(fs::path& out_selected) {
             }
             ImGui::EndTable();
         }
+        if (entries_.empty()) focus_list_pending_ = false;  // nothing to focus in an empty / unreadable folder
         ImGui::EndChild();
 
         // Live ValidateDiscImage Status Banner
@@ -343,6 +350,7 @@ bool FileBrowserUi::Draw(fs::path& out_selected) {
         if (can_open_dir) {
             if (ImGui::Button("Open Folder (A)", ImVec2(180.0f, 36.0f))) {
                 NavigateTo(entries_[selected_idx_].path);
+                focus_list_pending_ = true;
             }
             ImGui::SameLine();
         }
@@ -354,11 +362,16 @@ bool FileBrowserUi::Draw(fs::path& out_selected) {
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ImGui::Button("Cancel (B / Esc)", ImVec2(160.0f, 36.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        // Gamepad B (as labelled) and Esc cancel only while the browser has focus.
+        const bool focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        if (ImGui::Button("Cancel (B / Esc)", ImVec2(160.0f, 36.0f)) ||
+            (focused && (ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+                         ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))) {
             open_ = false;
         }
     }
     ImGui::End();
+    if (!open_) focus_list_pending_ = false;
     return confirmed;
 }
 

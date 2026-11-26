@@ -142,6 +142,7 @@ public:
         app::UpscalerMode active = req;
         bool temporal_used = false;
         bool fallback = false;
+        bool bypass_2d = false;
         std::string detail;
 
         if (IsTemporalMode(req)) {
@@ -149,6 +150,7 @@ public:
             ITemporalBackend* tb = BackendFor(req);
             bool scene_ok = fd.camera.valid && fd.camera.is_3d_gameplay && fd.scene_depth_res != nullptr &&
                             fd.render_w <= fd.vp_w && fd.render_h <= fd.vp_h;
+            bypass_2d = (tb != nullptr) && !scene_ok;
             if (tb && scene_ok && EnsureTemporalTargets(fd.render_w, fd.render_h, fd.vp_w, fd.vp_h)) {
                 bool cut = force_reset_ || !has_prev_cam_ || IsCameraCut(prev_cam_, fd.camera);
                 if (cut) {
@@ -242,8 +244,10 @@ public:
                 has_prev_vp_ = false;
                 if (!tb) {
                     detail = UnavailableReason(req);
+                } else if (bypass_2d) {
+                    detail = std::string(ModeShortName(req)) + " ready - 2D/menu/FMV frames use FSR 1.0 spatial pass";
                 } else {
-                    detail = "2D/menu/FMV bypass -> FSR 1.0";
+                    detail = "Temporal target allocation failed -> FSR 1.0";
                 }
             }
 
@@ -268,7 +272,8 @@ public:
             active = req;
         }
 
-        UpdateStatus(req, active, fd, temporal_used, fallback, detail);
+        UpdateStatus(req, active, fd, temporal_used, fallback, detail,
+                     BuildHudLabel(req, active, fd, temporal_used, bypass_2d, fallback, s.upscale_quality));
         return true;
     }
 
@@ -429,8 +434,29 @@ private:
         return true;
     }
 
+    // Live HUD / F1 overlay label: says whether the temporal upscaler is actually running, running as native-res
+    // anti-aliasing (DLAA / Native AA), idling on a 2D/menu/FMV frame (FSR 1.0 spatial pass), or fell back.
+    static std::string BuildHudLabel(app::UpscalerMode req, app::UpscalerMode active, const gpu::UpscalerFrameDesc& fd,
+                                     bool temporal, bool bypass_2d, bool fallback, app::UpscaleQuality quality) {
+        if (!IsTemporalMode(req)) return ModeShortName(active);
+        const bool native_aa = (quality == app::UpscaleQuality::NativeAA) ||
+                               (fd.render_w + 1u >= fd.vp_w && fd.render_h + 1u >= fd.vp_h);
+        const char* aa_tag = (req == app::UpscalerMode::Dlss) ? "DLAA" : "Native AA";
+        std::string label = ModeShortName(req);
+        if (temporal) {
+            if (native_aa) label += std::string(" (") + aa_tag + ")";
+            return label;
+        }
+        if (bypass_2d) {
+            label += native_aa ? std::string(" (") + aa_tag + ", 2D)" : std::string(" (2D)");
+            return label;
+        }
+        if (fallback) return "FSR 1.0 (Fallback)";
+        return ModeShortName(active);
+    }
+
     void UpdateStatus(app::UpscalerMode req, app::UpscalerMode active, const gpu::UpscalerFrameDesc& fd, bool temporal,
-                      bool fallback, const std::string& detail) {
+                      bool fallback, const std::string& detail, std::string label) {
         std::lock_guard<std::mutex> lk(status_lock_);
         // Only emit LOGR on genuine mode/fallback/resolution changes, not transient 2D/menu/FMV temporal toggles.
         bool changed = (status_.requested_mode != uint32_t(req) || status_.active_mode != uint32_t(active) ||
@@ -449,7 +475,7 @@ private:
         status_.dlss_available = dlss_tried_ ? (dlss_ && dlss_->IsAvailable()) : dlss_avail_hint_;
         status_.fsr3_available = fsr3_tried_ ? (fsr3_ && fsr3_->IsAvailable()) : fsr3_avail_hint_;
         status_.xess_available = xess_tried_ ? (xess_ && xess_->IsAvailable()) : xess_avail_hint_;
-        status_.active_label = ModeShortName(active);
+        status_.active_label = std::move(label);
         status_.status_detail = detail;
         if (changed) {
             LOGR("upscale: active=%s (req=%s, temporal=%d, fallback=%d, %ux%u -> %ux%u) %s",

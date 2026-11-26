@@ -16,6 +16,14 @@
 #include "app/app.h"
 #include "upscale/upscaler_common.h"
 
+#ifndef PSIOPS_VERSION_STR
+#define PSIOPS_VERSION_STR "1.1.0"
+#endif
+
+#define PSIOPS_WIDE_IMPL(s) L##s
+#define PSIOPS_WIDE(s) PSIOPS_WIDE_IMPL(s)
+#define PSIOPS_WVERSION_STR PSIOPS_WIDE(PSIOPS_VERSION_STR)
+
 namespace ui_common {
 
 // Applies the dark Mindgate/Psi-Ops cyan-slate ImGui theme scaled to dpi_scale.
@@ -51,5 +59,13 @@ struct GamepadNavEvents {
 };
 GamepadNavEvents PollGamepadNavToImGui(ImGuiIO& io);
 void ResetGamepadNavState(bool prime_held = true);
+
+// Sets ImGuiBackendFlags_HasGamepad while a controller is connected and clears it on disconnect (ImGui only
+// runs gamepad navigation with that flag). Call between the platform backend's NewFrame and ImGui::NewFrame.
+void SyncGamepadBackendFlag(ImGuiIO& io);
+
+// Releases every gamepad key previously fed by PollGamepadNavToImGui and re-primes the edge detector, so a
+// button held while a UI closes can't stay latched "down" or fire a spurious press when the UI reopens.
+void ReleaseGamepadNavKeys(ImGuiIO& io);
 
 }  // namespace ui_common

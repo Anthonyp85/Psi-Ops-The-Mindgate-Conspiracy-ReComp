@@ -25,10 +25,19 @@ namespace fs = std::filesystem;
 
 constexpr unsigned long long kPsiOpsNgxAppId = 0x4D570016ull;
 
-ngx_abi::PerfQuality MapQuality(app::UpscaleQuality q, uint32_t render_w, uint32_t out_w) {
+// NVSDK_NGX_PerfQuality_Value_UltraQuality (4) is reserved/unimplemented in retail nvngx_dlss.dll builds and
+// CreateFeature rejects it with 0xBAD00010 (NVSDK_NGX_Result_FAIL_InvalidParameter). DLSS takes the explicit
+// render/output dimensions we pass, so the PerfQuality value is only a hint bucket: Ultra Quality (77%) and any
+// Custom ratio above the Quality bucket are created as MaxQuality with their real (larger) input size.
+ngx_abi::PerfQuality MapQuality(app::UpscaleQuality q, uint32_t render_w, uint32_t render_h, uint32_t out_w,
+                                uint32_t out_h) {
+    // Input == output (+/-1 px rounding) is DLAA regardless of the selected tier.
+    if (out_w > 0 && out_h > 0 && render_w + 1u >= out_w && render_h + 1u >= out_h) {
+        return ngx_abi::kPerfQualityDlaa;
+    }
     switch (q) {
         case app::UpscaleQuality::NativeAA: return ngx_abi::kPerfQualityDlaa;
-        case app::UpscaleQuality::UltraQuality: return ngx_abi::kPerfQualityUltraQuality;
+        case app::UpscaleQuality::UltraQuality: return ngx_abi::kPerfQualityMaxQuality;
         case app::UpscaleQuality::Quality: return ngx_abi::kPerfQualityMaxQuality;
         case app::UpscaleQuality::Balanced: return ngx_abi::kPerfQualityBalanced;
         case app::UpscaleQuality::Performance: return ngx_abi::kPerfQualityMaxPerf;
@@ -37,7 +46,6 @@ ngx_abi::PerfQuality MapQuality(app::UpscaleQuality q, uint32_t render_w, uint32
         default: {
             float r = (out_w > 0) ? (float(render_w) / float(out_w)) : 1.0f;
             if (r >= 0.95f) return ngx_abi::kPerfQualityDlaa;
-            if (r >= 0.72f) return ngx_abi::kPerfQualityUltraQuality;
             if (r >= 0.62f) return ngx_abi::kPerfQualityMaxQuality;
             if (r >= 0.54f) return ngx_abi::kPerfQualityBalanced;
             if (r >= 0.42f) return ngx_abi::kPerfQualityMaxPerf;
@@ -189,6 +197,7 @@ public:
             ngx_mod_ = nullptr;
         }
         available_ = false;
+        feature_failed_ = false;
         dev_ = nullptr;
     }
 
@@ -202,11 +211,12 @@ public:
             render_w > out_w || render_h > out_h) {
             return false;
         }
-        ngx_abi::PerfQuality pq = MapQuality(quality, render_w, out_w);
+        ngx_abi::PerfQuality pq = MapQuality(quality, render_w, render_h, out_w, out_h);
         uint32_t preset_val = MapRenderPreset(dlss_preset);
         bool need_create = !handle_ || cur_rw_ != render_w || cur_rh_ != render_h || cur_ow_ != out_w ||
                            cur_oh_ != out_h || cur_pq_ != pq || cur_preset_ != preset_val;
         if (need_create) {
+            if (IsKnownFailure(render_w, render_h, out_w, out_h, pq, preset_val)) return false;
             if (!RecreateFeature(cmd, render_w, render_h, out_w, out_h, pq, preset_val, dlss_preset)) {
                 return false;
             }
@@ -219,12 +229,15 @@ public:
         if (!available_ || !params_ || !td.cmd || !td.color || !td.depth || !td.motion_vectors || !td.output) {
             return false;
         }
-        ngx_abi::PerfQuality pq = MapQuality(td.quality, td.render_w, td.out_w);
+        ngx_abi::PerfQuality pq = MapQuality(td.quality, td.render_w, td.render_h, td.out_w, td.out_h);
         uint32_t preset_val = MapRenderPreset(td.dlss_preset);
 
         bool need_create = !handle_ || cur_rw_ != td.render_w || cur_rh_ != td.render_h || cur_ow_ != td.out_w ||
                            cur_oh_ != td.out_h || cur_pq_ != pq || cur_preset_ != preset_val;
         if (need_create) {
+            // Don't retry a CreateFeature that already failed for this exact configuration every frame
+            // (each attempt flushes the GPU queue and logs); the manager falls back to FSR 1.0 meanwhile.
+            if (IsKnownFailure(td.render_w, td.render_h, td.out_w, td.out_h, pq, preset_val)) return false;
             if (!RecreateFeature(td.cmd, td.render_w, td.render_h, td.out_w, td.out_h, pq, preset_val,
                                  td.dlss_preset)) {
                 return false;
@@ -289,50 +302,76 @@ private:
         cur_rw_ = cur_rh_ = cur_ow_ = cur_oh_ = 0;
     }
 
+    bool IsKnownFailure(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, ngx_abi::PerfQuality pq,
+                        uint32_t preset_val) const {
+        return feature_failed_ && fail_rw_ == rw && fail_rh_ == rh && fail_ow_ == ow && fail_oh_ == oh &&
+               fail_pq_ == pq && fail_preset_ == preset_val;
+    }
+
     bool RecreateFeature(ID3D12GraphicsCommandList* cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh,
                          ngx_abi::PerfQuality pq, uint32_t preset_val, app::DlssPreset preset_enum) {
         ReleaseFeature();
-        params_->Reset();
-        params_->Set(ngx_abi::kParamCreationNodeMask, 1u);
-        params_->Set(ngx_abi::kParamVisibilityNodeMask, 1u);
-        params_->Set(ngx_abi::kParamWidth, rw);
-        params_->Set(ngx_abi::kParamHeight, rh);
-        params_->Set(ngx_abi::kParamOutWidth, ow);
-        params_->Set(ngx_abi::kParamOutHeight, oh);
-        params_->Set(ngx_abi::kParamPerfQualityValue, int(pq));
-        params_->Set(ngx_abi::kParamRtxValue, 1);
+        feature_failed_ = false;
 
-        uint32_t flags = ngx_abi::kFlagMvLowRes | ngx_abi::kFlagDepthInverted;
-        params_->Set(ngx_abi::kParamDlssCreateFlags, int(flags));
+        auto try_create = [&](ngx_abi::PerfQuality create_pq, uint32_t create_preset) -> ngx_abi::Result {
+            params_->Reset();
+            params_->Set(ngx_abi::kParamCreationNodeMask, 1u);
+            params_->Set(ngx_abi::kParamVisibilityNodeMask, 1u);
+            params_->Set(ngx_abi::kParamWidth, rw);
+            params_->Set(ngx_abi::kParamHeight, rh);
+            params_->Set(ngx_abi::kParamOutWidth, ow);
+            params_->Set(ngx_abi::kParamOutHeight, oh);
+            params_->Set(ngx_abi::kParamPerfQualityValue, int(create_pq));
+            params_->Set(ngx_abi::kParamRtxValue, 1);
 
-        // Apply selected DLSS render preset across all quality buckets so DLAA + Quality..UltraPerf honor it
-        params_->Set(ngx_abi::kParamPresetDlaa, preset_val);
-        params_->Set(ngx_abi::kParamPresetUltraQuality, preset_val);
-        params_->Set(ngx_abi::kParamPresetQuality, preset_val);
-        params_->Set(ngx_abi::kParamPresetBalanced, preset_val);
-        params_->Set(ngx_abi::kParamPresetPerformance, preset_val);
-        params_->Set(ngx_abi::kParamPresetUltraPerformance, preset_val);
+            uint32_t flags = ngx_abi::kFlagMvLowRes | ngx_abi::kFlagDepthInverted;
+            params_->Set(ngx_abi::kParamDlssCreateFlags, int(flags));
 
-        ngx_abi::Result r = fn_create_feature_(cmd, ngx_abi::kFeatureSuperSampling, params_, &handle_);
-        if (!ngx_abi::Succeeded(r) || !handle_) {
+            // Apply selected DLSS render preset across all quality buckets so DLAA + Quality..UltraPerf honor it
+            params_->Set(ngx_abi::kParamPresetDlaa, create_preset);
+            params_->Set(ngx_abi::kParamPresetUltraQuality, create_preset);
+            params_->Set(ngx_abi::kParamPresetQuality, create_preset);
+            params_->Set(ngx_abi::kParamPresetBalanced, create_preset);
+            params_->Set(ngx_abi::kParamPresetPerformance, create_preset);
+            params_->Set(ngx_abi::kParamPresetUltraPerformance, create_preset);
+            handle_ = nullptr;
+            ngx_abi::Result res = fn_create_feature_(cmd, ngx_abi::kFeatureSuperSampling, params_, &handle_);
+            if (!ngx_abi::Succeeded(res)) handle_ = nullptr;
+            return res;
+        };
+
+        ngx_abi::Result r = try_create(pq, preset_val);
+        if ((!ngx_abi::Succeeded(r) || !handle_) && preset_val != ngx_abi::kPresetDefault) {
             // Retry with Auto preset if an older retail DLL doesn't recognize Preset J/K
-            if (preset_val != ngx_abi::kPresetDefault) {
-                params_->Set(ngx_abi::kParamPresetDlaa, ngx_abi::kPresetDefault);
-                params_->Set(ngx_abi::kParamPresetUltraQuality, ngx_abi::kPresetDefault);
-                params_->Set(ngx_abi::kParamPresetQuality, ngx_abi::kPresetDefault);
-                params_->Set(ngx_abi::kParamPresetBalanced, ngx_abi::kPresetDefault);
-                params_->Set(ngx_abi::kParamPresetPerformance, ngx_abi::kPresetDefault);
-                params_->Set(ngx_abi::kParamPresetUltraPerformance, ngx_abi::kPresetDefault);
-                r = fn_create_feature_(cmd, ngx_abi::kFeatureSuperSampling, params_, &handle_);
+            r = try_create(pq, ngx_abi::kPresetDefault);
+        }
+        if (!ngx_abi::Succeeded(r) || !handle_) {
+            // Last resort: the plain DLAA / MaxQuality buckets accept any explicit input size on every DLSS build.
+            ngx_abi::PerfQuality fb_pq =
+                (rw >= ow && rh >= oh) ? ngx_abi::kPerfQualityDlaa : ngx_abi::kPerfQualityMaxQuality;
+            if (fb_pq != pq) {
+                LOGW("upscale: DLSS CreateFeature(PerfQuality=%d) failed (0x%08X); retrying with PerfQuality=%d",
+                     int(pq), r, int(fb_pq));
+                r = try_create(fb_pq, ngx_abi::kPresetDefault);
             }
         }
         if (!ngx_abi::Succeeded(r) || !handle_) {
+            handle_ = nullptr;
+            feature_failed_ = true;
+            fail_rw_ = rw;
+            fail_rh_ = rh;
+            fail_ow_ = ow;
+            fail_oh_ = oh;
+            fail_pq_ = pq;
+            fail_preset_ = preset_val;
             char buf[96];
             std::snprintf(buf, sizeof(buf), "DLSS CreateFeature failed (0x%08X)", r);
             detail_ = buf;
             LOGW("upscale: %s (%ux%u -> %ux%u)", detail_.c_str(), rw, rh, ow, oh);
             return false;
         }
+        // Key the live feature by the *requested* quality/preset so a fallback-created feature isn't
+        // recreated every frame.
         cur_rw_ = rw;
         cur_rh_ = rh;
         cur_ow_ = ow;
@@ -372,6 +411,12 @@ private:
     uint32_t cur_rw_ = 0, cur_rh_ = 0, cur_ow_ = 0, cur_oh_ = 0;
     ngx_abi::PerfQuality cur_pq_ = ngx_abi::kPerfQualityMaxQuality;
     uint32_t cur_preset_ = ngx_abi::kPresetK;
+
+    // Last failed CreateFeature configuration (cleared on success, Shutdown, or any key change).
+    bool feature_failed_ = false;
+    uint32_t fail_rw_ = 0, fail_rh_ = 0, fail_ow_ = 0, fail_oh_ = 0;
+    ngx_abi::PerfQuality fail_pq_ = ngx_abi::kPerfQualityMaxQuality;
+    uint32_t fail_preset_ = ngx_abi::kPresetDefault;
 };
 
 }  // namespace

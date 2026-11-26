@@ -67,7 +67,7 @@ jobs:
       - name: Package redistributable Linux tarball & verify via audit_release.py
         run: |
           ./release_linux.sh --skip-build
-          python3 tools/audit_release.py --ci --platform linux
+          python3 tools/audit_release.py --ci --platform linux --build-dir out/build/headers-only-linux
 
   windows-x64:
     name: Windows x64 (D3D12 / XAudio2 / Clang)
@@ -107,4 +107,4 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           set "PATH=C:\Program Files\LLVM\bin;%PATH%"
           call release.bat --skip-build
-          python tools/audit_release.py --ci --platform win64
+          python tools/audit_release.py --ci --platform win64 --build-dir out/build/headers-only-win
