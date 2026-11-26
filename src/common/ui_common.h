@@ -8,21 +8,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <imgui.h>
 
 #include "app/app.h"
+#include "common/update_checker.h"
+#include "common/version.h"
 #include "upscale/upscaler_common.h"
-
-#ifndef PSIOPS_VERSION_STR
-#define PSIOPS_VERSION_STR "1.1.0"
-#endif
-
-#define PSIOPS_WIDE_IMPL(s) L##s
-#define PSIOPS_WIDE(s) PSIOPS_WIDE_IMPL(s)
-#define PSIOPS_WVERSION_STR PSIOPS_WIDE(PSIOPS_VERSION_STR)
 
 namespace ui_common {
 
@@ -67,5 +63,41 @@ void SyncGamepadBackendFlag(ImGuiIO& io);
 // Releases every gamepad key previously fed by PollGamepadNavToImGui and re-primes the edge detector, so a
 // button held while a UI closes can't stay latched "down" or fire a spurious press when the UI reopens.
 void ReleaseGamepadNavKeys(ImGuiIO& io);
+
+// Cross-platform UTF-8 / CLI / Gamescope helpers.
+#ifdef _WIN32
+std::wstring Utf8ToWideStr(std::string_view s);
+std::string WideToUtf8Str(std::wstring_view w);
+#endif
+std::vector<std::string> GetProcessArgsUtf8();
+bool IsGamescope();
+
+// Persistent update-checker preferences stored in settings.toml.
+struct UpdateUiPrefs {
+    bool check_updates_on_startup = true;
+    std::string dismissed_update_tag;
+};
+UpdateUiPrefs& GetUpdatePrefs();
+void LoadUpdatePrefs(const void* toml_table);
+void SaveUpdatePrefs(void* toml_table);
+
+// Update Checker & Self-Updater UI components shared by Pre-Game Launcher and In-Game F1 Overlay.
+struct UpdateCardContext {
+    bool in_launcher = true;
+    float ui_scale = 1.0f;
+    std::function<void()> on_update_now;
+    std::function<void()> on_apply_and_restart;
+    std::function<void(const std::string&)> on_open_release_page;
+    std::function<void(const std::string&)> on_dismiss;
+};
+
+std::string SanitizeUiText(const std::string& s, bool single_line = true, size_t max_chars = 160);
+bool ShouldShowUpdateBanner(const psiops::UpdateStatusSnapshot& snap, const std::string& dismissed_tag);
+void DrawLauncherHeaderUpdateButton(const psiops::UpdateStatusSnapshot& snap, float ui_scale,
+                                    const std::function<void()>& on_manual_check);
+void DrawUpdateAlertCard(const psiops::UpdateStatusSnapshot& snap, const UpdateCardContext& uctx);
+void DrawUpdatesDiagnosticsSection(const psiops::UpdateStatusSnapshot& snap, bool in_launcher, float ui_scale,
+                                   bool& dirty, bool& manual_pending, std::string& status_msg,
+                                   const std::function<void()>& on_apply_and_restart);
 
 }  // namespace ui_common

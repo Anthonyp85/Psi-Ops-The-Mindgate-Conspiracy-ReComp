@@ -7,7 +7,12 @@ project(PsiOps VERSION 1.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_compile_definitions(PSIOPS_VERSION_STR="${PROJECT_VERSION}")
+add_compile_definitions(
+    PSIOPS_VERSION_STR="${PROJECT_VERSION}"
+    PSIOPS_CMAKE_VER_MAJOR=${PROJECT_VERSION_MAJOR}
+    PSIOPS_CMAKE_VER_MINOR=${PROJECT_VERSION_MINOR}
+    PSIOPS_CMAKE_VER_PATCH=${PROJECT_VERSION_PATCH}
+)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
@@ -216,7 +221,7 @@ if(WIN32)
         string(REPLACE "-Xlinker /MANIFEST:EMBED" "-Xlinker /MANIFEST:NO" CMAKE_CXX_LINK_EXECUTABLE "${CMAKE_CXX_LINK_EXECUTABLE}")
         target_link_options(PsiOps PRIVATE "-Wl,/MANIFEST:NO" "${PSIOPS_RES}")
     endif()
-    target_link_libraries(PsiOps PRIVATE wintrust crypt32 advapi32 oldnames)
+    target_link_libraries(PsiOps PRIVATE wintrust crypt32 advapi32 oldnames winhttp shell32)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/resources/psiops.png")
         add_custom_command(TARGET PsiOps POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different

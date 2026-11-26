@@ -6,6 +6,8 @@
 #include "common/input_recorder.h"
 #include "common/mkb_input.h"
 #include "common/ui_common.h"
+#include "common/update_checker.h"
+#include "common/version.h"
 #include "upscale/upscaler_common.h"
 
 #include <algorithm>
@@ -18,6 +20,7 @@
 #include <cstring>
 #include <cwctype>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -53,6 +56,8 @@ struct OverlayState {
     std::vector<app::GpuAdapterInfo> gpus;
     std::vector<app::MonitorInfo> monitors;
     std::string diag_status;
+    bool upd_manual_pending = false;
+    psiops::UpdateState prev_upd_state = psiops::UpdateState::Idle;
 };
 
 std::atomic<bool> g_show_hud{false};
@@ -220,6 +225,125 @@ void DrawShaderWarmupToast(const gpu::CacheStats& cs, float alpha) {
     ImGui::PopStyleVar(3);
 }
 
+bool HasMockUpdateEnv() {
+#ifdef _WIN32
+    const wchar_t* v = _wgetenv(L"PSIOPS_UPDATE_MOCK_JSON");
+    return v && *v;
+#else
+    const char* v = std::getenv("PSIOPS_UPDATE_MOCK_JSON");
+    return v && *v;
+#endif
+}
+
+std::mutex g_update_toast_lock;
+std::string g_update_toast_tag;
+uint64_t g_update_toast_start_ms = 0;
+bool g_update_toast_dismissed = false;
+
+bool ShouldShowUpdateAvailableToast(psiops::UpdateStatusSnapshot* out_snap, float* out_alpha) {
+    if (g_suppress_warmup_toast.load(std::memory_order_relaxed) || app::IsReplayOrAutotestActive() ||
+        input::AutotestActive() || mkb::IsAutotestActive() || input_rec::IsReplayActive() ||
+        input_rec::IsRecordActive()) {
+        return false;
+    }
+
+    psiops::UpdateStatusSnapshot snap = psiops::GetUpdateSnapshot();
+    if (snap.state != psiops::UpdateState::UpdateAvailable || snap.manual_check || snap.latest_tag.empty()) {
+        return false;
+    }
+    const std::string& dismissed_tag = ui_common::GetUpdatePrefs().dismissed_update_tag;
+    if (!dismissed_tag.empty() && snap.latest_tag == dismissed_tag) return false;
+
+    const bool overlay_open = mkb::IsOverlayOpen();
+    const uint64_t now_ms = SteadyNowMs();
+    uint64_t start_ms = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_update_toast_lock);
+        if (g_update_toast_tag != snap.latest_tag) {
+            g_update_toast_tag = snap.latest_tag;
+            g_update_toast_start_ms = now_ms;
+            g_update_toast_dismissed = false;
+        }
+        if (overlay_open) {
+            g_update_toast_dismissed = true;
+            return false;
+        }
+        if (g_update_toast_dismissed) return false;
+        start_ms = g_update_toast_start_ms;
+    }
+
+    const uint64_t age_ms = (now_ms >= start_ms) ? (now_ms - start_ms) : 0ull;
+    constexpr uint64_t kShowDurationMs = 6000;
+    constexpr uint64_t kFadeStartMs = 5100;
+    if (age_ms >= kShowDurationMs) {
+        std::lock_guard<std::mutex> lk(g_update_toast_lock);
+        g_update_toast_dismissed = true;
+        return false;
+    }
+    const float alpha =
+        (age_ms <= kFadeStartMs)
+            ? 1.0f
+            : std::clamp(float(kShowDurationMs - age_ms) / float(kShowDurationMs - kFadeStartMs), 0.0f, 1.0f);
+    if (alpha <= 0.02f) return false;
+
+    if (out_snap) *out_snap = std::move(snap);
+    if (out_alpha) *out_alpha = alpha;
+    return true;
+}
+
+void DrawUpdateAvailableToast(const psiops::UpdateStatusSnapshot& snap, float alpha) {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) return;
+
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 16.0f, 16.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.88f * alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.145f, 0.118f, 0.072f, 0.94f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.94f, 0.70f, 0.22f, 0.92f));
+    constexpr ImGuiWindowFlags kToastFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs |
+                                             ImGuiWindowFlags_NoMove;
+    if (ImGui::Begin("##PsiOpsUpdateAvailableToast", nullptr, kToastFlags)) {
+        ImGui::TextColored(ImVec4(1.00f, 0.84f, 0.36f, 1.0f),
+                           "Update %s available - press F1 -> Diagnostics", snap.latest_tag.c_str());
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(3);
+}
+
+void PollInGameUpdateTransitions(OverlayState& st, const psiops::UpdateStatusSnapshot& snap) {
+    if (st.upd_manual_pending && snap.state != psiops::UpdateState::Checking &&
+        snap.state != psiops::UpdateState::Idle) {
+        st.upd_manual_pending = false;
+        if (snap.state == psiops::UpdateState::UpToDate) {
+            st.diag_status = std::string("Up to date (") + PSIOPS_VERSION_TAG + ")";
+        } else if (snap.state == psiops::UpdateState::UpdateAvailable) {
+            std::string tag = !snap.latest_tag.empty() ? snap.latest_tag : ("v" + snap.latest_version);
+            st.diag_status = "Update available: " + tag;
+        } else if (snap.state == psiops::UpdateState::Error) {
+            st.diag_status = snap.status_message.empty()
+                                 ? "Update check failed (network error)."
+                                 : ui_common::SanitizeUiText(snap.status_message, true, 140);
+        }
+    } else if (st.prev_upd_state == psiops::UpdateState::Downloading &&
+               snap.state != psiops::UpdateState::Downloading) {
+        if (snap.state == psiops::UpdateState::ReadyToRestart) {
+            st.diag_status =
+                "Update " + snap.latest_tag +
+                " staged! Save your game progress first, then click 'Save & Exit to Update'.";
+        } else if (snap.state == psiops::UpdateState::Error) {
+            st.diag_status = snap.status_message.empty()
+                                 ? "Self-update download/staging failed."
+                                 : ui_common::SanitizeUiText(snap.status_message, true, 140);
+        }
+    }
+    st.prev_upd_state = snap.state;
+}
+
 bool CheckOpenSettingsCliOrEnv() {
 #ifdef _WIN32
     if (const wchar_t* v = _wgetenv(L"XBE_OPEN_SETTINGS"); v && *v && std::wcscmp(v, L"0") != 0) return true;
@@ -269,7 +393,7 @@ void DrawLiveHud(double fps) {
 
 bool HasVisibleUi() {
     return mkb::IsOverlayOpen() || g_show_hud.load(std::memory_order_relaxed) ||
-           ShouldShowShaderWarmupToast(nullptr, nullptr);
+           ShouldShowShaderWarmupToast(nullptr, nullptr) || ShouldShowUpdateAvailableToast(nullptr, nullptr);
 }
 
 void Init() {
@@ -279,11 +403,22 @@ void Init() {
     st.monitors = app::EnumerateMonitors();
     st.initialized = true;
     g_show_hud.store(st.show_hud, std::memory_order_relaxed);
-    g_suppress_warmup_toast.store(CheckSuppressWarmupToastCliOrEnv(), std::memory_order_relaxed);
+    const bool suppress_auto = CheckSuppressWarmupToastCliOrEnv();
+    g_suppress_warmup_toast.store(suppress_auto, std::memory_order_relaxed);
     gpu::SetUiVisibleCallback(HasVisibleUi);
     if (CheckOpenSettingsCliOrEnv()) {
         mkb::SetOverlayOpen(true);
     }
+    const bool has_mock_upd = HasMockUpdateEnv();
+    if ((!suppress_auto && !app::IsReplayOrAutotestActive()) || has_mock_upd) {
+        if ((ui_common::GetUpdatePrefs().check_updates_on_startup && psiops::ShouldAutoCheckForUpdates()) ||
+            has_mock_upd) {
+            if (psiops::GetUpdateSnapshot().state == psiops::UpdateState::Idle) {
+                psiops::StartUpdateCheck(false);
+            }
+        }
+    }
+    st.prev_upd_state = psiops::GetUpdateSnapshot().state;
 }
 
 void OnPadPoll(int port, const input::Pad& pad) {
@@ -315,6 +450,11 @@ void Draw(double fps) {
     if (ShouldShowShaderWarmupToast(&warmup_cs, &warmup_alpha)) {
         DrawShaderWarmupToast(warmup_cs, warmup_alpha);
     }
+    psiops::UpdateStatusSnapshot upd_toast_snap{};
+    float upd_toast_alpha = 0.0f;
+    if (ShouldShowUpdateAvailableToast(&upd_toast_snap, &upd_toast_alpha)) {
+        DrawUpdateAvailableToast(upd_toast_snap, upd_toast_alpha);
+    }
     if (!open_now) {
         if (st.was_open) {
             // Overlay just closed (F1 / Esc / BACK+L3 / Resume): don't leave gamepad keys latched in ImGui,
@@ -343,6 +483,8 @@ void Draw(double fps) {
     bool keep_open = true;
     bool dirty = false;
     bool needs_display_apply = false;
+    psiops::UpdateStatusSnapshot upd_snap = psiops::GetUpdateSnapshot();
+    PollInGameUpdateTransitions(st, upd_snap);
 
     if (ImGui::Begin("Psi-Ops: The Mindgate Conspiracy v" PSIOPS_VERSION_STR " - Live Settings (F1 / BACK+L3)",
                      &keep_open, ImGuiWindowFlags_NoCollapse)) {
@@ -377,6 +519,20 @@ void Draw(double fps) {
                     } else if (t == 3) {
                         mkb::DrawControlsSettingsPanel(true, &dirty);
                     } else if (t == 4) {
+                        ui_common::DrawUpdatesDiagnosticsSection(
+                            upd_snap, false, 1.0f, dirty, st.upd_manual_pending, st.diag_status, [&] {
+                                app::Save();
+                                dirty = false;
+                                if (psiops::ApplyStagedUpdateAndRelaunch()) {
+                                    app::RequestExit();
+                                } else {
+                                    psiops::UpdateStatusSnapshot err_s = psiops::GetUpdateSnapshot();
+                                    st.diag_status =
+                                        err_s.status_message.empty()
+                                            ? "Failed to launch staged update helper."
+                                            : ui_common::SanitizeUiText(err_s.status_message, true, 140);
+                                }
+                            });
                         ui_common::DrawToolsDiagnosticsPanel(st.probe, true, st.diag_status);
                         ImGui::Spacing();
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.32f, 0.86f, 0.96f, 1.0f));

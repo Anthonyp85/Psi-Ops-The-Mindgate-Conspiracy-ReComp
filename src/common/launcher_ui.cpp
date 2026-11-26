@@ -9,6 +9,8 @@
 #include "common/file_browser_ui.h"
 #include "common/mkb_input.h"
 #include "common/ui_common.h"
+#include "common/update_checker.h"
+#include "common/version.h"
 #include "upscale/upscaler_common.h"
 
 #include <algorithm>
@@ -188,6 +190,8 @@ struct LauncherState {
     file_browser_ui::FileBrowserUi browser;
     std::string status_banner;
     std::string tools_status;
+    bool upd_manual_pending = false;
+    psiops::UpdateState prev_upd_state = psiops::UpdateState::Idle;
 
     void RefreshDiscStatus() {
         has_valid_game = app::HasValidConfiguredGame();
@@ -204,7 +208,104 @@ struct LauncherState {
     }
 };
 
-void DrawPlayAndDiscTab(LauncherState& st, void* native_owner_win) {
+bool HasMockUpdateEnv() {
+#ifdef _WIN32
+    const wchar_t* v = _wgetenv(L"PSIOPS_UPDATE_MOCK_JSON");
+    return v && *v;
+#else
+    const char* v = std::getenv("PSIOPS_UPDATE_MOCK_JSON");
+    return v && *v;
+#endif
+}
+
+void MaybeStartLauncherUpdateCheck() {
+    if ((ui_common::GetUpdatePrefs().check_updates_on_startup && psiops::ShouldAutoCheckForUpdates()) ||
+        HasMockUpdateEnv()) {
+        if (psiops::GetUpdateSnapshot().state == psiops::UpdateState::Idle) {
+            psiops::StartUpdateCheck(false);
+        }
+    }
+}
+
+void PollLauncherUpdateTransitions(LauncherState& st, const psiops::UpdateStatusSnapshot& snap) {
+    if (st.upd_manual_pending && snap.state != psiops::UpdateState::Checking &&
+        snap.state != psiops::UpdateState::Idle) {
+        st.upd_manual_pending = false;
+        if (snap.state == psiops::UpdateState::UpToDate) {
+            st.status_banner = std::string("Up to date (") + PSIOPS_VERSION_TAG + ")";
+        } else if (snap.state == psiops::UpdateState::UpdateAvailable) {
+            std::string tag = !snap.latest_tag.empty() ? snap.latest_tag : ("v" + snap.latest_version);
+            st.status_banner = "Update available: " + tag;
+        } else if (snap.state == psiops::UpdateState::Error) {
+            st.status_banner = snap.status_message.empty()
+                                   ? "Update check failed (network error)."
+                                   : ui_common::SanitizeUiText(snap.status_message, true, 140);
+        }
+    } else if (st.prev_upd_state == psiops::UpdateState::Downloading &&
+               snap.state != psiops::UpdateState::Downloading) {
+        if (snap.state == psiops::UpdateState::ReadyToRestart) {
+            st.status_banner =
+                "Update " + snap.latest_tag + " verified & staged! Click 'Restart & Apply Update' to install.";
+        } else if (snap.state == psiops::UpdateState::Error) {
+            st.status_banner = snap.status_message.empty()
+                                   ? "Self-update download/staging failed."
+                                   : ui_common::SanitizeUiText(snap.status_message, true, 140);
+        }
+    }
+    st.prev_upd_state = snap.state;
+}
+
+bool DrawLauncherUpdateAlertIfNeeded(LauncherState& st, const psiops::UpdateStatusSnapshot& snap, float ui_scale) {
+    if (!ui_common::ShouldShowUpdateBanner(snap, ui_common::GetUpdatePrefs().dismissed_update_tag)) {
+        return false;
+    }
+    ui_common::UpdateCardContext uctx{};
+    uctx.in_launcher = true;
+    uctx.ui_scale = ui_scale;
+    uctx.on_update_now = [&] {
+        if (psiops::StartDownloadAndStageUpdate()) {
+            st.status_banner =
+                "Downloading & staging " + (snap.asset_name.empty() ? snap.latest_tag : snap.asset_name) + "...";
+        } else {
+            psiops::UpdateStatusSnapshot err_s = psiops::GetUpdateSnapshot();
+            st.status_banner = err_s.status_message.empty()
+                                   ? "Could not start self-update download."
+                                   : ui_common::SanitizeUiText(err_s.status_message, true, 140);
+        }
+    };
+    uctx.on_apply_and_restart = [&] {
+        if (st.settings_modified || st.has_valid_game) {
+            app::Save();
+            st.settings_modified = false;
+        }
+        if (psiops::ApplyStagedUpdateAndRelaunch()) {
+            st.request_play = false;
+            st.request_exit = true;
+        } else {
+            psiops::UpdateStatusSnapshot err_s = psiops::GetUpdateSnapshot();
+            st.status_banner = err_s.status_message.empty()
+                                   ? "Failed to launch staged update helper."
+                                   : ui_common::SanitizeUiText(err_s.status_message, true, 140);
+        }
+    };
+    uctx.on_open_release_page = [&](const std::string& url) {
+        std::string target = url.empty() ? std::string(PSIOPS_RELEASES_URL) : url;
+        psiops::OpenReleasePageInBrowser(target);
+        st.status_banner = ui_common::IsGamescope()
+                               ? ("Release page: " + target + " (browse in Desktop Mode if hidden)")
+                               : ("Opened release page in browser: " + target);
+    };
+    uctx.on_dismiss = [&](const std::string& tag) {
+        ui_common::GetUpdatePrefs().dismissed_update_tag = tag;
+        st.settings_modified = true;
+        st.status_banner = "Dismissed update alert for " + tag + " (click 'Check for Updates' to show again).";
+    };
+    ui_common::DrawUpdateAlertCard(snap, uctx);
+    ImGui::Spacing();
+    return true;
+}
+
+void DrawPlayAndDiscTab(LauncherState& st, void* native_owner_win, bool show_upd_banner) {
     app::Settings& s = app::Get();
 
     // Hero Banner Card
@@ -241,7 +342,7 @@ void DrawPlayAndDiscTab(LauncherState& st, void* native_owner_win) {
     ImGui::Spacing();
 
     // Game Disc Image Card
-    ImGui::BeginChild("DiscCard", ImVec2(0.0f, 185.0f), true);
+    ImGui::BeginChild("DiscCard", ImVec2(0.0f, show_upd_banner ? 156.0f : 185.0f), true);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.32f, 0.86f, 0.96f, 1.0f));
     ImGui::TextUnformatted("Game Disc Image (.xiso.iso / .iso)");
     ImGui::PopStyleColor();
@@ -328,7 +429,10 @@ void DrawPlayAndDiscTab(LauncherState& st, void* native_owner_win) {
     ImGui::EndChild();
 }
 
-void DrawLauncherFrame(LauncherState& st, void* native_owner_win) {
+void DrawLauncherFrame(LauncherState& st, void* native_owner_win, float ui_scale) {
+    psiops::UpdateStatusSnapshot upd_snap = psiops::GetUpdateSnapshot();
+    PollLauncherUpdateTransitions(st, upd_snap);
+
     ImGuiIO& io = ImGui::GetIO();
     ui_common::GamepadNavEvents nav = ui_common::PollGamepadNavToImGui(io);
     // LB/RB/Start are suspended while a modal is up: the file browser, or a pending click-to-rebind capture.
@@ -359,6 +463,15 @@ void DrawLauncherFrame(LauncherState& st, void* native_owner_win) {
         ImGui::PopStyleColor();
         ImGui::SameLine();
         ImGui::TextDisabled("   (LB / RB switch tabs  |  F1 in-game overlay  |  Start to Play)");
+        ui_common::DrawLauncherHeaderUpdateButton(upd_snap, ui_scale, [&] {
+            if (!ui_common::GetUpdatePrefs().dismissed_update_tag.empty()) {
+                ui_common::GetUpdatePrefs().dismissed_update_tag.clear();
+                if (!HasMockUpdateEnv()) st.settings_modified = true;
+            }
+            st.upd_manual_pending = true;
+            st.status_banner = "Checking GitHub Releases for updates...";
+            psiops::StartUpdateCheck(true);
+        });
         ImGui::Separator();
 
         static constexpr const char* kTabs[6] = {
@@ -376,9 +489,10 @@ void DrawLauncherFrame(LauncherState& st, void* native_owner_win) {
                 if (ImGui::BeginTabItem(kTabs[t], nullptr, tf)) {
                     if (!st.tab_switch_requested) st.active_tab = t;
                     ImGui::BeginChild("LauncherTabContent", ImVec2(0.0f, content_h - 36.0f), false);
+                    bool show_upd_banner = DrawLauncherUpdateAlertIfNeeded(st, upd_snap, ui_scale);
                     bool dummy_apply = false;
                     if (t == 0) {
-                        DrawPlayAndDiscTab(st, native_owner_win);
+                        DrawPlayAndDiscTab(st, native_owner_win, show_upd_banner);
                     } else if (t == 1) {
                         ui_common::DrawUpscalingGraphicsPanel(st.probe, false, st.settings_modified, dummy_apply);
                         ImGui::Spacing();
@@ -408,6 +522,23 @@ void DrawLauncherFrame(LauncherState& st, void* native_owner_win) {
                     } else if (t == 4) {
                         mkb::DrawControlsSettingsPanel(false, &st.settings_modified);
                     } else if (t == 5) {
+                        ui_common::DrawUpdatesDiagnosticsSection(
+                            upd_snap, true, ui_scale, st.settings_modified, st.upd_manual_pending, st.tools_status, [&] {
+                                if (st.settings_modified || st.has_valid_game) {
+                                    app::Save();
+                                    st.settings_modified = false;
+                                }
+                                if (psiops::ApplyStagedUpdateAndRelaunch()) {
+                                    st.request_play = false;
+                                    st.request_exit = true;
+                                } else {
+                                    psiops::UpdateStatusSnapshot err_s = psiops::GetUpdateSnapshot();
+                                    st.tools_status =
+                                        err_s.status_message.empty()
+                                            ? "Failed to launch staged update helper."
+                                            : ui_common::SanitizeUiText(err_s.status_message, true, 140);
+                                }
+                            });
                         ui_common::DrawToolsDiagnosticsPanel(st.probe, false, st.tools_status);
                         ImGui::Spacing();
                         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.32f, 0.86f, 0.96f, 1.0f));
@@ -660,6 +791,8 @@ struct Win32LauncherApp {
         st.monitors = app::EnumerateMonitors();
         st.RefreshDiscStatus();
         if (cli.open_file_browser) st.browser.Open();
+        MaybeStartLauncherUpdateCheck();
+        st.prev_upd_state = psiops::GetUpdateSnapshot().state;
 
         WNDCLASSEXW wc{sizeof(wc)};
         wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -811,7 +944,7 @@ struct Win32LauncherApp {
             ImGui_ImplWin32_NewFrame();
             ui_common::SyncGamepadBackendFlag(io);  // after the backend (which only knows XInput pads)
             ImGui::NewFrame();
-            DrawLauncherFrame(st, hwnd);
+            DrawLauncherFrame(st, hwnd, dpi_scale);
             ImGui::Render();
 
             uint32_t bi = swap->GetCurrentBackBufferIndex();
@@ -866,6 +999,8 @@ struct Win32LauncherApp {
         if (st.request_play) {
             if (st.settings_modified) app::Save();
             launch_game = true;
+        } else {
+            psiops::ShutdownUpdateChecker();
         }
         // Strictly ZERO settings.toml write on unconfigured Exit!
 
@@ -896,6 +1031,8 @@ bool RunLinuxLauncher(const LauncherCli& cli) {
     st.monitors = app::EnumerateMonitors();
     st.RefreshDiscStatus();
     if (cli.open_file_browser) st.browser.Open();
+    MaybeStartLauncherUpdateCheck();
+    st.prev_upd_state = psiops::GetUpdateSnapshot().state;
 
     bool is_deck = (std::getenv("SteamDeck") && std::strcmp(std::getenv("SteamDeck"), "1") == 0);
     app::Mode desk = app::Desktop();
@@ -959,7 +1096,7 @@ bool RunLinuxLauncher(const LauncherCli& cli) {
         ImGui_ImplSDL3_NewFrame();
         ui_common::SyncGamepadBackendFlag(io);  // SDL3 backend runs in Manual mode with no pads of its own
         ImGui::NewFrame();
-        DrawLauncherFrame(st, win);
+        DrawLauncherFrame(st, win, 1.0f);
         ImGui::Render();
 
         SDL_SetRenderDrawColor(ren, 12, 16, 23, 255);
@@ -999,6 +1136,8 @@ bool RunLinuxLauncher(const LauncherCli& cli) {
     if (st.request_play) {
         if (st.settings_modified) app::Save();
         launch_game = true;
+    } else {
+        psiops::ShutdownUpdateChecker();
     }
     // Strictly ZERO settings.toml write on unconfigured Exit!
 

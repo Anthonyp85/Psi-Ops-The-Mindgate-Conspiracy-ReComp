@@ -6,6 +6,9 @@
 #include "common/launcher_ui.h"
 #include "common/mkb_input.h"
 #include "common/settings_ui.h"
+#include "common/ui_common.h"
+#include "common/update_checker.h"
+#include "common/version.h"
 #include "core/input.h"
 #include "core/perf.h"
 #include "gpu/backend.h"
@@ -17,6 +20,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string_view>
+
+static_assert(PSIOPS_VERSION_MAJOR == 1 && PSIOPS_VERSION_MINOR == 1 && PSIOPS_VERSION_PATCH == 0 &&
+                  std::string_view(PSIOPS_VERSION_STR) == "1.1.0",
+              "Keep game_info.cpp, version.h, and CMakeLists.txt synchronized (v1.1.0)");
 
 uint32_t PsiOpsLiveCameraVa();
 uint64_t PsiOpsConsumeMkbActionsFired();
@@ -528,7 +536,18 @@ void OnPsiOpsRumble(int port, uint16_t& left, uint16_t& right) {
     input_rec::OnRumble(port, left, right);
 }
 
+void OnPsiOpsLoadSettings(const void* toml_table) {
+    mkb::LoadSettings(toml_table);
+    ui_common::LoadUpdatePrefs(toml_table);
+}
+
+void OnPsiOpsSaveSettings(void* toml_table) {
+    mkb::SaveSettings(toml_table);
+    ui_common::SaveUpdatePrefs(toml_table);
+}
+
 void OnPsiOpsShutdown() {
+    psiops::ShutdownUpdateChecker();
     mkb::Shutdown();
     input_rec::Shutdown();
 }
@@ -559,8 +578,8 @@ const app::GameInfo app::kGame = {
     .missing = L"Provide Psi-Ops: The Mindgate Conspiracy (USA) as a read-only Xbox disc image (.xiso.iso / .iso) via --iso, settings.toml (iso_path), or inside the assets/ or game folder.",
     .images = {{"default.xbe", "PsiOps"}},
     .options = {},
-    .load = mkb::LoadSettings,
-    .save = mkb::SaveSettings,
+    .load = OnPsiOpsLoadSettings,
+    .save = OnPsiOpsSaveSettings,
     .init = OnPsiOpsInit,
     .loaded = nullptr,
     .window = mkb::OnWindowCreated,

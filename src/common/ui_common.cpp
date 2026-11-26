@@ -5,12 +5,18 @@
 #include "common/ui_common.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <vector>
+
+#include <toml++/toml.hpp>
 
 #include "audio/audio.h"
 #include "core/input.h"
@@ -676,6 +682,617 @@ GamepadNavEvents PollGamepadNavToImGui(ImGuiIO& io) {
     ev.confirm_pressed = (pressed & 0x1000u) != 0;
     ev.cancel_pressed = (pressed & 0x2000u) != 0;
     return ev;
+}
+
+#ifdef _WIN32
+std::wstring Utf8ToWideStr(std::string_view s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring w(size_t(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), w.data(), n);
+    return w;
+}
+
+std::string WideToUtf8Str(std::wstring_view w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string s(size_t(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), s.data(), n, nullptr, nullptr);
+    return s;
+}
+#endif
+
+std::vector<std::string> GetProcessArgsUtf8() {
+    std::vector<std::string> args;
+#ifdef _WIN32
+    const wchar_t* cmd = GetCommandLineW();
+    if (!cmd) return args;
+    const wchar_t* p = cmd;
+    while (*p) {
+        while (*p && std::iswspace(*p)) ++p;
+        if (!*p) break;
+        std::wstring a;
+        bool q = false;
+        while (*p && (q || !std::iswspace(*p))) {
+            if (*p == L'"') q = !q;
+            else a.push_back(*p);
+            ++p;
+        }
+        args.push_back(WideToUtf8Str(a));
+    }
+#else
+    std::ifstream f("/proc/self/cmdline", std::ios::binary);
+    if (!f) return args;
+    std::string raw((std::istreambuf_iterator<char>(f)), {});
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        size_t nul = raw.find('\0', pos);
+        if (nul == std::string::npos) nul = raw.size();
+        args.emplace_back(raw.substr(pos, nul - pos));
+        pos = nul + 1;
+    }
+#endif
+    return args;
+}
+
+bool IsGamescope() {
+#ifdef _WIN32
+    return false;
+#else
+    if (const char* gs = std::getenv("GAMESCOPE_WAYLAND_DISPLAY"); gs && *gs) return true;
+    if (const char* sd = std::getenv("SteamDeck"); sd && std::strcmp(sd, "1") == 0) return true;
+    return false;
+#endif
+}
+
+namespace {
+std::mutex g_update_prefs_lock;
+UpdateUiPrefs g_update_prefs{};
+
+std::string LowerAsciiUi(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+}  // namespace
+
+UpdateUiPrefs& GetUpdatePrefs() { return g_update_prefs; }
+
+void LoadUpdatePrefs(const void* toml_table) {
+    if (!toml_table) return;
+    const auto& root = *static_cast<const toml::table*>(toml_table);
+    std::lock_guard<std::mutex> lk(g_update_prefs_lock);
+    g_update_prefs.check_updates_on_startup =
+        root["check_updates_on_startup"].value_or(g_update_prefs.check_updates_on_startup);
+    if (auto tag = root["dismissed_update_tag"].value<std::string>()) {
+        g_update_prefs.dismissed_update_tag = *tag;
+    } else {
+        g_update_prefs.dismissed_update_tag.clear();
+    }
+}
+
+void SaveUpdatePrefs(void* toml_table) {
+    if (!toml_table) return;
+    auto& root = *static_cast<toml::table*>(toml_table);
+    std::lock_guard<std::mutex> lk(g_update_prefs_lock);
+    root.insert_or_assign("check_updates_on_startup", g_update_prefs.check_updates_on_startup);
+    root.insert_or_assign("dismissed_update_tag", g_update_prefs.dismissed_update_tag);
+}
+
+std::string SanitizeUiText(const std::string& s, bool single_line, size_t max_chars) {
+    std::string out;
+    out.reserve(s.size());
+    bool prev_space = true;
+    size_t i = 0;
+    while (i < s.size()) {
+        uint8_t c = static_cast<uint8_t>(s[i]);
+        // Normalize common UTF-8 typographic punctuation into crisp ASCII equivalents for Latin-1 fonts
+        if (c == 0xE2u && i + 2 < s.size()) {
+            uint8_t b1 = static_cast<uint8_t>(s[i + 1]);
+            uint8_t b2 = static_cast<uint8_t>(s[i + 2]);
+            if (b1 == 0x80u && (b2 == 0x93u || b2 == 0x94u)) {
+                out.push_back('-');
+                prev_space = false;
+                i += 3;
+                continue;
+            }
+            if (b1 == 0x80u && (b2 == 0x98u || b2 == 0x99u)) {
+                out.push_back('\'');
+                prev_space = false;
+                i += 3;
+                continue;
+            }
+            if (b1 == 0x80u && (b2 == 0x9Cu || b2 == 0x9Du)) {
+                out.push_back('"');
+                prev_space = false;
+                i += 3;
+                continue;
+            }
+            if (b1 == 0x80u && b2 == 0xA2u) {
+                out += "*";
+                prev_space = false;
+                i += 3;
+                continue;
+            }
+            if (b1 == 0x80u && b2 == 0xA6u) {
+                out += "...";
+                prev_space = false;
+                i += 3;
+                continue;
+            }
+            if (b1 == 0x86u && b2 == 0x92u) {
+                out += "->";
+                prev_space = false;
+                i += 3;
+                continue;
+            }
+        }
+        if (c == '\r') {
+            ++i;
+            continue;
+        }
+        if (c == '\n') {
+            if (single_line) {
+                if (!out.empty() && !prev_space) {
+                    out += "  |  ";
+                    prev_space = true;
+                }
+            } else if (!out.empty() && out.back() != '\n') {
+                out.push_back('\n');
+                prev_space = true;
+            }
+            ++i;
+            continue;
+        }
+        if (c < 0x20u || c == 0x7Fu) {
+            if (c == '\t' && !prev_space) {
+                out.push_back(' ');
+                prev_space = true;
+            }
+            ++i;
+            continue;
+        }
+        if (c == ' ') {
+            if (!prev_space) {
+                out.push_back(' ');
+                prev_space = true;
+            }
+            ++i;
+            continue;
+        }
+        // Keep printable ASCII + valid 2-byte UTF-8 Latin-1 (U+00A0..U+00FF); skip higher planes
+        if (c < 0x80u) {
+            out.push_back(static_cast<char>(c));
+            prev_space = false;
+            ++i;
+        } else if ((c & 0xE0u) == 0xC0u && i + 1 < s.size()) {
+            uint32_t cp = ((uint32_t(c) & 0x1Fu) << 6) | (uint32_t(static_cast<uint8_t>(s[i + 1])) & 0x3Fu);
+            if (cp >= 0xA0u && cp <= 0xFFu) {
+                out.push_back(static_cast<char>(c));
+                out.push_back(s[i + 1]);
+                prev_space = false;
+            }
+            i += 2;
+        } else if ((c & 0xF0u) == 0xE0u && i + 2 < s.size()) {
+            i += 3;
+        } else if ((c & 0xF8u) == 0xF0u && i + 3 < s.size()) {
+            i += 4;
+        } else {
+            ++i;
+        }
+    }
+    while (!out.empty() && (out.back() == ' ' || out.back() == '|' || out.back() == '\n')) {
+        out.pop_back();
+    }
+    if (max_chars > 4 && out.size() > max_chars) {
+        size_t cut = max_chars - 3;
+        while (cut > 0 && (static_cast<uint8_t>(out[cut]) & 0xC0u) == 0x80u) --cut;
+        while (cut > max_chars / 2 && out[cut] != ' ') --cut;
+        while (cut > 0 && (out[cut - 1] == ' ' || out[cut - 1] == '|')) --cut;
+        out.resize(cut);
+        out += "...";
+    }
+    return out;
+}
+
+bool ShouldShowUpdateBanner(const psiops::UpdateStatusSnapshot& snap, const std::string& dismissed_tag) {
+    if (snap.state != psiops::UpdateState::UpdateAvailable &&
+        snap.state != psiops::UpdateState::Downloading &&
+        snap.state != psiops::UpdateState::ReadyToRestart) {
+        return false;
+    }
+    if (snap.manual_check) return true;
+    if (dismissed_tag.empty()) return true;
+    return snap.latest_tag != dismissed_tag;
+}
+
+void DrawLauncherHeaderUpdateButton(const psiops::UpdateStatusSnapshot& snap, float ui_scale,
+                                    const std::function<void()>& on_manual_check) {
+    float s = std::clamp(ui_scale, 1.0f, 2.5f);
+    const UpdateUiPrefs& o = GetUpdatePrefs();
+    const bool checking = (snap.state == psiops::UpdateState::Checking);
+    const bool downloading = (snap.state == psiops::UpdateState::Downloading);
+    const bool ready = (snap.state == psiops::UpdateState::ReadyToRestart);
+    const bool has_banner = ShouldShowUpdateBanner(snap, o.dismissed_update_tag);
+
+    const char* visible_text = "Check for Updates";
+    const char* btn_id = "Check for Updates##LauncherHdrUpd";
+    if (checking) {
+        visible_text = "Checking...";
+        btn_id = "Checking...##LauncherHdrUpd";
+    } else if (downloading) {
+        visible_text = "Updating...";
+        btn_id = "Updating...##LauncherHdrUpd";
+    } else if (ready) {
+        visible_text = "Update Staged!";
+        btn_id = "Update Staged!##LauncherHdrUpd";
+    } else if (has_banner) {
+        visible_text = "Update Available!";
+        btn_id = "Update Available!##LauncherHdrUpd";
+    }
+
+    float text_w = ImGui::CalcTextSize(visible_text).x;
+    float btn_w = std::max(text_w + ImGui::GetStyle().FramePadding.x * 2.0f + 12.0f * s, 148.0f * s);
+    float right_x = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - btn_w;
+    ImGui::SameLine();
+    if (right_x > ImGui::GetCursorPosX() + 8.0f * s) {
+        ImGui::SetCursorPosX(right_x);
+    }
+
+    const bool disabled = checking || downloading;
+    if (disabled) ImGui::BeginDisabled(true);
+
+    if (ready) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.48f, 0.28f, 0.96f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.62f, 0.36f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.20f, 0.72f, 0.42f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.36f, 0.88f, 0.52f, 0.95f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 1.00f, 0.96f, 1.00f));
+    } else if (has_banner) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.56f, 0.36f, 0.08f, 0.96f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.48f, 0.11f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.84f, 0.56f, 0.14f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.96f, 0.74f, 0.24f, 0.95f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.94f, 0.76f, 1.00f));
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.11f, 0.21f, 0.32f, 0.96f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.35f, 0.50f, 0.98f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.20f, 0.48f, 0.64f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.22f, 0.44f, 0.60f, 0.88f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.96f, 0.99f, 1.00f));
+    }
+
+    if (ImGui::Button(btn_id, ImVec2(btn_w, 0.0f))) {
+        if (on_manual_check) on_manual_check();
+    }
+
+    ImGui::PopStyleColor(5);
+    if (disabled) ImGui::EndDisabled();
+
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (checking) {
+            ImGui::SetTooltip("Querying GitHub Releases (%s)...", PSIOPS_GITHUB_REPO);
+        } else if (has_banner && !snap.latest_tag.empty()) {
+            ImGui::SetTooltip("New release %s is available (Current: %s). Click to re-check.",
+                              snap.latest_tag.c_str(), PSIOPS_VERSION_TAG);
+        } else if (snap.state == psiops::UpdateState::UpToDate) {
+            ImGui::SetTooltip("Up to date (%s). Click to check GitHub Releases again.", PSIOPS_VERSION_TAG);
+        } else {
+            ImGui::SetTooltip("Check GitHub Releases (%s) for a newer build.", PSIOPS_GITHUB_REPO);
+        }
+    }
+}
+
+void DrawUpdateAlertCard(const psiops::UpdateStatusSnapshot& snap, const UpdateCardContext& uctx) {
+    float s = std::clamp(uctx.ui_scale, 1.0f, 2.5f);
+    std::string tag = !snap.latest_tag.empty()
+                          ? snap.latest_tag
+                          : (!snap.latest_version.empty() ? ("v" + snap.latest_version) : std::string("New Release"));
+
+    const bool ready = (snap.state == psiops::UpdateState::ReadyToRestart);
+    const bool downloading = (snap.state == psiops::UpdateState::Downloading);
+    const bool show_primary = ready || downloading || snap.can_self_update;
+    const bool show_dismiss = !downloading;
+
+    std::string clean_title = SanitizeUiText(snap.release_title, true, 76);
+    std::string clean_notes = SanitizeUiText(snap.release_notes_summary, true, 118);
+    std::string summary_line;
+    if (ready) {
+        if (uctx.in_launcher) {
+            summary_line =
+                "Verified & staged in update_staging/ - click 'Restart & Apply Update' to install (saves, settings & ISO preserved).";
+        } else {
+            summary_line =
+                "Update staged! Save your game progress first, then click 'Save & Exit to Update' to install & relaunch.";
+        }
+    } else if (!clean_notes.empty() && !clean_title.empty() && LowerAsciiUi(clean_title) != LowerAsciiUi(tag) &&
+               clean_notes.find(clean_title) == std::string::npos) {
+        summary_line = SanitizeUiText(clean_title + " - " + clean_notes, true, 118);
+    } else if (!clean_notes.empty()) {
+        summary_line = clean_notes;
+    } else if (!clean_title.empty()) {
+        summary_line = clean_title;
+    } else {
+        summary_line =
+            "A newer release of Psi-Ops: The Mindgate Conspiracy ReComp is available on GitHub Releases.";
+    }
+
+    std::string full_tooltip = SanitizeUiText(snap.release_notes_summary, false, 600);
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                          ready ? ImVec4(0.080f, 0.160f, 0.120f, 0.97f) : ImVec4(0.145f, 0.118f, 0.072f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_Border,
+                          ready ? ImVec4(0.36f, 0.88f, 0.50f, 0.95f) : ImVec4(0.94f, 0.70f, 0.22f, 0.95f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, std::max(1.5f, std::round(1.5f * s)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f * s, 8.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * s, 5.0f * s));
+
+    const char* card_id = uctx.in_launcher ? "##LauncherUpdateAlertCard" : "##InGameUpdateAlertCard";
+    constexpr ImGuiChildFlags kCardFlags =
+        ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_NavFlattened;
+    if (ImGui::BeginChild(card_id, ImVec2(0.0f, 0.0f), kCardFlags)) {
+        ImGui::AlignTextToFramePadding();
+        if (ready) {
+            ImGui::TextColored(ImVec4(0.48f, 0.96f, 0.60f, 1.0f), "Update Ready: %s (Current: %s)", tag.c_str(),
+                               PSIOPS_VERSION_TAG);
+        } else if (downloading) {
+            ImGui::TextColored(ImVec4(1.00f, 0.84f, 0.36f, 1.0f), "Downloading Update: %s (Current: %s)", tag.c_str(),
+                               PSIOPS_VERSION_TAG);
+        } else {
+            ImGui::TextColored(ImVec4(1.00f, 0.84f, 0.36f, 1.0f), "Update Available: %s (Current: %s)", tag.c_str(),
+                               PSIOPS_VERSION_TAG);
+        }
+
+        const char* prim_lbl = uctx.in_launcher ? "Update Now" : "Stage Update";
+        if (ready) {
+            prim_lbl = uctx.in_launcher ? "Restart & Apply Update" : "Save & Exit to Update";
+        } else if (downloading) {
+            prim_lbl = "Downloading...";
+        }
+        const char* rel_lbl = "Open Release Page";
+        const char* dis_lbl = "Dismiss";
+
+        auto calc_btn_w = [&](const char* txt) -> float {
+            return ImGui::CalcTextSize(txt).x + ImGui::GetStyle().FramePadding.x * 2.0f + 8.0f * s;
+        };
+        float prim_w = show_primary ? calc_btn_w(prim_lbl) : 0.0f;
+        float rel_w = calc_btn_w(rel_lbl);
+        float dis_w = show_dismiss ? calc_btn_w(dis_lbl) : 0.0f;
+
+        int btn_count = (show_primary ? 1 : 0) + 1 + (show_dismiss ? 1 : 0);
+        float total_btns_w = prim_w + rel_w + dis_w + ImGui::GetStyle().ItemSpacing.x * float(btn_count - 1);
+        float right_x = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - total_btns_w;
+
+        ImGui::SameLine();
+        if (right_x >= ImGui::GetCursorPosX() + 8.0f * s) {
+            ImGui::SetCursorPosX(right_x);
+        } else {
+            ImGui::NewLine();
+        }
+
+        if (show_primary) {
+            if (downloading) ImGui::BeginDisabled(true);
+            if (ready) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.54f, 0.28f, 1.00f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.68f, 0.36f, 1.00f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.26f, 0.78f, 0.42f, 1.00f));
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.68f, 0.44f, 0.08f, 1.00f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.84f, 0.56f, 0.12f, 1.00f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.94f, 0.64f, 0.16f, 1.00f));
+            }
+            if (ImGui::Button(prim_lbl, ImVec2(prim_w, 0.0f))) {
+                if (ready) {
+                    if (uctx.on_apply_and_restart) uctx.on_apply_and_restart();
+                } else {
+                    if (uctx.on_update_now) uctx.on_update_now();
+                }
+            }
+            ImGui::PopStyleColor(3);
+            if (downloading) ImGui::EndDisabled();
+
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                if (ready) {
+                    ImGui::SetTooltip(
+                        uctx.in_launcher
+                            ? "Closes the launcher, installs the verified update (preserving settings, saves & ISO), and relaunches."
+                            : "Ensure you saved your game progress first! Closes the game, applies the update, and relaunches.");
+                } else if (!downloading) {
+                    if (!snap.asset_name.empty() && snap.asset_size > 0) {
+                        ImGui::SetTooltip(
+                            uctx.in_launcher
+                                ? "Download & stage %s (%.1f MB) for one-click update."
+                                : "Download & verify %s (%.1f MB) in the background without closing your game.",
+                            snap.asset_name.c_str(), double(snap.asset_size) / (1024.0 * 1024.0));
+                    } else {
+                        ImGui::SetTooltip("Download & stage the latest release archive.");
+                    }
+                }
+            }
+            ImGui::SameLine();
+        }
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.24f, 0.34f, 0.96f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.19f, 0.36f, 0.50f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.24f, 0.46f, 0.62f, 1.00f));
+        if (ImGui::Button(rel_lbl, ImVec2(rel_w, 0.0f))) {
+            if (uctx.on_open_release_page) uctx.on_open_release_page(snap.html_url);
+        }
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Open GitHub release notes & manual downloads in your browser.");
+        }
+
+        if (show_dismiss) {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.18f, 0.22f, 0.92f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.26f, 0.24f, 0.28f, 0.96f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.36f, 0.28f, 0.32f, 1.00f));
+            if (ImGui::Button(dis_lbl, ImVec2(dis_w, 0.0f))) {
+                if (uctx.on_dismiss) uctx.on_dismiss(tag);
+            }
+            ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Hide this alert for %s until you click 'Check for Updates' manually.", tag.c_str());
+            }
+        }
+
+        if (downloading) {
+            double dl_mb = double(snap.downloaded_bytes) / (1024.0 * 1024.0);
+            float frac = 0.35f;
+            char prog_buf[256];
+            if (snap.asset_size > 0) {
+                double tot_mb = double(snap.asset_size) / (1024.0 * 1024.0);
+                frac = std::clamp(float(double(snap.downloaded_bytes) / double(snap.asset_size)), 0.0f, 1.0f);
+                std::snprintf(prog_buf, sizeof(prog_buf), "%.2f / %.2f MB (%.0f%%)  %s", dl_mb, tot_mb,
+                              double(frac * 100.0f), snap.asset_name.c_str());
+            } else {
+                std::snprintf(prog_buf, sizeof(prog_buf), "%.2f MB downloaded  %s", dl_mb, snap.asset_name.c_str());
+            }
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.88f, 0.60f, 0.14f, 1.00f));
+            ImGui::ProgressBar(frac, ImVec2(-1.0f, std::round(18.0f * s)), prog_buf);
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.90f, 0.86f, 1.0f));
+            ImGui::TextWrapped("%s", summary_line.c_str());
+            ImGui::PopStyleColor();
+            if (!full_tooltip.empty() && ImGui::IsItemHovered()) {
+                if (ImGui::BeginTooltip()) {
+                    ImGui::PushTextWrapPos(460.0f * s);
+                    ImGui::TextUnformatted(full_tooltip.c_str());
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+            }
+            if (!uctx.in_launcher && !ready) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.74f, 0.30f, 1.0f));
+                ImGui::TextWrapped("Save your progress in-game before closing the game to apply an update.");
+                ImGui::PopStyleColor();
+            }
+        }
+    }
+    ImGui::EndChild();
+
+    ImVec2 p_min = ImGui::GetItemRectMin();
+    ImVec2 p_max = ImGui::GetItemRectMax();
+    if (p_max.x > p_min.x + 8.0f && p_max.y > p_min.y + 8.0f) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImU32 glow_col = ready ? IM_COL32(90, 224, 128, 52) : IM_COL32(245, 182, 58, 58);
+        ImU32 bar_col = ready ? IM_COL32(96, 236, 136, 235) : IM_COL32(248, 190, 64, 235);
+        dl->AddRect(ImVec2(p_min.x + 1.0f, p_min.y + 1.0f), ImVec2(p_max.x - 1.0f, p_max.y - 1.0f), glow_col,
+                    6.0f * s, 0, std::max(1.0f, s));
+        dl->AddRectFilled(ImVec2(p_min.x + 1.0f, p_min.y + 3.0f * s),
+                          ImVec2(p_min.x + std::max(3.5f, std::round(3.5f * s)), p_max.y - 3.0f * s), bar_col,
+                          2.0f * s);
+    }
+
+    ImGui::PopStyleVar(4);
+    ImGui::PopStyleColor(2);
+}
+
+void DrawUpdatesDiagnosticsSection(const psiops::UpdateStatusSnapshot& snap, bool in_launcher, float ui_scale,
+                                   bool& dirty, bool& manual_pending, std::string& status_msg,
+                                   const std::function<void()>& on_apply_and_restart) {
+    SectionHeading("Updates & Self-Updater (" PSIOPS_VERSION_TAG ")");
+
+    UpdateUiPrefs& o = GetUpdatePrefs();
+    if (!in_launcher && ShouldShowUpdateBanner(snap, o.dismissed_update_tag)) {
+        UpdateCardContext uctx{};
+        uctx.in_launcher = false;
+        uctx.ui_scale = ui_scale;
+        uctx.on_update_now = [&] {
+            if (psiops::StartDownloadAndStageUpdate()) {
+                status_msg = "Downloading & staging " +
+                             (snap.asset_name.empty() ? snap.latest_tag : snap.asset_name) +
+                             " in the background...";
+            } else {
+                psiops::UpdateStatusSnapshot err_s = psiops::GetUpdateSnapshot();
+                status_msg = err_s.status_message.empty() ? "Could not start self-update download."
+                                                          : SanitizeUiText(err_s.status_message, true, 140);
+            }
+        };
+        uctx.on_apply_and_restart = on_apply_and_restart;
+        uctx.on_open_release_page = [&](const std::string& url) {
+            std::string target = url.empty() ? std::string(PSIOPS_RELEASES_URL) : url;
+            psiops::OpenReleasePageInBrowser(target);
+            status_msg = IsGamescope() ? ("Release page: " + target + " (browse in Desktop Mode if hidden)")
+                                       : ("Opened release page in browser: " + target);
+        };
+        uctx.on_dismiss = [&](const std::string& tag) {
+            o.dismissed_update_tag = tag;
+            dirty = true;
+            status_msg = "Dismissed update alert for " + tag + " (click 'Check for Updates' to show again).";
+        };
+        DrawUpdateAlertCard(snap, uctx);
+        ImGui::Spacing();
+    }
+
+    const bool upd_busy =
+        (snap.state == psiops::UpdateState::Checking || snap.state == psiops::UpdateState::Downloading);
+    if (upd_busy) ImGui::BeginDisabled(true);
+    if (ImGui::Button(snap.state == psiops::UpdateState::Checking ? "Checking...##DiagUpdBtn"
+                                                                  : "Check for Updates##DiagUpdBtn")) {
+        if (!o.dismissed_update_tag.empty()) {
+            o.dismissed_update_tag.clear();
+            dirty = true;
+        }
+        manual_pending = true;
+        status_msg = "Checking GitHub Releases for updates...";
+        psiops::StartUpdateCheck(true);
+    }
+    if (upd_busy) ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    if (ImGui::Button("Open Release Page##DiagRelBtn")) {
+        std::string target = snap.html_url.empty() ? std::string(PSIOPS_RELEASES_URL) : snap.html_url;
+        psiops::OpenReleasePageInBrowser(target);
+        status_msg = IsGamescope() ? ("GitHub Releases: " + target + " (browse in Desktop Mode if hidden)")
+                                   : ("Opened GitHub Releases: " + target);
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Automatically Check for Updates on Startup", &o.check_updates_on_startup)) {
+        dirty = true;
+    }
+
+    switch (snap.state) {
+        case psiops::UpdateState::Checking:
+            ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.36f, 1.0f), "Status: Querying GitHub Releases (%s)...",
+                               PSIOPS_GITHUB_REPO);
+            break;
+        case psiops::UpdateState::UpToDate:
+            ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.65f, 1.0f), "Status: Up to date (%s)", PSIOPS_VERSION_TAG);
+            break;
+        case psiops::UpdateState::UpdateAvailable:
+            ImGui::TextColored(
+                ImVec4(1.00f, 0.84f, 0.36f, 1.0f),
+                in_launcher ? "Status: Update available (%s) - use the alert banner above to download & install."
+                            : "Status: Update available (%s) - save your progress in-game before updating.",
+                snap.latest_tag.c_str());
+            break;
+        case psiops::UpdateState::Downloading:
+            ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.36f, 1.0f), "Status: Downloading %s...",
+                               snap.asset_name.c_str());
+            break;
+        case psiops::UpdateState::ReadyToRestart:
+            ImGui::TextColored(
+                ImVec4(0.48f, 0.96f, 0.60f, 1.0f),
+                in_launcher ? "Status: Update %s staged! Click 'Restart & Apply Update' above to finish."
+                            : "Status: Update %s staged! Save your game progress, then click 'Save & Exit to Update'.",
+                snap.latest_tag.c_str());
+            break;
+        case psiops::UpdateState::Error:
+            ImGui::TextColored(ImVec4(0.95f, 0.38f, 0.38f, 1.0f), "Status: %s",
+                               snap.status_message.empty() ? "Update check failed."
+                                                           : SanitizeUiText(snap.status_message, true, 120).c_str());
+            break;
+        case psiops::UpdateState::Idle:
+        default:
+            ImGui::TextDisabled("Installed Version: %s  |  GitHub: %s", PSIOPS_VERSION_TAG, PSIOPS_GITHUB_REPO);
+            break;
+    }
 }
 
 }  // namespace ui_common
