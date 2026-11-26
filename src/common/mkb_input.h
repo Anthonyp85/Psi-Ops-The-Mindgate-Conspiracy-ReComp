@@ -55,6 +55,7 @@ enum class Action : uint8_t {
     Reload,
     Jump,
     Crouch,
+    WallMove,
     Interact,
     Melee,
     PsiUse,
@@ -66,6 +67,8 @@ enum class Action : uint8_t {
     PsiMc,
     PsiRv,
     PsiAv,
+    TkCamControl,
+    McExplode,
     Pause,
     Objectives,
     Count
@@ -146,6 +149,26 @@ bool ConsumeCameraMouseDelta(float& out_d_yaw_rad, float& out_d_pitch_rad, int32
 
 // Query direct 1-key Psi power selection request (-1 if none, else 0..5 for TK/PK/MD/MC/RV/AV).
 int ConsumeDirectPsiSelect();
+
+// Active Psi power slot (0=TK, 1=PK, 2=MD, 3=MC, 4=RV, 5=AV) used by Action::PsiUse (LShift/Mouse5).
+int GetSelectedPsiIndex();
+void SetSelectedPsiIndex(int idx);
+
+// Per-guest-frame decoupled M&K snapshot queried inside InputManager::Update (0x00294130).
+struct GameplayInputSnapshot {
+    bool mkb_active = false;
+    bool overlay_open = false;
+    bool held[size_t(Action::Count)] = {};
+    int32_t wheel_delta = 0;       // +1 WheelUp / -1 WheelDown / 0 none (1 guest tick per notch)
+    bool any_key_or_mouse = false; // for idle timer reset (0x86)
+    float wasd_x = 0.0f;           // diagonal-normalized [-1..+1]
+    float wasd_y = 0.0f;
+    float wasd_mag = 0.0f;
+    float recent_flick_peak = 0.0f; // peak single-frame raw mouse speed over last 140ms (TK Throw 0x0D)
+    float recent_flick_disp = 0.0f; // net raw mouse displacement over last 140ms (TK Throw 0x0D)
+};
+void PollGameplayInput(GameplayInputSnapshot& out);
+bool IsActionHeld(Action a);
 
 // Snapshot M&K telemetry for unified --state-log JSONL output.
 input_rec::MkbStateSnapshot SnapshotTelemetry();

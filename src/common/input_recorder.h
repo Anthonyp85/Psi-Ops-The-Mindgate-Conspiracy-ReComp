@@ -42,6 +42,18 @@ struct GuestStateSnapshot {
     float psi = 0.0f;
     int32_t ammo_clip = -1;
     int32_t ammo_reserve = -1;
+    int32_t ammo_clip_size = -1;
+    int32_t weapon_type = -1;
+
+    bool has_player_actions = false;
+    uint32_t anim_state = 0;
+    float melee_timer = -1.0f;
+    uint32_t psi_fn = 0;
+    int32_t psi_selected = 0;
+    bool lock_on_active = false;
+    bool sniper_scoped = false;
+    uint64_t mkb_actions_fired = 0;
+    uint32_t mkb_reload_count = 0;
 
     bool has_guest_invert_y = false;
     bool guest_invert_y = false;

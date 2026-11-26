@@ -376,6 +376,19 @@ void EmitStateLogLineLocked(RecorderState& st, uint64_t frame_id, uint64_t ts_us
         if (std::isfinite(gs.psi)) std::fprintf(st.state_fp, ",\"psi\":%.3f", gs.psi);
         if (gs.ammo_clip >= 0) std::fprintf(st.state_fp, ",\"ammo_clip\":%d", int(gs.ammo_clip));
         if (gs.ammo_reserve >= 0) std::fprintf(st.state_fp, ",\"ammo_reserve\":%d", int(gs.ammo_reserve));
+        if (gs.ammo_clip_size >= 0) std::fprintf(st.state_fp, ",\"ammo_clip_size\":%d", int(gs.ammo_clip_size));
+        if (gs.weapon_type >= 0) std::fprintf(st.state_fp, ",\"weapon_type\":%d", int(gs.weapon_type));
+    }
+    if (gs.has_player_actions) {
+        std::fprintf(st.state_fp,
+                     ",\"anim_state\":%u,\"psi_fn\":%u,\"psi_selected\":%d,\"lock_on_active\":%s,"
+                     "\"sniper_scoped\":%s,\"mkb_actions_fired\":%llu,\"mkb_reload_count\":%u",
+                     unsigned(gs.anim_state), unsigned(gs.psi_fn), int(gs.psi_selected),
+                     gs.lock_on_active ? "true" : "false", gs.sniper_scoped ? "true" : "false",
+                     (unsigned long long)gs.mkb_actions_fired, unsigned(gs.mkb_reload_count));
+        if (std::isfinite(gs.melee_timer) && gs.melee_timer >= 0.0f) {
+            std::fprintf(st.state_fp, ",\"melee_timer\":%.4f", gs.melee_timer);
+        }
     }
     if (gs.has_guest_invert_y) {
         std::fprintf(st.state_fp, ",\"guest_invert_y\":%s", gs.guest_invert_y ? "true" : "false");

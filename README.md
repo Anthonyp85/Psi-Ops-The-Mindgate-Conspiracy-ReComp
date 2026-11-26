@@ -17,7 +17,7 @@ A native **Windows x64** (D3D12 + XAudio2 + SDL3) and **Native Linux x86_64 / St
   - **6 Built-In Zero-DLL Spatial Upscalers (Windows D3D12 & Linux Vulkan 1.2):** `FSR 1.0` (default), `NVIDIA NIS v1.0.3`, `AMD CAS`, `Bicubic 5-Tap` (supports `>100%` SSAA), `Integer`, and `Bilinear`.
   - **3 Retail Vendor-Signed Temporal Upscalers (Windows D3D12, bundled in `plugins/`):** `NVIDIA DLSS 4` (Presets Auto/E/J/K & DLAA + automatic NGX driver-store fallback), `AMD FSR 3.1`, and `Intel XeSS 2` — driven by true `16:9` square-pixel rendering, Halton `(2,3)` camera jitter, `RG16F` motion vectors, and `R8_UNORM` HUD reactive masking (auto-bypassed on 2D menus, loading screens, and FMVs; gracefully falls back to `FSR 1.0` on Linux Vulkan or missing DLLs).
 - **Native-PC 1:1 Mouse & Keyboard + Multi-Vendor Controller Support:**
-  - `WM_INPUT` Raw Input (Windows) & `SDL_SetWindowRelativeMouseMode` (Linux) injected past the controller deadzone & slew filter with `1px` micro-aim precision, `0.000°` stop-drift, `dt`-independent sensitivity (`cm/360 @ 800 DPI`), decoupled PC Mouse Invert-Y, `Raw 1:1 Aim` auto-steer bypass, normalized `WASD` (`1.000`), queued `WheelUp`/`WheelDown` weapon cycling, direct `1–6` Psi power hotkeys, smart OS cursor capture/release, and portable OS-independent `settings.toml` bindings (`Primary` + `Secondary` slots across 22 actions).
+  - `WM_INPUT` Raw Input (Windows) & `SDL_SetWindowRelativeMouseMode` (Linux) injected past the controller deadzone & slew filter with `1px` micro-aim precision, `0.000°` stop-drift, `dt`-independent sensitivity (`cm/360 @ 800 DPI`), decoupled PC Mouse Invert-Y, `Raw 1:1 Aim` auto-steer bypass, normalized `WASD` (`1.000`), engine-level decoupled `InputManager` actions (`E` Interact/Pickup, `Space` Jump/Mantle, `Q`/`Mouse4` Melee, `LCtrl`/`C` Crouch, `LAlt` Wall Cover, `R`/`MMB` instant manual Reload / MC Secondary, `WheelUp`/`WheelDown` bidirectional Next/Prev Weapon & Sniper Zoom / TK Push-Pull, `RMB`/`V` Sniper Scope / Target Lock-On, `LShift`/`Mouse5` + `1–6` Psi powers, mouse-flick TK Throw, `G` TK Camera Control, `X` MC Head Pop), smart OS cursor capture/release, and portable OS-independent `settings.toml` bindings (`Primary` + `Secondary` slots across 25 actions).
   - Full SDL3 controller support (DualSense 5 / Edge with Touchpad-as-Back, Xbox, Switch, Steam Deck) with sustained rumble keepalive and deterministic `.rec` recording/replay.
 - **Cross-Hardware Performance & Frame Pacing:**
   - `NvOptimusEnablement` & `AmdPowerXpressRequestHighPerformance` exports, `--list-gpus` / `--gpu <idx>`, adaptive `16 / 32 / 64 MiB` upload rings, `32 MiB` GPU texture slab sub-allocators, per-VID/DID shader/PSO/metadata disk caches with parallel boot pre-warm & background async writes, `0` mid-frame GPU flushes, de-conflicted VRR/VSync pacing (`60/90/120/144/165 Hz`), RAM-bounded first-launch compilation (`~768 MiB`/slot), and binary-verified `60 FPS` (default) & `30 FPS` `1.00x` Havok simulation fidelity.
@@ -54,21 +54,27 @@ A native **Windows x64** (D3D12 + XAudio2 + SDL3) and **Native Linux x86_64 / St
 
 ## Controls
 
-| Action | Default M&K (Primary / Secondary) | Xbox / Gamepad (Config 1) |
+| Action | Default M&K (Primary / Secondary) | Engine Action / Xbox (Config 1) |
 |---|---|---|
-| Move | `W` `A` `S` `D` / Arrow Keys | Left Stick |
-| Aim / Look | Raw 1:1 Mouse | Right Stick |
-| Fire | `LMB` / `F` | Right Trigger (`RT`) |
-| Use Active Psi / Telekinesis | `LShift` / `Mouse5` / `1` | Left Trigger (`LT`) |
-| Target Lock-On / Sniper Scope | `RMB` / `V` | `Y` |
-| Direct Psi Powers (`TK`/`PK`/`MD`/`MC`/`RV`/`AV`) | `1` `2` `3` `4` `5` `6` | `LT` / `White` / `Black` / D-Pad |
-| Weapon Cycle / Sniper Zoom | `WheelUp` / `WheelDown` | D-Pad |
-| Interact / Crouch / Jump & Melee / Reload | `E` (`Enter`) / `LCtrl` (`C`) / `Space` (`Q`, `Mouse4`) / `R` (`MMB`) | `A` / `B` / `X` / `DPad Down` |
-| Pause / Back / Skip FMV | `Escape` (context-aware latched) | `Start` / `B` |
-| Objectives | `Tab` | `Back` (DualSense Touchpad) |
+| Move | `W` `A` `S` `D` / Arrow Keys | Left Stick (`0x01..0x04`, RV `0x09..0x0C`) |
+| Aim / Look / TK Throw | Raw 1:1 Mouse (flick on TK release throws) | Right Stick (`0x0D` TK Throw) |
+| Fire Weapon | `LMB` / `F` | Right Trigger (`RT`, `0x1A`/`0x1B`) |
+| Sniper Scope / Lock-On | `RMB` / `V` | `R3` Sniper Scope (`0x1D`) / `Y` Lock-On (`0x2B`/`0x2C`/`0x33`) |
+| Reload / MC Secondary | `R` / `MMB` | Instant Manual Reload / MC Secondary (`0x37`) |
+| Jump / Mantle | `Space` | Decoupled Jump / Mantle (`0x23`, never melees/interacts) |
+| Use / Interact / Pickup | `E` / `Enter` | Decoupled Interact (`0x1F`) & Ground Pickup (`0x1E`, never jumps) |
+| Melee Attack | `Q` / `Mouse4` | Decoupled Melee (`0x20`, never jumps) |
+| Crouch / Sneak | `LCtrl` / `C` | Crouch Toggle (`B`, `0x26`) |
+| Wall Cover / Peek | `LAlt` | Wall Move / Cover (`L3`, `0x36`) |
+| Next / Previous Weapon / Zoom | `WheelUp` / `WheelDown` | Next (`0x18`) / Prev (`0x19`), Sniper Zoom (`0x34`/`0x35`), TK Push/Pull (`0x05`/`0x06`) |
+| Use Active Psi Power | `LShift` / `Mouse5` | Casts / holds selected Psi power (`0x10`/`0x11` + `0x12..0x17`) |
+| Direct Psi Powers (`TK`/`PK`/`MD`/`MC`/`RV`/`AV`) | `1` `2` `3` `4` `5` `6` | Selects active Psi slot & casts/holds directly (`0x12..0x17`) |
+| TK Camera Control / MC Head Pop | `G` / Hold `X` (0.5s) | TK Camera (`0x2E`) / MC Suicide (`0x38`) |
+| Pause / Back / Skip FMV | `Escape` (context-aware latched) | `Start` (`0x80`) / `B` |
+| Mission Objectives | `Tab` | `Back` (`0x21`/`0x22`, DualSense Touchpad) |
 | Live Settings Overlay | `F1` | `Back + L3` |
 
-All 22 actions support 4-column Click-to-Rebind (`Primary` + `Secondary`) in both the Pre-Game Launcher and `F1` Overlay, stored portably in `settings.toml` under `[controls]` and `[controls.bindings]`.
+All 25 actions support 4-column Click-to-Rebind (`Primary` + `Secondary`) in both the Pre-Game Launcher and `F1` Overlay, stored portably in `settings.toml` under `[controls]` and `[controls.bindings]`. M&K mappings are decoupled directly inside Psi-Ops's `InputManager` regardless of the in-game Xbox Control Config (`1`/`2`/`3`), while Controller mode and `.rec` replays remain 100% untouched.
 
 ---
 

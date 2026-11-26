@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -47,6 +48,11 @@ std::atomic<uint32_t> g_saved_look_spring{1u};
 std::atomic<float> g_pending_tk_pitch{0.0f};
 // Exact live Camera* VA observed in Camera::ApplyManualAim (shared with game_info.cpp telemetry).
 std::atomic<uint32_t> g_live_camera_va{0u};
+// True while Nick holds the Sniper Rifle ([wpn+0x10]==3) or is actively sniper-scoped (shared with AutoSteer bypass).
+std::atomic<bool> g_im_sniper_weapon_or_scoped{false};
+// Telemetry accumulated from Hook_InputManagerGetActionValue / Hook_InputManagerUpdate for --state-log.
+std::atomic<uint64_t> g_mkb_actions_fired_mask{0u};
+std::atomic<uint32_t> g_mkb_reload_count{0u};
 
 void SyncLookSpring(uint8_t* base, bool mkb_active) {
     constexpr uint32_t kLookSpringVa = 0x005ECEB8u;
@@ -188,9 +194,13 @@ void Hook_UpdateTKPitch(X86Context& ctx, uint8_t* base) {
 // Camera::AutoSteerToPoint @ 0x0004F4F0 (with on_true = "ret" -> ret 0x1C).
 // ABI at entry: ecx = Camera*, [esp+4] = speed, [esp+8..0x14] = vec4 tgt,
 //               [esp+0x18] = float* out_yaw, [esp+0x1C] = float* out_pitch.
-// When M&K is active with Raw 1:1 Aim enabled, zeroes *out_yaw/*out_pitch and returns early to bypass auto-steer.
+// When M&K is active with Raw 1:1 Aim enabled, zeroes *out_yaw/*out_pitch and returns early to bypass auto-steer
+// (except while the player explicitly holds RMB/V Target Lock-On on a non-sniper weapon).
 bool Hook_CameraAutoSteerBypass(X86Context& ctx, uint8_t* base) {
     if (input_rec::ShouldBypassMkb() || !mkb::IsMkbActiveForGameplay() || !mkb::IsRawAimEnabled()) {
+        return false;
+    }
+    if (mkb::IsActionHeld(mkb::Action::FineAim) && !g_im_sniper_weapon_or_scoped.load(std::memory_order_relaxed)) {
         return false;
     }
     if (mem::IsCommitted(ctx.esp + 0x18u) && mem::IsCommitted(ctx.esp + 0x1Cu)) {
@@ -897,4 +907,460 @@ void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
         CallSendUiEvent(ctx, base, ui_mgr, kUiEvtConfirm);
         mkb::PulseMenuPad(true, false, false);
     }
+}
+
+namespace {
+
+constexpr uint32_t kInputMgrSingletonVa = 0x005EC518u;
+constexpr uint32_t kVtblShotgun = 0x004F9650u;
+constexpr uint32_t kPsiFnTkHold = 0x00116BE0u;
+constexpr uint32_t kPsiFnRvFly = 0x00115C80u;
+
+struct GuestMkbInputFrame {
+    bool valid = false;
+    bool held[size_t(mkb::Action::Count)] = {};
+    bool prev_held[size_t(mkb::Action::Count)] = {};
+    bool edge[size_t(mkb::Action::Count)] = {};
+    int32_t wheel_delta = 0;
+    bool any_input = false;
+    float wasd_x = 0.0f;
+    float wasd_y = 0.0f;
+    float recent_flick_peak = 0.0f;
+    float recent_flick_disp = 0.0f;
+
+    int sniper_zoom_in_frames = 0;
+    int sniper_zoom_out_frames = 0;
+    int tk_push_frames = 0;
+    int tk_pull_frames = 0;
+
+    std::chrono::steady_clock::time_point mc_explode_start{};
+    bool mc_explode_holding = false;
+    bool mc_explode_ready = false;
+
+    int selected_psi = 0;
+    bool user_selected_psi = false;
+
+    std::chrono::steady_clock::time_point last_reload_tp{};
+    bool has_reloaded_once = false;
+
+    uint32_t player = 0u;
+    uint32_t wpn = 0u;
+    uint32_t wpn_type = 0u;
+    uint32_t psi_fn = 0u;
+    uint32_t ground_wpn = 0u;
+    uint32_t mc_puppet = 0u;
+    uint32_t turret_ptr = 0u;
+    bool sniper_scoped = false;
+};
+
+GuestMkbInputFrame g_im{};
+
+int ParsePsiPowerTag(const uint8_t* base, uint32_t str_va) {
+    if (!SafeAddr(str_va, 3u)) return -1;
+    char c0 = char(ReadU8(base, str_va));
+    char c1 = char(ReadU8(base, str_va + 1u));
+    if (c0 == 'T' && c1 == 'K') return 0;
+    if (c0 == 'P' && c1 == 'K') return 1;
+    if (c0 == 'M' && c1 == 'D') return 2;
+    if (c0 == 'M' && c1 == 'C') return 3;
+    if (c0 == 'R' && c1 == 'V') return 4;
+    if (c0 == 'A' && c1 == 'V') return 5;
+    return -1;
+}
+
+void CallWeaponReloadOnce(X86Context& ctx, uint8_t* base, uint32_t wpn, uint32_t reload_fn) {
+    if (!SafeAddr(ctx.esp - 0x40u, 0x40u)) return;
+    X86Context saved = ctx;
+    ctx.ecx = wpn;
+    ctx.esp -= 4u;
+    WriteU32(base, ctx.esp, 0xFFFFFFF0u);  // dummy return address (Weapon::Reload is __thiscall ret 0)
+    x86_icall(ctx, base, reload_fn);
+    ctx = saved;
+}
+
+void TryManualWeaponReload(X86Context& ctx, uint8_t* base) {
+    using namespace std::chrono;
+    if (!g_im.wpn || !SafeAddr(g_im.wpn, 0x54u)) return;
+    const auto now = steady_clock::now();
+    if (g_im.has_reloaded_once && duration_cast<milliseconds>(now - g_im.last_reload_tp).count() < 400) {
+        return;
+    }
+
+    uint32_t vtbl = ReadU32(base, g_im.wpn);
+    if (!SafeAddr(vtbl + 0x1Cu, 4u)) return;
+    uint32_t reload_fn = ReadU32(base, vtbl + 0x1Cu);
+    if (reload_fn < 0x00011000u || reload_fn >= 0x004D0000u) return;
+
+    int32_t clip = int32_t(ReadU32(base, g_im.wpn + 0x48u));
+    int32_t clip_size = int32_t(ReadU32(base, g_im.wpn + 0x4Cu));
+    uint32_t store = ReadU32(base, g_im.wpn + 0x44u);
+    uint8_t inf_ammo = ReadU8(base, g_im.wpn + 0x50u);
+    int32_t reserve = (store && SafeAddr(store, 4u)) ? int32_t(ReadU32(base, store)) : -1;
+
+    if (clip < 0 || clip_size <= 0 || clip_size >= 1000 || clip >= clip_size) return;
+    if (inf_ammo == 0u && store != 0u && reserve <= 0) return;
+
+    if (vtbl == kVtblShotgun) {
+        // Shotgun::Reload (0x000C9990) loads 2 shells per call -> loop cleanly to full clip or empty reserve.
+        for (int iter = 0; iter < 8; ++iter) {
+            int32_t before = int32_t(ReadU32(base, g_im.wpn + 0x48u));
+            int32_t res_now = (store && SafeAddr(store, 4u)) ? int32_t(ReadU32(base, store)) : 1;
+            if (before >= clip_size || (inf_ammo == 0u && store != 0u && res_now <= 0)) break;
+            CallWeaponReloadOnce(ctx, base, g_im.wpn, reload_fn);
+            int32_t after = int32_t(ReadU32(base, g_im.wpn + 0x48u));
+            if (after <= before) break;
+        }
+    } else {
+        CallWeaponReloadOnce(ctx, base, g_im.wpn, reload_fn);
+    }
+
+    g_im.last_reload_tp = now;
+    g_im.has_reloaded_once = true;
+    g_mkb_reload_count.fetch_add(1u, std::memory_order_relaxed);
+}
+
+}  // namespace
+
+uint64_t PsiOpsConsumeMkbActionsFired() { return g_mkb_actions_fired_mask.exchange(0u, std::memory_order_acq_rel); }
+
+uint32_t PsiOpsGetMkbReloadCount() { return g_mkb_reload_count.load(std::memory_order_acquire); }
+
+// InputManager::Update @ 0x00294130 (edi = InputManager*, single ret @ 0x294154).
+// Snapshots decoupled M&K state once per guest frame, computes 1-frame rising edges,
+// updates active Psi slot (1..6) + wheel zoom/push latches, and executes manual Weapon::Reload on R tap.
+void Hook_InputManagerUpdate(X86Context& ctx, uint8_t* base) {
+    using mkb::Action;
+    if (input_rec::ShouldBypassMkb()) {
+        g_im.valid = false;
+        g_im_sniper_weapon_or_scoped.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    mkb::GameplayInputSnapshot snap{};
+    mkb::PollGameplayInput(snap);
+
+    for (size_t i = 0; i < size_t(Action::Count); ++i) {
+        g_im.held[i] = snap.held[i];
+        g_im.edge[i] = snap.held[i] && !g_im.prev_held[i];
+        g_im.prev_held[i] = snap.held[i];
+    }
+    g_im.wheel_delta = snap.wheel_delta;
+    g_im.any_input = snap.any_key_or_mouse;
+    g_im.wasd_x = snap.wasd_x;
+    g_im.wasd_y = snap.wasd_y;
+    g_im.recent_flick_peak = snap.recent_flick_peak;
+    g_im.recent_flick_disp = snap.recent_flick_disp;
+
+    uint32_t im = ctx.edi;
+    if (!SafeAddr(im, 0x28u)) im = kInputMgrSingletonVa;
+    uint32_t mode = SafeAddr(im + 0x14u, 4u) ? ReadU32(base, im + 0x14u) : 0u;
+    uint32_t override_cnt = SafeAddr(im + 0x24u, 4u) ? ReadU32(base, im + 0x24u) : 0u;
+
+    g_im.valid = snap.mkb_active && !snap.overlay_open && (mode == 2u || mode == 3u || mode == 4u) &&
+                 (override_cnt == 0u);
+    if (!g_im.valid) {
+        g_im.sniper_zoom_in_frames = 0;
+        g_im.sniper_zoom_out_frames = 0;
+        g_im.tk_push_frames = 0;
+        g_im.tk_pull_frames = 0;
+        g_im.mc_explode_holding = false;
+        g_im.mc_explode_ready = false;
+        g_im_sniper_weapon_or_scoped.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    // Read binary-verified live Player / Weapon / PsiManager / Camera context
+    g_im.player = 0u;
+    g_im.wpn = 0u;
+    g_im.wpn_type = 0u;
+    g_im.psi_fn = 0u;
+    g_im.ground_wpn = 0u;
+    g_im.mc_puppet = 0u;
+    g_im.turret_ptr = 0u;
+    g_im.sniper_scoped = false;
+
+    uint32_t app = SafeAddr(0x00586A04u, 4u) ? ReadU32(base, 0x00586A04u) : 0u;
+    if (app && SafeAddr(app + 0xD0u, 4u)) {
+        g_im.player = ReadU32(base, app + 0xD0u);
+    }
+    uint32_t psi_mgr = 0u;
+    if (g_im.player && SafeAddr(g_im.player, 0x870u)) {
+        uint32_t wpn = ReadU32(base, g_im.player + 0x6FCu);
+        if (!wpn) {
+            uint32_t holder = ReadU32(base, g_im.player + 0x788u);
+            if (holder && SafeAddr(holder + 0x4u, 4u)) wpn = ReadU32(base, holder + 0x4u);
+        }
+        g_im.wpn = wpn;
+        if (wpn && SafeAddr(wpn, 0x14u)) {
+            g_im.wpn_type = ReadU32(base, wpn + 0x10u);
+        }
+        psi_mgr = ReadU32(base, g_im.player + 0x6F4u);
+        if (psi_mgr && SafeAddr(psi_mgr, 8u)) {
+            g_im.psi_fn = ReadU32(base, psi_mgr + 0x4u);
+        }
+        g_im.ground_wpn = ReadU32(base, g_im.player + 0x74Cu);
+        g_im.mc_puppet = ReadU32(base, g_im.player + 0x764u);
+        g_im.turret_ptr = ReadU32(base, g_im.player + 0x854u);
+    }
+
+    uint32_t cam = PsiOpsLiveCameraVa();
+    if (cam && SafeAddr(cam + 0x37Cu, 4u)) {
+        float sniper_timer = ReadF32(base, cam + 0x37Cu);
+        g_im.sniper_scoped = std::isfinite(sniper_timer) && sniper_timer > 0.8f;
+    }
+    g_im_sniper_weapon_or_scoped.store(g_im.wpn_type == 3u || g_im.sniper_scoped, std::memory_order_relaxed);
+
+    // Sync active Psi slot (0..5: TK/PK/MD/MC/RV/AV) for LShift/Mouse5 PsiUse
+    if (!g_im.user_selected_psi && psi_mgr && SafeAddr(psi_mgr + 0x158u, 0x38u)) {
+        uint32_t idx = ReadU32(base, psi_mgr + 0x158u);
+        if (idx < 6u) {
+            uint32_t tag_va = ReadU32(base, psi_mgr + 0x160u + idx * 8u);
+            int parsed = ParsePsiPowerTag(base, tag_va);
+            if (parsed >= 0) {
+                g_im.selected_psi = parsed;
+                mkb::SetSelectedPsiIndex(parsed);
+            }
+        }
+    }
+    for (int k = 0; k < 6; ++k) {
+        if (g_im.edge[size_t(Action::PsiTk) + size_t(k)]) {
+            g_im.selected_psi = k;
+            g_im.user_selected_psi = true;
+            mkb::SetSelectedPsiIndex(k);
+        }
+    }
+
+    // Multi-frame wheel latches for held-mode Sniper Zoom (0x34/0x35) and TK Push/Pull (0x05/0x06)
+    if (g_im.sniper_zoom_in_frames > 0) --g_im.sniper_zoom_in_frames;
+    if (g_im.sniper_zoom_out_frames > 0) --g_im.sniper_zoom_out_frames;
+    if (g_im.tk_push_frames > 0) --g_im.tk_push_frames;
+    if (g_im.tk_pull_frames > 0) --g_im.tk_pull_frames;
+
+    if (g_im.sniper_scoped) {
+        g_im.tk_push_frames = 0;
+        g_im.tk_pull_frames = 0;
+        if (g_im.wheel_delta > 0) {
+            g_im.sniper_zoom_in_frames = 6;
+            g_im.sniper_zoom_out_frames = 0;
+        } else if (g_im.wheel_delta < 0) {
+            g_im.sniper_zoom_out_frames = 6;
+            g_im.sniper_zoom_in_frames = 0;
+        }
+    } else if (g_im.psi_fn == kPsiFnTkHold) {
+        g_im.sniper_zoom_in_frames = 0;
+        g_im.sniper_zoom_out_frames = 0;
+        if (g_im.wheel_delta > 0) {
+            g_im.tk_push_frames = 5;
+            g_im.tk_pull_frames = 0;
+        } else if (g_im.wheel_delta < 0) {
+            g_im.tk_pull_frames = 5;
+            g_im.tk_push_frames = 0;
+        }
+    } else {
+        g_im.sniper_zoom_in_frames = 0;
+        g_im.sniper_zoom_out_frames = 0;
+        g_im.tk_push_frames = 0;
+        g_im.tk_pull_frames = 0;
+    }
+
+    // MC Head-Pop (0x38) 500ms hold guard so tapping X never kills a mind-controlled puppet by accident
+    if (g_im.mc_puppet != 0u && g_im.held[size_t(Action::McExplode)]) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!g_im.mc_explode_holding) {
+            g_im.mc_explode_holding = true;
+            g_im.mc_explode_start = now;
+        }
+        g_im.mc_explode_ready =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - g_im.mc_explode_start).count() >= 500;
+    } else {
+        g_im.mc_explode_holding = false;
+        g_im.mc_explode_ready = false;
+    }
+
+    // Instant Manual Weapon Reload on Action::Reload rising edge (never switches weapons!)
+    if (g_im.edge[size_t(Action::Reload)] && g_im.mc_puppet == 0u && g_im.turret_ptr == 0u &&
+        g_im.psi_fn != kPsiFnRvFly && g_im.psi_fn != kPsiFnTkHold) {
+        TryManualWeaponReload(ctx, base);
+    }
+}
+
+// InputManager::GetActionValue @ 0x00294160 (with on_true = "ret" -> ret 4).
+// ABI: esi = InputManager*, [esp+4] = uint32_t action_id, returns float in x87 st(0).
+// Decouples every PC M&K gameplay action cleanly regardless of Xbox Config 1/2/3 while
+// passing through 100% untouched for Controller mode, .rec replays, UI/menus, and script overrides.
+bool Hook_InputManagerGetActionValue(X86Context& ctx, uint8_t* base) {
+    using mkb::Action;
+    if (input_rec::ShouldBypassMkb() || !mkb::IsMkbActiveForGameplay() || mkb::IsOverlayOpen()) return false;
+    if (!g_im.valid) return false;
+
+    uint32_t im = ctx.esi;
+    if (!SafeAddr(im, 0x28u)) im = kInputMgrSingletonVa;
+    if (!SafeAddr(im, 0x28u)) return false;
+    uint32_t mode = ReadU32(base, im + 0x14u);
+    if (mode != 2u && mode != 3u && mode != 4u) return false;
+    if (ReadU32(base, im + 0x24u) != 0u) return false;
+    if (!SafeAddr(ctx.esp + 0x4u, 4u)) return false;
+
+    uint32_t action_id = ReadU32(base, ctx.esp + 0x4u);
+    float val = 0.0f;
+
+    switch (action_id) {
+        case 0x00u:  // Break Free (Grab Wiggle)
+            val = (g_im.edge[size_t(Action::MoveLeft)] || g_im.edge[size_t(Action::MoveRight)] ||
+                   g_im.edge[size_t(Action::Jump)])
+                      ? 1.0f
+                      : 0.0f;
+            break;
+        case 0x01u:  // Move Forward
+        case 0x09u:  // Remote View Move Forward
+            val = std::max(0.0f, g_im.wasd_y);
+            break;
+        case 0x02u:  // Move Backward
+        case 0x0Au:  // Remote View Move Backward
+            val = std::max(0.0f, -g_im.wasd_y);
+            break;
+        case 0x03u:  // Strafe Left
+        case 0x0Bu:  // Remote View Strafe Left
+            val = std::max(0.0f, -g_im.wasd_x);
+            break;
+        case 0x04u:  // Strafe Right
+        case 0x0Cu:  // Remote View Strafe Right
+            val = std::max(0.0f, g_im.wasd_x);
+            break;
+        case 0x05u:  // TK Hold Push Away (WheelUp)
+            val = (g_im.psi_fn == kPsiFnTkHold && g_im.tk_push_frames > 0) ? 1.0f : 0.0f;
+            break;
+        case 0x06u:  // TK Hold Pull Closer (WheelDown)
+            val = (g_im.psi_fn == kPsiFnTkHold && g_im.tk_pull_frames > 0) ? 1.0f : 0.0f;
+            break;
+        case 0x07u:  // Psi Aim Left (handled by raw mouse hooks)
+        case 0x08u:  // Psi Aim Right
+            val = 0.0f;
+            break;
+        case 0x0Du:  // TK Throw / Flick during 0.15s release window (0x00117380)
+            val = (g_im.recent_flick_peak >= 8.0f || g_im.recent_flick_disp >= 20.0f) ? 1.0f : 0.0f;
+            break;
+        case 0x0Eu:  // Psi Force-Cancel (unbound in SP)
+            val = 0.0f;
+            break;
+        case 0x10u:  // Use Psi (Held)
+            val = (g_im.held[size_t(Action::PsiUse)] || g_im.held[size_t(Action::PsiTk)] ||
+                   g_im.held[size_t(Action::PsiPk)] || g_im.held[size_t(Action::PsiMd)] ||
+                   g_im.held[size_t(Action::PsiMc)] || g_im.held[size_t(Action::PsiRv)] ||
+                   g_im.held[size_t(Action::PsiAv)])
+                      ? 1.0f
+                      : 0.0f;
+            break;
+        case 0x11u:  // Use Psi (Edge / Cast / Exit MC, RV, AV)
+            val = (g_im.edge[size_t(Action::PsiUse)] || g_im.edge[size_t(Action::PsiTk)] ||
+                   g_im.edge[size_t(Action::PsiPk)] || g_im.edge[size_t(Action::PsiMd)] ||
+                   g_im.edge[size_t(Action::PsiMc)] || g_im.edge[size_t(Action::PsiRv)] ||
+                   g_im.edge[size_t(Action::PsiAv)])
+                      ? 1.0f
+                      : 0.0f;
+            break;
+        case 0x12u:  // Psi: TK
+        case 0x13u:  // Psi: PK
+        case 0x14u:  // Psi: MD
+        case 0x15u:  // Psi: MC
+        case 0x16u:  // Psi: RV
+        case 0x17u: {  // Psi: AV
+            const int idx = int(action_id - 0x12u);
+            val = (g_im.held[size_t(Action::PsiTk) + size_t(idx)] ||
+                   (g_im.held[size_t(Action::PsiUse)] && g_im.selected_psi == idx))
+                      ? 1.0f
+                      : 0.0f;
+            break;
+        }
+        case 0x18u:  // Next Weapon (never triggered by Reload R!)
+            val = (!g_im.sniper_scoped && g_im.psi_fn != kPsiFnTkHold && g_im.edge[size_t(Action::WeaponNext)]) ? 1.0f
+                                                                                                                : 0.0f;
+            break;
+        case 0x19u:  // Previous Weapon (engine-native 0x0FC970, never triggered by Reload R!)
+            val = (!g_im.sniper_scoped && g_im.psi_fn != kPsiFnTkHold && g_im.edge[size_t(Action::WeaponPrev)]) ? 1.0f
+                                                                                                                : 0.0f;
+            break;
+        case 0x1Au:  // Fire Weapon (Held)
+            val = g_im.held[size_t(Action::Fire)] ? 1.0f : 0.0f;
+            break;
+        case 0x1Bu:  // Fire Weapon (Edge)
+            val = g_im.edge[size_t(Action::Fire)] ? 1.0f : 0.0f;
+            break;
+        case 0x1Du:  // Sniper Scope Toggle (only when holding Sniper Rifle [wpn+0x10]==3 or scoped)
+            val = ((g_im.wpn_type == 3u || g_im.sniper_scoped) && g_im.edge[size_t(Action::FineAim)]) ? 1.0f : 0.0f;
+            break;
+        case 0x1Eu:  // Pick Up Ground Weapon (E when standing over droppable weapon [player+0x74C]!=0)
+            val = (g_im.ground_wpn != 0u && g_im.edge[size_t(Action::Interact)]) ? 1.0f : 0.0f;
+            break;
+        case 0x1Fu:  // Interact / Use / Ladder / Turret ONLY (NEVER triggers Jump 0x23!)
+            val = g_im.edge[size_t(Action::Interact)] ? 1.0f : 0.0f;
+            break;
+        case 0x20u:  // Melee Attack ONLY (NEVER triggered by Space!)
+            val = g_im.edge[size_t(Action::Melee)] ? 1.0f : 0.0f;
+            break;
+        case 0x21u:  // Open Mission Objectives (Tab)
+            val = g_im.edge[size_t(Action::Objectives)] ? 1.0f : 0.0f;
+            break;
+        case 0x23u:  // Jump / Climb / Mantle / Vault ONLY (NEVER triggers Melee 0x20 or Interact 0x1F!)
+            val = g_im.edge[size_t(Action::Jump)] ? 1.0f : 0.0f;
+            break;
+        case 0x26u:  // Crouch / Sneak Toggle (LCtrl / C)
+            val = g_im.edge[size_t(Action::Crouch)] ? 1.0f : 0.0f;
+            break;
+        case 0x27u:  // Camera Look Right (handled 1:1 by Hook_CameraApplyManualAim)
+        case 0x28u:  // Camera Look Left
+        case 0x29u:  // Camera Look Up
+        case 0x2Au:  // Camera Look Down
+            val = 0.0f;
+            break;
+        case 0x2Bu:  // Target Lock-On / Strafe (Held, non-sniper weapons)
+            val = ((g_im.wpn_type != 3u && !g_im.sniper_scoped) && g_im.held[size_t(Action::FineAim)]) ? 1.0f : 0.0f;
+            break;
+        case 0x2Cu:  // Target Lock-On (Edge)
+        case 0x33u:  // Target Lock-On Strafe (Edge)
+            val = ((g_im.wpn_type != 3u && !g_im.sniper_scoped) && g_im.edge[size_t(Action::FineAim)]) ? 1.0f : 0.0f;
+            break;
+        case 0x2Eu:  // TK Camera Control Toggle (G during TK Hold)
+            val = (g_im.psi_fn == kPsiFnTkHold && g_im.edge[size_t(Action::TkCamControl)]) ? 1.0f : 0.0f;
+            break;
+        case 0x34u:  // Sniper Scope Zoom In (WheelUp / WeaponNext while scoped)
+            val = (g_im.sniper_scoped && (g_im.held[size_t(Action::WeaponNext)] || g_im.sniper_zoom_in_frames > 0))
+                      ? 1.0f
+                      : 0.0f;
+            break;
+        case 0x35u:  // Sniper Scope Zoom Out (WheelDown / WeaponPrev while scoped)
+            val = (g_im.sniper_scoped && (g_im.held[size_t(Action::WeaponPrev)] || g_im.sniper_zoom_out_frames > 0))
+                      ? 1.0f
+                      : 0.0f;
+            break;
+        case 0x36u:  // Wall Move / Wall Cover (LAlt)
+            val = g_im.edge[size_t(Action::WallMove)] ? 1.0f : 0.0f;
+            break;
+        case 0x37u:  // MC Puppet Secondary Attack / Grenade (R/MMB held while in Mind Control)
+            val = (g_im.mc_puppet != 0u && g_im.held[size_t(Action::Reload)]) ? 1.0f : 0.0f;
+            break;
+        case 0x38u:  // MC Head-Explode / Suicide (X held >= 0.5s while in Mind Control)
+            val = (g_im.mc_puppet != 0u && g_im.mc_explode_ready) ? 1.0f : 0.0f;
+            break;
+        case 0x7Fu:  // Skip Cutscene / QuickTip / Credits
+            val = (g_im.edge[size_t(Action::Jump)] || g_im.edge[size_t(Action::Interact)] ||
+                   g_im.edge[size_t(Action::Pause)])
+                      ? 1.0f
+                      : 0.0f;
+            break;
+        case 0x80u:  // Pause Menu (Escape)
+            val = g_im.edge[size_t(Action::Pause)] ? 1.0f : 0.0f;
+            break;
+        case 0x86u:  // Idle Timer Reset
+            val = g_im.any_input ? 1.0f : 0.0f;
+            break;
+        default:
+            return false;
+    }
+
+    if (val > 0.0f && action_id < 64u) {
+        g_mkb_actions_fired_mask.fetch_or(1ull << action_id, std::memory_order_relaxed);
+    }
+    x87_push(ctx, double(val));
+    return true;
 }

@@ -97,21 +97,24 @@ constexpr ActionMeta kActionTable[] = {
     {Action::MoveLeft, "move_left", "Strafe Left", KeyCode::A, KeyCode::Left},
     {Action::MoveRight, "move_right", "Strafe Right", KeyCode::D, KeyCode::Right},
     {Action::Fire, "fire", "Fire Weapon", KeyCode::MouseLeft, KeyCode::F},
-    {Action::FineAim, "fine_aim", "Fine Aim / Zoom", KeyCode::MouseRight, KeyCode::V},
-    {Action::Reload, "reload", "Reload", KeyCode::R, KeyCode::MouseMiddle},
+    {Action::FineAim, "fine_aim", "Sniper Scope / Lock-On", KeyCode::MouseRight, KeyCode::V},
+    {Action::Reload, "reload", "Reload / MC Secondary", KeyCode::R, KeyCode::MouseMiddle},
     {Action::Jump, "jump", "Jump / Mantle", KeyCode::Space, KeyCode::None},
     {Action::Crouch, "crouch", "Crouch / Sneak", KeyCode::LCtrl, KeyCode::C},
-    {Action::Interact, "interact", "Use / Interact", KeyCode::E, KeyCode::Enter},
-    {Action::Melee, "melee", "Melee", KeyCode::Q, KeyCode::Mouse4},
-    {Action::PsiUse, "psi_use", "Use Psi Power", KeyCode::LShift, KeyCode::Mouse5},
-    {Action::WeaponNext, "weapon_next", "Next Weapon", KeyCode::WheelUp, KeyCode::None},
-    {Action::WeaponPrev, "weapon_prev", "Previous Weapon", KeyCode::WheelDown, KeyCode::None},
+    {Action::WallMove, "wall_move", "Wall Cover / Peek", KeyCode::LAlt, KeyCode::None},
+    {Action::Interact, "interact", "Use / Interact / Pickup", KeyCode::E, KeyCode::Enter},
+    {Action::Melee, "melee", "Melee Attack", KeyCode::Q, KeyCode::Mouse4},
+    {Action::PsiUse, "psi_use", "Use Active Psi Power", KeyCode::LShift, KeyCode::Mouse5},
+    {Action::WeaponNext, "weapon_next", "Next Weapon / Zoom In", KeyCode::WheelUp, KeyCode::None},
+    {Action::WeaponPrev, "weapon_prev", "Prev Weapon / Zoom Out", KeyCode::WheelDown, KeyCode::None},
     {Action::PsiTk, "psi_tk", "Psi: Telekinesis (TK)", KeyCode::Num1, KeyCode::None},
     {Action::PsiPk, "psi_pk", "Psi: Pyrokinesis (PK)", KeyCode::Num2, KeyCode::None},
     {Action::PsiMd, "psi_md", "Psi: Mind Drain (MD)", KeyCode::Num3, KeyCode::None},
     {Action::PsiMc, "psi_mc", "Psi: Mind Control (MC)", KeyCode::Num4, KeyCode::None},
     {Action::PsiRv, "psi_rv", "Psi: Remote View (RV)", KeyCode::Num5, KeyCode::None},
     {Action::PsiAv, "psi_av", "Psi: Aura View (AV)", KeyCode::Num6, KeyCode::None},
+    {Action::TkCamControl, "tk_cam_control", "TK Camera Control", KeyCode::G, KeyCode::None},
+    {Action::McExplode, "mc_explode", "MC Head Pop (Hold)", KeyCode::X, KeyCode::None},
     {Action::Pause, "pause", "Pause / Back", KeyCode::Escape, KeyCode::None},
     {Action::Objectives, "objectives", "Mission Objectives", KeyCode::Tab, KeyCode::None},
 };
@@ -282,13 +285,25 @@ struct MkbState {
 
     // Queued wheel pulses (+1 / -1) and context-aware latched Esc edge
     std::deque<int32_t> wheel_queue;
+    std::deque<int32_t> gameplay_wheel_queue;
+    int32_t prev_gameplay_wheel_dir = 0;
     int32_t active_wheel_dir = 0;
     int wheel_hold_frames = 0;
     bool prev_esc_down = false;
     bool esc_edge_pending = false;
     int esc_hold_frames = 0;
+    perf::Phase prev_present_phase = perf::Phase::TitleMenu;
     bool prev_psi_down[6] = {};
     std::atomic<int> pending_direct_psi{-1};
+    std::atomic<int> selected_psi_idx{0};
+
+    // Short sliding window of consumed raw mouse deltas for TK Throw flick detection (0x0D)
+    struct MouseFlickSample {
+        std::chrono::steady_clock::time_point tp{};
+        int32_t dx = 0;
+        int32_t dy = 0;
+    };
+    std::deque<MouseFlickSample> mouse_flick_history;
 
     // Click-to-rebind UI state
     int rebind_action = -1;
@@ -1461,9 +1476,9 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                 if (!handle_rebind_key(wk)) {
                     std::lock_guard<std::mutex> lk(st.lock);
                     if (st.cursor_captured.load(std::memory_order_acquire)) {
-                        if (st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::GameplayActive &&
-                            st.wheel_queue.size() < 8) {
-                            st.wheel_queue.push_back(notches);
+                        if (st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::GameplayActive) {
+                            if (st.wheel_queue.size() < 8) st.wheel_queue.push_back(notches);
+                            if (st.gameplay_wheel_queue.size() < 8) st.gameplay_wheel_queue.push_back(notches);
                         }
                     } else if (!st.cursor_should_hide.load(std::memory_order_acquire) &&
                                !st.overlay_open.load(std::memory_order_acquire)) {
@@ -1773,9 +1788,9 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                 if (!handle_rebind_key(wk)) {
                     std::lock_guard<std::mutex> lk(st.lock);
                     if (st.cursor_captured.load(std::memory_order_acquire)) {
-                        if (st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::GameplayActive &&
-                            st.wheel_queue.size() < 8) {
-                            st.wheel_queue.push_back(notches);
+                        if (st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::GameplayActive) {
+                            if (st.wheel_queue.size() < 8) st.wheel_queue.push_back(notches);
+                            if (st.gameplay_wheel_queue.size() < 8) st.gameplay_wheel_queue.push_back(notches);
                         }
                     } else if (!st.cursor_should_hide.load(std::memory_order_acquire) &&
                                !st.overlay_open.load(std::memory_order_acquire)) {
@@ -1942,6 +1957,7 @@ void OnPadPoll(int port, input::Pad& pad) {
         bool down = act.held[size_t(kPsiActs[i])];
         if (down && !st.prev_psi_down[i]) {
             st.pending_direct_psi.store(i, std::memory_order_release);
+            st.selected_psi_idx.store(i, std::memory_order_release);
         }
         st.prev_psi_down[i] = down;
     }
@@ -1986,6 +2002,15 @@ void OnPresent(uint64_t /*present_frame*/, perf::Phase phase, bool modal_ui_open
         st.cur_phase.store(phase, std::memory_order_relaxed);
         st.cur_modal_ui.store(modal_ui_open, std::memory_order_relaxed);
         st.cur_non_pointer_modal.store(non_pointer_modal, std::memory_order_relaxed);
+        if (phase != st.prev_present_phase) {
+            // Clear latched Esc pulse across phase boundaries so Pause <-> Gameplay never double-toggles.
+            st.esc_hold_frames = 0;
+            if (phase != perf::Phase::GameplayActive) {
+                st.gameplay_wheel_queue.clear();
+                st.prev_gameplay_wheel_dir = 0;
+            }
+            st.prev_present_phase = phase;
+        }
 
         // Discard any raw mouse delta outside active 3D gameplay so cursor motion during FMV/Loading/Pause
         // never snaps the camera on the first frame of gameplay.
@@ -2047,6 +2072,7 @@ void OnPresent(uint64_t /*present_frame*/, perf::Phase phase, bool modal_ui_open
                         MarkMkbActivity(st);
                         if (st.cursor_captured.load(std::memory_order_acquire)) {
                             if (st.wheel_queue.size() < 8) st.wheel_queue.push_back(we.delta);
+                            if (st.gameplay_wheel_queue.size() < 8) st.gameplay_wheel_queue.push_back(we.delta);
                         } else if (!st.overlay_open.load(std::memory_order_acquire)) {
                             st.ui_wheel_pending += we.delta;
                         }
@@ -2222,6 +2248,19 @@ bool ConsumeCameraMouseDelta(float& out_d_yaw_rad, float& out_d_pitch_rad, int32
     st.frame_d_pitch += dpitch;
     st.frame_mouse_consumed_by_hook = true;
 
+    if (dx64 != 0 || dy64 != 0) {
+        const auto now = std::chrono::steady_clock::now();
+        st.mouse_flick_history.push_back({now, int32_t(dx64), int32_t(dy64)});
+        while (st.mouse_flick_history.size() > 32) {
+            st.mouse_flick_history.pop_front();
+        }
+        while (!st.mouse_flick_history.empty() &&
+               std::chrono::duration_cast<std::chrono::milliseconds>(now - st.mouse_flick_history.front().tp).count() >
+                   150) {
+            st.mouse_flick_history.pop_front();
+        }
+    }
+
     out_d_yaw_rad = dyaw;
     out_d_pitch_rad = dpitch;
     if (out_dx) *out_dx = int32_t(dx64);
@@ -2230,6 +2269,108 @@ bool ConsumeCameraMouseDelta(float& out_d_yaw_rad, float& out_d_pitch_rad, int32
 }
 
 int ConsumeDirectPsiSelect() { return St().pending_direct_psi.exchange(-1, std::memory_order_acq_rel); }
+
+int GetSelectedPsiIndex() { return std::clamp(St().selected_psi_idx.load(std::memory_order_acquire), 0, 5); }
+
+void SetSelectedPsiIndex(int idx) { St().selected_psi_idx.store(std::clamp(idx, 0, 5), std::memory_order_release); }
+
+bool IsActionHeld(Action a) {
+    if (size_t(a) >= size_t(Action::Count)) return false;
+    MkbState& st = St();
+    std::lock_guard<std::mutex> lk(st.lock);
+    if (input_rec::ShouldBypassMkb() || st.overlay_open.load(std::memory_order_relaxed)) return false;
+    const bool mkb_owns = (st.cfg.input_mode == InputMode::Mkb) ||
+                          (st.cfg.input_mode == InputMode::Auto &&
+                           st.active_device.load(std::memory_order_relaxed) == ActiveDevice::Mkb);
+    if (!mkb_owns) return false;
+    return IsActionHeldLocked(st, a);
+}
+
+void PollGameplayInput(GameplayInputSnapshot& out) {
+    out = GameplayInputSnapshot{};
+    MkbState& st = St();
+    std::lock_guard<std::mutex> lk(st.lock);
+    out.overlay_open = st.overlay_open.load(std::memory_order_relaxed);
+    if (input_rec::ShouldBypassMkb() || out.overlay_open) {
+        st.gameplay_wheel_queue.clear();
+        st.prev_gameplay_wheel_dir = 0;
+        return;
+    }
+    const bool mkb_owns = (st.cfg.input_mode == InputMode::Mkb) ||
+                          (st.cfg.input_mode == InputMode::Auto &&
+                           st.active_device.load(std::memory_order_relaxed) == ActiveDevice::Mkb);
+    if (!mkb_owns) {
+        st.gameplay_wheel_queue.clear();
+        st.prev_gameplay_wheel_dir = 0;
+        return;
+    }
+    out.mkb_active = (st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::GameplayActive);
+
+    // Always snapshot physical held state while M&K owns input so edge tracking stays synced across Paused -> Gameplay.
+    bool any_held = false;
+    for (size_t i = 0; i < size_t(Action::Count); ++i) {
+        bool h = IsActionHeldLocked(st, Action(i));
+        out.held[i] = h;
+        any_held = any_held || h;
+    }
+
+    if (out.mkb_active) {
+        // Consume 1 queued wheel notch per guest tick, inserting a 1-tick 0 gap between identical consecutive notches
+        // so rapid multi-notch scrolling produces distinct rising edges.
+        if (!st.gameplay_wheel_queue.empty()) {
+            int32_t front_dir = st.gameplay_wheel_queue.front() > 0 ? 1 : -1;
+            if (st.prev_gameplay_wheel_dir == front_dir) {
+                st.prev_gameplay_wheel_dir = 0;
+            } else {
+                st.gameplay_wheel_queue.pop_front();
+                out.wheel_delta = front_dir;
+                st.prev_gameplay_wheel_dir = front_dir;
+            }
+        } else {
+            st.prev_gameplay_wheel_dir = 0;
+        }
+        if (out.wheel_delta != 0) {
+            KeyCode wk = (out.wheel_delta > 0) ? KeyCode::WheelUp : KeyCode::WheelDown;
+            for (size_t i = 0; i < size_t(Action::Count); ++i) {
+                if (st.cfg.bindings[i][0] == wk || st.cfg.bindings[i][1] == wk) {
+                    out.held[i] = true;
+                    any_held = true;
+                }
+            }
+        }
+    }
+
+    // Diagonal-normalized WASD movement
+    float rx = (out.held[size_t(Action::MoveRight)] ? 1.0f : 0.0f) - (out.held[size_t(Action::MoveLeft)] ? 1.0f : 0.0f);
+    float ry =
+        (out.held[size_t(Action::MoveForward)] ? 1.0f : 0.0f) - (out.held[size_t(Action::MoveBackward)] ? 1.0f : 0.0f);
+    float mag = std::hypot(rx, ry);
+    if (mag > 0.0f) {
+        out.wasd_x = rx / mag;
+        out.wasd_y = ry / mag;
+        out.wasd_mag = std::hypot(out.wasd_x, out.wasd_y);
+    }
+
+    // Recent mouse flick velocity over last 140ms for TK Throw (0x0D)
+    const auto now = std::chrono::steady_clock::now();
+    while (!st.mouse_flick_history.empty() &&
+           std::chrono::duration_cast<std::chrono::milliseconds>(now - st.mouse_flick_history.front().tp).count() >
+               140) {
+        st.mouse_flick_history.pop_front();
+    }
+    float peak_spd = 0.0f;
+    float sum_dx = 0.0f;
+    float sum_dy = 0.0f;
+    for (const auto& ms : st.mouse_flick_history) {
+        float s = std::hypot(float(ms.dx), float(ms.dy));
+        if (s > peak_spd) peak_spd = s;
+        sum_dx += float(ms.dx);
+        sum_dy += float(ms.dy);
+    }
+    out.recent_flick_peak = peak_spd;
+    out.recent_flick_disp = std::hypot(sum_dx, sum_dy);
+    out.any_key_or_mouse = any_held || (out.wheel_delta != 0) || (peak_spd > 0.0f);
+}
 
 input_rec::MkbStateSnapshot SnapshotTelemetry() {
     MkbState& st = St();

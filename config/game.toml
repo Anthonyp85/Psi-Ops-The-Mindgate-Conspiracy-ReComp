@@ -338,3 +338,14 @@ on_true = "ret"
 [[hook]]
 at = 0x0C1040
 call = "Hook_HudUpdate"
+
+# 6. InputManager::Update (per-guest-frame M&K edge/wheel/Psi snapshot & instant Manual Reload)
+[[hook]]
+at = 0x294130
+call = "Hook_InputManagerUpdate"
+
+# 7. InputManager::GetActionValue (100% engine-level decoupled M&K Action ID override, ret 4)
+[[hook]]
+at = 0x294160
+call = "Hook_InputManagerGetActionValue"
+on_true = "ret"

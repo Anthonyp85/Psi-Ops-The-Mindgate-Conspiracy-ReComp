@@ -19,6 +19,8 @@
 #include <cstring>
 
 uint32_t PsiOpsLiveCameraVa();
+uint64_t PsiOpsConsumeMkbActionsFired();
+uint32_t PsiOpsGetMkbReloadCount();
 
 namespace {
 
@@ -290,8 +292,11 @@ void PsiOpsActionMap(const mkb::ActionPadState& act, input::Pad& pad) {
         if (act.held[size_t(Action::MoveLeft)]) pad.buttons |= 1u << 2;      // DPAD_LEFT
         if (act.held[size_t(Action::MoveRight)]) pad.buttons |= 1u << 3;     // DPAD_RIGHT
         if (act.held[size_t(Action::Interact)] || act.held[size_t(Action::Jump)]) {
-            pad.analog[0] = 0xFF;  // A confirms menu item
+            pad.analog[0] = 0xFF;  // A confirms menu item / dismisses Tip
             if (act.phase == perf::Phase::TitleMenu) pad.buttons |= 1u << 4;  // START advances Title Screen
+        }
+        if (act.held[size_t(Action::Objectives)]) {
+            pad.buttons |= 1u << 5;  // BACK closes Mission Objectives (0x22) in UI mode 0x16
         }
         if (act.esc_pulse) {
             if (act.phase == perf::Phase::Paused) pad.buttons |= 1u << 4;  // START resumes gameplay
@@ -300,7 +305,8 @@ void PsiOpsActionMap(const mkb::ActionPadState& act, input::Pad& pad) {
         return;
     }
 
-    // Active 3D gameplay (read active guest control layout: 2=Config 1 default, 3=Config 2, 4=Config 3)
+    // Active 3D gameplay pad fallback (InputManager::GetActionValue @ 0x294160 decouples every gameplay action
+    // directly by Action ID in modes 2/3/4; keep pad bits clean & accurate for any passthrough / mode transition).
     uint32_t cfg = 2u;
     if (kernel::g_base && mem::IsCommitted(0x005ECEB4u)) {
         uint32_t v = kernel::R32(0x005ECEB4u);
@@ -312,33 +318,35 @@ void PsiOpsActionMap(const mkb::ActionPadState& act, input::Pad& pad) {
         pad.ly = int16_t(std::clamp(std::lround(act.wasd_y * 32767.0f), -32768L, 32767L));
     }
 
-    // Triggers: RT = Fire (0x1A/0x1B), LT = Use Active Psi / Telekinesis (0x10/0x11/0x12)
+    // Fire (RT)
     if (act.held[size_t(Action::Fire)]) pad.analog[7] = 0xFF;
-    if (act.held[size_t(Action::PsiUse)]) pad.analog[6] = 0xFF;
 
-    // Face & Stick buttons (Config 1 default, adapting to Config 2/3)
+    // Face & Stick buttons (config-aware, strictly fixing Jump != X and Reload != DPad_Down)
     if (act.held[size_t(Action::Interact)]) {
+        pad.analog[0] = 0xFF;  // A = Interact (0x1F) in all configs
+    }
+    if (act.held[size_t(Action::Jump)]) {
         if (cfg == 3u) pad.analog[1] = 0xFF;       // B in Config 2
         else if (cfg == 4u) pad.analog[3] = 0xFF;  // Y in Config 3
-        else pad.analog[0] = 0xFF;                 // A in Config 1 (also Accept (A) on Mission Objectives!)
+        else pad.analog[0] = 0xFF;                 // A in Config 1 (NEVER X!)
+    }
+    if (act.held[size_t(Action::Melee)]) {
+        pad.analog[2] = 0xFF;  // X = Melee (0x20) ONLY
     }
     if (act.held[size_t(Action::Crouch)]) {
         if (cfg == 3u) pad.buttons |= 1u << 6;  // LTHUMB in Config 2
         else pad.analog[1] = 0xFF;              // B in Config 1/3
     }
-    if (act.held[size_t(Action::Jump)] || act.held[size_t(Action::Melee)]) {
-        pad.analog[2] = 0xFF;  // X = Jump / Melee / Vault (0x20)
+    if (act.held[size_t(Action::WallMove)]) {
+        if (cfg == 4u) pad.analog[1] = 0xFF;    // B in Config 3
+        else pad.buttons |= 1u << 6;            // LTHUMB in Config 1/2
     }
     if (act.held[size_t(Action::FineAim)]) {
         if (cfg == 4u) pad.buttons |= 1u << 6;  // LTHUMB in Config 3
-        else pad.analog[3] = 0xFF;              // Y = Target Lock-On / Sniper Scope Toggle (0x2B/0x2C/0x33)
+        else pad.analog[3] = 0xFF;              // Y in Config 1/2
     }
 
-    // Reload & Weapon Cycle / Sniper Scope Zoom (Config 1: DPad_Down = Reload/Cycle; Config 2/3: Black)
-    if (act.held[size_t(Action::Reload)]) {
-        if (cfg == 2u) pad.buttons |= 1u << 1;  // DPAD_DOWN (0x37)
-        else pad.analog[4] = 0xFF;              // BLACK
-    }
+    // Weapon Cycle / Sniper Scope Zoom (Reload R is handled directly by Weapon::Reload, NEVER DPAD_DOWN!)
     if (act.wheel_up_pulse || act.wheel_down_pulse) {
         if (IsSniperScopeActive()) {
             if (act.wheel_up_pulse) pad.buttons |= 1u << 0;    // DPAD_UP = Sniper Zoom In (0x34)
@@ -349,25 +357,25 @@ void PsiOpsActionMap(const mkb::ActionPadState& act, input::Pad& pad) {
         }
     }
 
-    // Direct 1-key Psi Power buttons (1..6 -> TK, PK, MD, MC, RV, AV — dedicated guest actions 0x12..0x17!)
-    if (act.held[size_t(Action::PsiTk)]) pad.analog[6] = 0xFF;  // LT = TK (0x12)
-    if (act.held[size_t(Action::PsiPk)]) {
-        if (cfg == 2u) pad.analog[5] = 0xFF;  // WHITE = PK (0x13) in Config 1
-        else pad.buttons |= 1u << 0;          // DPAD_UP in Config 2/3
+    // Active Psi power (LShift/Mouse5 -> selected Psi 0..5) + direct 1..6 hotkeys
+    const int sel_psi = mkb::GetSelectedPsiIndex();
+    auto press_psi = [&](int idx) {
+        switch (idx) {
+            case 0: pad.analog[6] = 0xFF; break;                                                // LT = TK
+            case 1: if (cfg == 2u) pad.analog[5] = 0xFF; else pad.buttons |= 1u << 0; break;    // PK
+            case 2: if (cfg == 2u) pad.analog[4] = 0xFF; else pad.analog[5] = 0xFF; break;      // MD
+            case 3: if (cfg == 2u) pad.buttons |= 1u << 0; else pad.buttons |= 1u << 1; break;  // MC
+            case 4: pad.buttons |= 1u << 2; break;                                              // DPAD_LEFT = RV
+            case 5: pad.buttons |= 1u << 3; break;                                              // DPAD_RIGHT = AV
+            default: break;
+        }
+    };
+    if (act.held[size_t(Action::PsiUse)]) press_psi(sel_psi);
+    for (int i = 0; i < 6; ++i) {
+        if (act.held[size_t(Action::PsiTk) + size_t(i)]) press_psi(i);
     }
-    if (act.held[size_t(Action::PsiMd)]) {
-        if (cfg == 2u) pad.analog[4] = 0xFF;  // BLACK = MD (0x14) in Config 1
-        else pad.analog[5] = 0xFF;            // WHITE in Config 2/3
-    }
-    if (act.held[size_t(Action::PsiMc)]) {
-        if (cfg == 2u) pad.buttons |= 1u << 0;  // DPAD_UP = MC (0x15) in Config 1
-        else pad.buttons |= 1u << 1;            // DPAD_DOWN in Config 2/3
-    }
-    if (act.held[size_t(Action::PsiRv)]) pad.buttons |= 1u << 2;  // DPAD_LEFT = RV (0x16)
-    if (act.held[size_t(Action::PsiAv)]) pad.buttons |= 1u << 3;  // DPAD_RIGHT = AV (0x17)
 
-    // Latched Escape -> START (Pause), Tab -> BACK (Objectives)
-    if (act.esc_pulse) pad.buttons |= 1u << 4;
+    // Tab -> BACK (kept continuous across Gameplay -> Objectives mode 0x16 so holding Tab never bounces closed)
     if (act.held[size_t(Action::Objectives)]) pad.buttons |= 1u << 5;
 }
 
@@ -416,13 +424,16 @@ input_rec::GuestStateSnapshot QueryPsiOpsGuestState() {
             s.psi = psi;
         }
 
-        // Active Weapon clip & reserve ammo
-        uint32_t wpn = 0u;
-        uint32_t holder = kernel::R32(player + 0x788u);
-        if (holder && mem::IsCommitted(holder + 0x4u)) wpn = kernel::R32(holder + 0x4u);
-        if (!wpn) wpn = kernel::R32(player + 0x6FCu);
-        if (wpn && mem::IsCommitted(wpn + 0x4Cu)) {
+        // Active Weapon clip, clip_size, reserve ammo & weapon_type
+        uint32_t wpn = kernel::R32(player + 0x6FCu);
+        if (!wpn) {
+            uint32_t holder = kernel::R32(player + 0x788u);
+            if (holder && mem::IsCommitted(holder + 0x4u)) wpn = kernel::R32(holder + 0x4u);
+        }
+        if (wpn && mem::IsCommitted(wpn + 0x54u)) {
             int32_t clip = int32_t(kernel::R32(wpn + 0x48u));
+            int32_t clip_size = int32_t(kernel::R32(wpn + 0x4Cu));
+            int32_t wtype = int32_t(kernel::R32(wpn + 0x10u));
             int32_t reserve = 0;
             uint32_t reserve_ptr = kernel::R32(wpn + 0x44u);
             if (reserve_ptr && mem::IsCommitted(reserve_ptr)) reserve = int32_t(kernel::R32(reserve_ptr));
@@ -430,12 +441,34 @@ input_rec::GuestStateSnapshot QueryPsiOpsGuestState() {
                 s.has_vitals = true;
                 s.ammo_clip = clip;
                 s.ammo_reserve = reserve;
+                if (clip_size > 0 && clip_size < 1000) s.ammo_clip_size = clip_size;
+                if (wtype >= 0 && wtype < 64) s.weapon_type = wtype;
             }
         }
 
-        // Active Psi power state fn
+        // Active Psi power state fn + AnimStateMachine state + Melee timer + Lock-On state
         uint32_t psi_mgr = kernel::R32(player + 0x6F4u);
         if (psi_mgr && mem::IsCommitted(psi_mgr + 0x4u)) psi_fn = kernel::R32(psi_mgr + 0x4u);
+
+        s.has_player_actions = true;
+        s.psi_fn = psi_fn;
+        s.psi_selected = mkb::GetSelectedPsiIndex();
+        s.sniper_scoped = IsSniperScopeActive();
+        s.mkb_actions_fired = PsiOpsConsumeMkbActionsFired();
+        s.mkb_reload_count = PsiOpsGetMkbReloadCount();
+        if (mem::IsCommitted(player + 0x43Cu)) {
+            uint32_t asm_ptr = kernel::R32(player + 0x438u);
+            if (asm_ptr && mem::IsCommitted(asm_ptr + 0x48u)) {
+                s.anim_state = kernel::R32(asm_ptr + 0x44u);
+            }
+        }
+        if (mem::IsCommitted(player + 0x860u)) {
+            float mt = ReadGuestF32(player + 0x85Cu);
+            if (std::isfinite(mt) && mt >= 0.0f && mt < 1e6f) s.melee_timer = mt;
+        }
+        if (mem::IsCommitted(player + 0x744u)) {
+            s.lock_on_active = (kernel::R32(player + 0x740u) != 0u) || (kernel::G<uint8_t>(player + 0x710u) != 0u);
+        }
     }
 
     // Camera yaw/pitch/mode from exact live Camera* captured in Camera::ApplyManualAim (edi)

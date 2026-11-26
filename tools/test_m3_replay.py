@@ -568,8 +568,11 @@ def execute_session(
                 m2.kill_wsl_psiops(wsl_distro)
                 res.errors.append(f"{name}: leftover Linux PsiOps processes after exit: {post_pids}.")
 
-    if log_file.is_file():
-        shutil.copy2(log_file, saved_log)
+    logs_dir = exe_path.parent / "logs"
+    candidates = sorted(logs_dir.glob("psiops*.log"), key=lambda p: p.stat().st_mtime_ns) if logs_dir.is_dir() else []
+    newest_log = candidates[-1] if candidates else log_file
+    if newest_log.is_file():
+        shutil.copy2(newest_log, saved_log)
         log_text = saved_log.read_text(encoding="utf-8", errors="replace")
     else:
         log_text = stdout_s + "\n" + stderr_s

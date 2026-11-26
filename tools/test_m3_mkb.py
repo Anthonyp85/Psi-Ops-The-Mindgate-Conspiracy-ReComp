@@ -67,9 +67,10 @@ fine_aim = ['RMB', 'V']
 reload = ['R', 'MMB']
 jump = ['Space', '']
 crouch = ['LCtrl', 'C']
+wall_move = ['LAlt', '']
 interact = ['E', 'Enter']
 melee = ['Q', 'Mouse4']
-psi_use = ['RMB', 'Mouse5']
+psi_use = ['LShift', 'Mouse5']
 weapon_next = ['WheelUp', '']
 weapon_prev = ['WheelDown', '']
 psi_tk = ['1', '']
@@ -78,6 +79,8 @@ psi_md = ['3', '']
 psi_mc = ['4', '']
 psi_rv = ['5', '']
 psi_av = ['6', '']
+tk_cam_control = ['G', '']
+mc_explode = ['X', '']
 pause = ['Escape', '']
 objectives = ['Tab', '']
 """
@@ -132,7 +135,7 @@ set_ms 60640 mouse_sensitivity 1.0
 set_ms 60680 mouse_invert_y 0
 set_ms 60720 mouse_raw_aim 1
 set_ms 60760 fps_cap 60
-pad_ms 60700 71800 none 700 -550 -600 480 0 0
+pad_ms 60700 80450 none 700 -550 -600 480 0 0
 
 # 7. 1px micro-aim precision (0 deadzone loss)
 mouse_ms 61400 1 0
@@ -166,42 +169,70 @@ key_ms 67200 67600 W,A
 key_ms 67800 68200 S,D
 key_ms 68400 68800 S,A
 
-# 13. Queued WheelUp/WheelDown pulses, direct 1-key bindings, LMB fire, RMB aim, jump & gameplay PNG
+# 13. Engine-level decoupled PC M&K action verification in live Level 00 3D gameplay:
+# 13a. WheelUp -> Next Weapon (0x18), WheelDown -> Prev Weapon (0x19), NEVER reloads!
 wheel_ms 69200 1
 wheel_ms 69500 -1
-key_ms 69800 70200 1
-key_ms 70400 70800 LMB
-key_ms 70820 70980 RMB
-key_ms 71000 71400 Space
-capture_ms 71600 mkb_gameplay.bmp
+
+# 13b. E (Interact ONLY) in open space -> fires 0x1F ONLY, NEVER jumps (|delta_y| < 0.08)!
+key_ms 70000 70400 E
+
+# 13c. Space (Jump ONLY) -> fires 0x23 ONLY, Nick physically JUMPS (delta_y > 0.25), NEVER melees!
+key_ms 70800 71200 Space
+
+# 13d. Q (Melee ONLY) -> fires 0x20 ONLY, melee_timer resets, NEVER jumps!
+key_ms 72200 72600 Q
+
+# 13e. LCtrl (Crouch Toggle ON -> OFF) -> fires 0x26, anim_state transitions to crouch!
+key_ms 73400 73750 LCtrl
+key_ms 74100 74400 LCtrl
+
+# 13f. LMB (Fire Weapon) -> fires 0x1A/0x1B, real guest ammo_clip decreases!
+key_ms 74700 75100 LMB
+
+# 13g. R (Instant Manual Reload) -> refills ammo_clip without switching weapon_type or firing 0x18/0x19!
+key_ms 75500 75800 R
+
+# 13h. RMB (Fine Aim / Lock-On) & LAlt (Wall Cover 0x36)
+key_ms 76200 76550 RMB
+key_ms 76900 77250 LAlt
+
+# 13i. Direct Psi hotkeys 1..6 + LShift (Use Active Psi Power):
+#      Press 2 (PK -> psi_selected=1, 0x10+0x11+0x13) -> LShift uses slot 1 (0x13)
+#      Press 1 (TK -> psi_selected=0, 0x10+0x11+0x12) -> LShift uses slot 0 (0x12)
+key_ms 77600 77900 2
+key_ms 78200 78500 LShift
+key_ms 78800 79200 1
+key_ms 79500 79900 LShift
+capture_ms 80100 mkb_gameplay.bmp
 
 # Restore 15% deadzones after noisy-controller stress window
-set_ms 71850 controller_deadzone_left 15
-set_ms 71860 controller_deadzone_right 15
+set_ms 80500 controller_deadzone_left 15
+set_ms 80510 controller_deadzone_right 15
 
 # 14. Auto hot-switching (genuine controller press -> mkb)
-pad_ms 72000 72300 A
-mouse_ms 72600 20 0
+pad_ms 80800 81100 A
+mouse_ms 81400 20 0
 
 # 15. Smart cursor release on F1 Overlay & Focus Loss, re-capture on restore
-set_ms 73000 overlay_open 1
-set_ms 73400 overlay_open 0
-set_ms 73800 window_focused 0
-set_ms 74200 window_focused 1
+set_ms 81800 overlay_open 1
+set_ms 82200 overlay_open 0
+set_ms 82600 window_focused 0
+set_ms 83000 window_focused 1
 
 # 16. Pause Menu Mouse Navigation: Esc -> Pause (cursor visible) -> Hover item 0 -> RMB resumes gameplay
-key_ms 74800 75300 Escape
-cursor_ms 75650 256 97
-rmb_click_ms 76150
+key_ms 83600 84100 Escape
+cursor_ms 84450 256 97
+rmb_click_ms 84950
 
 # 17. Pause Menu Mouse Quit-to-Main-Menu: Esc -> Hover + LMB QUIT TO MAIN MENU [item 7: y=331..353] -> SavePrompt Quit Without Saving [item 1: y=222..244] -> Title Menu
-key_ms 77600 78000 Escape
-cursor_ms 78500 256 342
-lmb_click_ms 78900 256 342
-cursor_ms 79800 256 233
-lmb_click_ms 80200 256 233
+key_ms 86400 86800 Escape
+cursor_ms 87300 256 342
+lmb_click_ms 87700 256 342
+cursor_ms 88600 256 233
+lmb_click_ms 89000 256 233
 
-exit_ms 86500
+exit_ms 95000
 """
 
 
@@ -411,18 +442,185 @@ def evaluate_mkb_state_log(state_log_path: Path) -> tuple[list[str], list[str], 
             errs.append(f"WASD '{label}' magnitude out of bounds: {mag:.6f} (expected 1.000 +/- 0.002).")
     metrics["wasd_magnitudes"] = wasd_mags
 
-    # 7. Queued WheelUp/WheelDown pulses & Auto hot-switching (mkb <-> controller)
-    w_wu = _window(records, 69150, 69400)
-    w_wd = _window(records, 69450, 69700)
+    # 7. Queued WheelUp/WheelDown pulses & Engine-Level Decoupled Action Verification (live Level 00 guest state!)
+    def actions_or(win: list[dict[str, Any]]) -> int:
+        mask = 0
+        for r in win:
+            mask |= int(r.get("mkb_actions_fired", 0))
+        return mask
+
+    w_wu = _window(records, 69150, 69450)
+    w_wd = _window(records, 69450, 69750)
     if not any(int(r.get("wheel_pulse", 0)) > 0 for r in w_wu):
-        errs.append("WheelUp (+1) pulse not observed in [69150..69400ms].")
+        errs.append("WheelUp (+1) pulse not observed in [69150..69450ms].")
     if not any(int(r.get("wheel_pulse", 0)) < 0 for r in w_wd):
-        errs.append("WheelDown (-1) pulse not observed in [69450..69700ms].")
+        errs.append("WheelDown (-1) pulse not observed in [69450..69750ms].")
+    m_wu = actions_or(w_wu)
+    m_wd = actions_or(w_wd)
+    if (m_wu & (1 << 0x18)) == 0:
+        errs.append(f"WheelUp did not fire Next Weapon (0x18) in [69150..69450ms] (mask=0x{m_wu:X}).")
+    if (m_wu & (1 << 0x19)) != 0:
+        errs.append(f"WheelUp unexpectedly fired Prev Weapon (0x19) (mask=0x{m_wu:X}).")
+    if (m_wd & (1 << 0x19)) == 0:
+        errs.append(f"WheelDown did not fire Prev Weapon (0x19) in [69450..69750ms] (mask=0x{m_wd:X}).")
+    if (m_wd & (1 << 0x18)) != 0:
+        errs.append(f"WheelDown unexpectedly fired Next Weapon (0x18) (mask=0x{m_wd:X}).")
+    if w_wu and w_wd and int(w_wd[-1].get("mkb_reload_count", 0)) != int(w_wu[0].get("mkb_reload_count", 0)):
+        errs.append("WheelUp/WheelDown unexpectedly triggered Reload!")
+
+    # 7a-i. E (Interact ONLY) in open space -> fires 0x1F ONLY, NEVER jumps (|delta_y| < 0.08)!
+    w_e_base = [r for r in _window(records, 69750, 69980) if "player_y" in r]
+    w_e_act = _window(records, 69980, 70650)
+    m_e = actions_or(w_e_act)
+    if (m_e & (1 << 0x1F)) == 0:
+        errs.append(f"E (Interact) did not fire Action 0x1F in [69980..70650ms] (mask=0x{m_e:X}).")
+    if (m_e & ((1 << 0x23) | (1 << 0x20))) != 0:
+        errs.append(f"E (Interact) leaked into Jump (0x23) or Melee (0x20) (mask=0x{m_e:X})!")
+    e_ys = [float(r["player_y"]) for r in w_e_act if "player_y" in r]
+    if w_e_base and e_ys:
+        base_y_e = float(w_e_base[-1]["player_y"])
+        delta_y_e = max(e_ys) - base_y_e
+        metrics["e_interact_delta_y"] = round(delta_y_e, 4)
+        if delta_y_e > 0.08:
+            errs.append(f"Pressing E in open space made Nick jump (delta_player_y={delta_y_e:.4f} > 0.08)!")
+    else:
+        errs.append("Missing player_y telemetry during E (Interact) test window.")
+
+    # 7a-ii. Space (Jump ONLY) -> fires 0x23 ONLY, Nick physically JUMPS (delta_y > 0.25), NEVER melees!
+    w_j_base = [r for r in _window(records, 70550, 70780) if "player_y" in r]
+    w_j_act = _window(records, 70780, 71850)
+    m_j = actions_or(w_j_act)
+    if (m_j & (1 << 0x23)) == 0:
+        errs.append(f"Space (Jump) did not fire Action 0x23 in [70780..71850ms] (mask=0x{m_j:X}).")
+    if (m_j & ((1 << 0x20) | (1 << 0x1F))) != 0:
+        errs.append(f"Space (Jump) leaked into Melee (0x20) or Interact (0x1F) (mask=0x{m_j:X})!")
+    j_ys = [float(r["player_y"]) for r in w_j_act if "player_y" in r]
+    if w_j_base and j_ys:
+        base_y_j = float(w_j_base[-1]["player_y"])
+        delta_y_j = max(j_ys) - base_y_j
+        metrics["space_jump_delta_y"] = round(delta_y_j, 4)
+        if delta_y_j < 0.25:
+            errs.append(f"Pressing Space did not make Nick jump (delta_player_y={delta_y_j:.4f} < 0.25)!")
+    else:
+        errs.append("Missing player_y telemetry during Space (Jump) test window.")
+
+    # 7a-iii. Q (Melee ONLY) -> fires 0x20 ONLY, NEVER jumps, triggers real guest Melee state!
+    w_q_base = [r for r in _window(records, 71950, 72180) if "player_y" in r]
+    w_q_act = _window(records, 72180, 73100)
+    m_q = actions_or(w_q_act)
+    if (m_q & (1 << 0x20)) == 0:
+        errs.append(f"Q (Melee) did not fire Action 0x20 in [72180..73100ms] (mask=0x{m_q:X}).")
+    if (m_q & (1 << 0x23)) != 0:
+        errs.append(f"Q (Melee) leaked into Jump (0x23) (mask=0x{m_q:X})!")
+    q_ys = [float(r["player_y"]) for r in w_q_act if "player_y" in r]
+    if w_q_base and q_ys:
+        base_y_q = float(w_q_base[-1]["player_y"])
+        delta_y_q = max(q_ys) - base_y_q
+        metrics["q_melee_delta_y"] = round(delta_y_q, 4)
+        if delta_y_q > 0.12:
+            errs.append(f"Pressing Q (Melee) unexpectedly made Nick jump (delta_player_y={delta_y_q:.4f} > 0.12)!")
+        base_mt = float(w_q_base[-1].get("melee_timer", 99.0))
+        q_mts = [float(r["melee_timer"]) for r in w_q_act if "melee_timer" in r]
+        base_anim_q = int(w_q_base[-1].get("anim_state", 0))
+        q_anims = {int(r.get("anim_state", 0)) for r in w_q_act if int(r.get("anim_state", 0)) != 0}
+        melee_reset = bool(q_mts) and (min(q_mts) < 0.30) and (min(q_mts) < base_mt - 0.1 or base_mt == 0.0)
+        anim_changed_q = bool(base_anim_q) and any(a != base_anim_q for a in q_anims)
+        metrics["q_melee_timer_min"] = round(min(q_mts), 4) if q_mts else None
+        metrics["q_melee_anim_changed"] = anim_changed_q
+        if not melee_reset and not anim_changed_q:
+            errs.append(f"Q (Melee) did not trigger guest Melee state (base_mt={base_mt:.3f}, min_mt={min(q_mts) if q_mts else -1:.3f}, anim_changed={anim_changed_q}).")
+
+    # 7a-iv. LCtrl (Crouch Toggle ON -> OFF) -> fires 0x26, transitions real guest anim_state!
+    w_c_base = _window(records, 73150, 73380)
+    w_c_on = _window(records, 73380, 74080)
+    m_c = actions_or(w_c_on)
+    if (m_c & (1 << 0x26)) == 0:
+        errs.append(f"LCtrl (Crouch) did not fire Action 0x26 in [73380..74080ms] (mask=0x{m_c:X}).")
+    if w_c_base and w_c_on:
+        base_anim_c = int(w_c_base[-1].get("anim_state", 0))
+        c_post = _window(records, 73650, 74080)
+        c_anims = {int(r.get("anim_state", 0)) for r in c_post if int(r.get("anim_state", 0)) != 0}
+        metrics["crouch_anim_changed"] = bool(base_anim_c) and any(a != base_anim_c for a in c_anims)
+        if base_anim_c and not any(a != base_anim_c for a in c_anims):
+            errs.append(f"LCtrl (Crouch) did not change guest anim_state (remained 0x{base_anim_c:X}).")
+
+    # 7a-v. LMB (Fire Weapon) -> fires 0x1A & 0x1B, real guest ammo_clip decreases!
+    w_f_base = [r for r in _window(records, 74450, 74680) if "ammo_clip" in r]
+    w_f_act = _window(records, 74680, 75400)
+    m_f = actions_or(w_f_act)
+    if (m_f & (1 << 0x1A)) == 0 or (m_f & (1 << 0x1B)) == 0:
+        errs.append(f"LMB (Fire) did not fire Actions 0x1A+0x1B in [74680..75400ms] (mask=0x{m_f:X}).")
+    f_clips = [int(r["ammo_clip"]) for r in w_f_act if "ammo_clip" in r]
+    if w_f_base and f_clips:
+        clip_before_fire = int(w_f_base[-1]["ammo_clip"])
+        clip_after_fire = min(f_clips)
+        metrics["lmb_ammo_clip_before"] = clip_before_fire
+        metrics["lmb_ammo_clip_after"] = clip_after_fire
+        if clip_after_fire >= clip_before_fire:
+            errs.append(f"LMB (Fire) did not decrease ammo_clip ({clip_before_fire} -> {clip_after_fire})!")
+    else:
+        errs.append("Missing ammo_clip telemetry during LMB (Fire) window.")
+
+    # 7a-vi. R (Instant Manual Reload) -> refills ammo_clip WITHOUT switching weapon_type or firing 0x18/0x19!
+    w_r_base = [r for r in _window(records, 75200, 75480) if "ammo_clip" in r]
+    w_r_act = _window(records, 75480, 76100)
+    m_r = actions_or(w_r_act)
+    if (m_r & ((1 << 0x18) | (1 << 0x19))) != 0:
+        errs.append(f"R (Reload) unexpectedly fired Weapon Cycle 0x18/0x19 (mask=0x{m_r:X})!")
+    r_clips = [int(r["ammo_clip"]) for r in w_r_act if "ammo_clip" in r]
+    if w_r_base and r_clips and w_r_act:
+        clip_before_r = int(w_r_base[-1]["ammo_clip"])
+        clip_after_r = int(r_clips[-1])
+        wtype_before_r = int(w_r_base[-1].get("weapon_type", -1))
+        wtype_after_r = int(w_r_act[-1].get("weapon_type", -1))
+        rel_before = int(w_r_base[-1].get("mkb_reload_count", 0))
+        rel_after = int(w_r_act[-1].get("mkb_reload_count", 0))
+        metrics["r_reload_clip_before"] = clip_before_r
+        metrics["r_reload_clip_after"] = clip_after_r
+        metrics["r_reload_count_delta"] = rel_after - rel_before
+        metrics["r_reload_weapon_type_before"] = wtype_before_r
+        metrics["r_reload_weapon_type_after"] = wtype_after_r
+        if rel_after <= rel_before:
+            errs.append(f"R (Reload) did not invoke manual Weapon::Reload (count {rel_before} -> {rel_after})!")
+        if clip_after_r <= clip_before_r:
+            errs.append(f"R (Reload) did not refill ammo_clip ({clip_before_r} -> {clip_after_r})!")
+        if wtype_before_r >= 0 and wtype_after_r >= 0 and wtype_before_r != wtype_after_r:
+            errs.append(f"R (Reload) switched weapons ({wtype_before_r} -> {wtype_after_r})!")
+    else:
+        errs.append("Missing ammo_clip telemetry during R (Reload) window.")
+
+    # 7a-vii. RMB (Fine Aim / Lock-On) & LAlt (Wall Cover 0x36)
+    m_rmb = actions_or(_window(records, 76180, 76650))
+    if (m_rmb & ((1 << 0x2B) | (1 << 0x2C) | (1 << 0x1D))) == 0:
+        errs.append(f"RMB (FineAim) did not fire Lock-On (0x2B/0x2C) or Scope (0x1D) (mask=0x{m_rmb:X}).")
+    m_wall = actions_or(_window(records, 76880, 77350))
+    if (m_wall & (1 << 0x36)) == 0:
+        errs.append(f"LAlt (WallMove) did not fire Action 0x36 (mask=0x{m_wall:X}).")
+
+    # 7a-viii. Direct Psi 1..6 + LShift (Use Active Psi Power)
+    w_psi2 = _window(records, 77580, 78050)
+    w_sh2 = _window(records, 78180, 78650)
+    w_psi1 = _window(records, 78780, 79350)
+    w_sh1 = _window(records, 79480, 80050)
+    m_psi2, m_sh2 = actions_or(w_psi2), actions_or(w_sh2)
+    m_psi1, m_sh1 = actions_or(w_psi1), actions_or(w_sh1)
+    if (m_psi2 & ((1 << 0x10) | (1 << 0x11) | (1 << 0x13))) != ((1 << 0x10) | (1 << 0x11) | (1 << 0x13)):
+        errs.append(f"Key 2 (PsiPk) did not fire 0x10+0x11+0x13 (mask=0x{m_psi2:X}).")
+    if not any(int(r.get("psi_selected", -1)) == 1 for r in w_psi2):
+        errs.append("Key 2 (PsiPk) did not set psi_selected=1.")
+    if (m_sh2 & ((1 << 0x10) | (1 << 0x11) | (1 << 0x13))) != ((1 << 0x10) | (1 << 0x11) | (1 << 0x13)):
+        errs.append(f"LShift (PsiUse) after selecting 2 did not fire 0x10+0x11+0x13 (mask=0x{m_sh2:X}).")
+    if (m_psi1 & ((1 << 0x10) | (1 << 0x11) | (1 << 0x12))) != ((1 << 0x10) | (1 << 0x11) | (1 << 0x12)):
+        errs.append(f"Key 1 (PsiTk) did not fire 0x10+0x11+0x12 (mask=0x{m_psi1:X}).")
+    if not any(int(r.get("psi_selected", -1)) == 0 for r in w_psi1):
+        errs.append("Key 1 (PsiTk) did not set psi_selected=0.")
+    if (m_sh1 & ((1 << 0x10) | (1 << 0x11) | (1 << 0x12))) != ((1 << 0x10) | (1 << 0x11) | (1 << 0x12)):
+        errs.append(f"LShift (PsiUse) after selecting 1 did not fire 0x10+0x11+0x12 (mask=0x{m_sh1:X}).")
 
     # 7b. Continuous noisy physical DualSense Edge immunity (deadzone=0, lx=700, ly=-550, rx=-600, ry=480)
-    w_noise = _window(records, 60900, 71750)
+    w_noise = _window(records, 60900, 80400)
     if not w_noise:
-        errs.append("No state-log frames found in noisy DualSense Edge stress window [60900..71750ms].")
+        errs.append("No state-log frames found in noisy DualSense Edge stress window [60900..80400ms].")
     else:
         flip_flops = [r for r in w_noise if str(r.get("input_device", "")).lower() != "mkb"]
         metrics["dualsense_noise_frames"] = len(w_noise)
@@ -433,12 +631,12 @@ def evaluate_mkb_state_log(state_log_path: Path) -> tuple[list[str], list[str], 
                 f"{len(flip_flops)}/{len(w_noise)} frames (expected 0 flip-flops)."
             )
 
-    w_hs_pad = _window(records, 72050, 72350)
-    w_hs_mkb = _window(records, 72600, 72900)
+    w_hs_pad = _window(records, 80850, 81150)
+    w_hs_mkb = _window(records, 81400, 81700)
     if not any(str(r.get("input_device", "")).lower() == "controller" for r in w_hs_pad):
-        errs.append("Auto hot-switch to controller failed in [72050..72350ms].")
+        errs.append("Auto hot-switch to controller failed in [80850..81150ms].")
     if not any(str(r.get("input_device", "")).lower() == "mkb" for r in w_hs_mkb):
-        errs.append("Auto hot-switch back to mkb failed in [72600..72900ms].")
+        errs.append("Auto hot-switch back to mkb failed in [81400..81700ms].")
 
     # 8. Smart OS Cursor Capture, real OS-level visibility (GetCursorInfo / SDL_CursorVisible), & Mouse Menus
     cursor_windows = {
@@ -449,15 +647,15 @@ def evaluate_mkb_state_log(state_log_path: Path) -> tuple[list[str], list[str], 
         "cursor_level00_tip_popup": (58950, 59450, True, False, None),
         "cursor_level00_post_tip": (59550, 60400, True, False, "gameplay_active"),
         "cursor_gameplay": (60900, 61300, True, False, "gameplay_active"),
-        "cursor_after_lmb_rmb": (70850, 71500, True, False, "gameplay_active"),
-        "cursor_auto_controller_hidden": (72050, 72350, True, False, "gameplay_active"),
-        "cursor_overlay_open": (73100, 73350, False, True, None),
-        "cursor_overlay_closed": (73500, 73750, True, False, "gameplay_active"),
-        "cursor_focus_lost": (73900, 74150, False, True, None),
-        "cursor_focus_regained": (74300, 74650, True, False, "gameplay_active"),
-        "cursor_pause": (75500, 76000, False, True, "paused"),
-        "cursor_rmb_resume": (76550, 77300, True, False, "gameplay_active"),
-        "cursor_quit_to_menu": (83000, 85000, False, True, "title_menu"),
+        "cursor_after_lmb_rmb": (76400, 77200, True, False, "gameplay_active"),
+        "cursor_auto_controller_hidden": (80850, 81150, True, False, "gameplay_active"),
+        "cursor_overlay_open": (81900, 82150, False, True, None),
+        "cursor_overlay_closed": (82300, 82550, True, False, "gameplay_active"),
+        "cursor_focus_lost": (82700, 82950, False, True, None),
+        "cursor_focus_regained": (83100, 83450, True, False, "gameplay_active"),
+        "cursor_pause": (84300, 84800, False, True, "paused"),
+        "cursor_rmb_resume": (85350, 86100, True, False, "gameplay_active"),
+        "cursor_quit_to_menu": (91800, 93800, False, True, "title_menu"),
     }
     cursor_states: dict[str, bool | None] = {}
     os_cursor_states: dict[str, bool | None] = {}
@@ -488,17 +686,17 @@ def evaluate_mkb_state_log(state_log_path: Path) -> tuple[list[str], list[str], 
     metrics["os_cursor_states"] = os_cursor_states
 
     # 8a. Continuous GameplayActive + Tip (state==4) cursor invariant: 0 unlock leaks and 0 visible-cursor leaks
-    #     across Level 00 opening tutorial/objectives popup, fire (LMB), aim (RMB), and Auto hot-switch [58850..72900ms].
+    #     across Level 00 opening tutorial/objectives popup, all M&K actions, and Auto hot-switch [58850..81700ms].
     gp_cont = [
         r
-        for r in _window(records, 58850, 72900)
+        for r in _window(records, 58850, 81700)
         if (str(r.get("phase", "")) == "gameplay_active" or int(r.get("state", -1)) == 4)
         and not bool(r.get("overlay_open", False))
         and bool(r.get("window_focused", True))
     ]
     metrics["gameplay_cursor_checked_frames"] = len(gp_cont)
     if not gp_cont:
-        errs.append("No continuous gameplay_active/tip frames found in [58850..72900ms] for cursor leak invariant.")
+        errs.append("No continuous gameplay_active/tip frames found in [58850..81700ms] for cursor leak invariant.")
     else:
         unlock_leaks = [r for r in gp_cont if not bool(r.get("cursor_captured", False))]
         vis_leaks = [r for r in gp_cont if bool(r.get("os_cursor_visible", True))]
@@ -506,25 +704,25 @@ def evaluate_mkb_state_log(state_log_path: Path) -> tuple[list[str], list[str], 
         metrics["gameplay_os_cursor_visible_leaks"] = len(vis_leaks)
         if unlock_leaks:
             errs.append(
-                f"Gameplay cursor unexpectedly unlocked on {len(unlock_leaks)}/{len(gp_cont)} frames in [58850..72900ms] "
+                f"Gameplay cursor unexpectedly unlocked on {len(unlock_leaks)}/{len(gp_cont)} frames in [58850..81700ms] "
                 f"(first at {_rec_ms(unlock_leaks[0]):.1f}ms)."
             )
         if vis_leaks:
             errs.append(
-                f"OS cursor leaked visible on {len(vis_leaks)}/{len(gp_cont)} gameplay frames in [58850..72900ms] "
+                f"OS cursor leaked visible on {len(vis_leaks)}/{len(gp_cont)} gameplay frames in [58850..81700ms] "
                 f"(first at {_rec_ms(vis_leaks[0]):.1f}ms)."
             )
 
     # 8b. Verify pure mouse menu hover detection on RootMenuContent and Pause Menu
     w_main_hover = _window(records, 28550, 28950)
-    w_pause_hover = _window(records, 75700, 76100)
+    w_pause_hover = _window(records, 84500, 84900)
     if not any(int(r.get("ui_hovered_idx", -1)) >= 0 for r in w_main_hover):
         errs.append("Main Menu mouse hover not detected (ui_hovered_idx < 0 in [28550..28950ms]).")
     if not any(int(r.get("ui_hovered_idx", -1)) >= 0 for r in w_pause_hover):
-        errs.append("Pause Menu mouse hover not detected (ui_hovered_idx < 0 in [75700..76100ms]).")
+        errs.append("Pause Menu mouse hover not detected (ui_hovered_idx < 0 in [84500..84900ms]).")
 
     # Verify context-aware latched Esc fired once on Pause transition
-    esc_win = _window(records, 74750, 75500)
+    esc_win = _window(records, 83550, 84300)
     if not any(bool(r.get("esc_pulse")) for r in esc_win):
         warns.append("esc_pulse=true not observed during 3D->Pause Escape press (verify latched Esc logging).")
 
@@ -771,19 +969,37 @@ def _self_test_mkb_logic(tmp_dir: Path) -> None:
         {"eff_us": 67400_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "wasd_x": -0.707107, "wasd_y": 0.707107, "wasd_mag": 1.0},
         {"eff_us": 68000_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "wasd_x": 0.707107, "wasd_y": -0.707107, "wasd_mag": 1.0},
         {"eff_us": 68600_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "wasd_x": -0.707107, "wasd_y": -0.707107, "wasd_mag": 1.0},
-        {"eff_us": 69220_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "wheel_pulse": 1},
-        {"eff_us": 69520_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "wheel_pulse": -1},
-        {"eff_us": 71100_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False},
-        {"eff_us": 72150_000, "phase": "gameplay_active", "input_device": "controller", "cursor_captured": True, "os_cursor_visible": False},
-        {"eff_us": 72650_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False},
-        {"eff_us": 73200_000, "phase": "gameplay_active", "input_device": "mkb", "overlay_open": True, "cursor_captured": False, "os_cursor_visible": True},
-        {"eff_us": 73600_000, "phase": "gameplay_active", "input_device": "mkb", "overlay_open": False, "cursor_captured": True, "os_cursor_visible": False},
-        {"eff_us": 74000_000, "phase": "gameplay_active", "input_device": "mkb", "window_focused": False, "cursor_captured": False, "os_cursor_visible": True},
-        {"eff_us": 74450_000, "phase": "gameplay_active", "input_device": "mkb", "window_focused": True, "cursor_captured": True, "os_cursor_visible": False},
-        {"eff_us": 74850_000, "phase": "gameplay_active", "input_device": "mkb", "esc_pulse": True, "cursor_captured": True, "os_cursor_visible": False},
-        {"eff_us": 75750_000, "phase": "paused", "input_device": "mkb", "cursor_captured": False, "os_cursor_visible": True, "ui_screen": "Menu", "ui_hovered_idx": 0, "ui_item_count": 5},
-        {"eff_us": 76900_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False},
-        {"eff_us": 84000_000, "phase": "title_menu", "input_device": "mkb", "cursor_captured": False, "os_cursor_visible": True, "ui_screen": "RootMenuContent"},
+        {"eff_us": 69220_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "wheel_pulse": 1, "mkb_actions_fired": 1 << 0x18, "mkb_reload_count": 0},
+        {"eff_us": 69520_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "wheel_pulse": -1, "mkb_actions_fired": 1 << 0x19, "mkb_reload_count": 0},
+        {"eff_us": 69900_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "player_y": 1.48},
+        {"eff_us": 70100_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "player_y": 1.48, "mkb_actions_fired": 1 << 0x1F},
+        {"eff_us": 70700_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "player_y": 1.48},
+        {"eff_us": 71050_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "player_y": 2.35, "mkb_actions_fired": 1 << 0x23},
+        {"eff_us": 72100_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "player_y": 1.48, "melee_timer": 2.0, "anim_state": 0x100},
+        {"eff_us": 72350_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "player_y": 1.48, "melee_timer": 0.05, "anim_state": 0x200, "mkb_actions_fired": 1 << 0x20},
+        {"eff_us": 73250_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "anim_state": 0x100},
+        {"eff_us": 73500_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "anim_state": 0x300, "mkb_actions_fired": 1 << 0x26},
+        {"eff_us": 73800_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "anim_state": 0x300},
+        {"eff_us": 74550_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "ammo_clip": 12, "weapon_type": 2, "mkb_reload_count": 0},
+        {"eff_us": 74850_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "ammo_clip": 11, "weapon_type": 2, "mkb_actions_fired": (1 << 0x1A) | (1 << 0x1B), "mkb_reload_count": 0},
+        {"eff_us": 75350_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "ammo_clip": 11, "weapon_type": 2, "mkb_reload_count": 0},
+        {"eff_us": 75650_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "ammo_clip": 12, "weapon_type": 2, "mkb_actions_fired": 0, "mkb_reload_count": 1},
+        {"eff_us": 76350_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "mkb_actions_fired": (1 << 0x2B) | (1 << 0x2C) | (1 << 0x33)},
+        {"eff_us": 77000_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "mkb_actions_fired": 1 << 0x36},
+        {"eff_us": 77750_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "psi_selected": 1, "mkb_actions_fired": (1 << 0x10) | (1 << 0x11) | (1 << 0x13)},
+        {"eff_us": 78350_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "psi_selected": 1, "mkb_actions_fired": (1 << 0x10) | (1 << 0x11) | (1 << 0x13)},
+        {"eff_us": 78950_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "psi_selected": 0, "mkb_actions_fired": (1 << 0x10) | (1 << 0x11) | (1 << 0x12)},
+        {"eff_us": 79650_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False, "psi_selected": 0, "mkb_actions_fired": (1 << 0x10) | (1 << 0x11) | (1 << 0x12)},
+        {"eff_us": 80950_000, "phase": "gameplay_active", "input_device": "controller", "cursor_captured": True, "os_cursor_visible": False},
+        {"eff_us": 81500_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False},
+        {"eff_us": 82000_000, "phase": "gameplay_active", "input_device": "mkb", "overlay_open": True, "cursor_captured": False, "os_cursor_visible": True},
+        {"eff_us": 82400_000, "phase": "gameplay_active", "input_device": "mkb", "overlay_open": False, "cursor_captured": True, "os_cursor_visible": False},
+        {"eff_us": 82800_000, "phase": "gameplay_active", "input_device": "mkb", "window_focused": False, "cursor_captured": False, "os_cursor_visible": True},
+        {"eff_us": 83250_000, "phase": "gameplay_active", "input_device": "mkb", "window_focused": True, "cursor_captured": True, "os_cursor_visible": False},
+        {"eff_us": 83650_000, "phase": "gameplay_active", "input_device": "mkb", "esc_pulse": True, "cursor_captured": True, "os_cursor_visible": False},
+        {"eff_us": 84550_000, "phase": "paused", "input_device": "mkb", "cursor_captured": False, "os_cursor_visible": True, "ui_screen": "Menu", "ui_hovered_idx": 0, "ui_item_count": 5},
+        {"eff_us": 85700_000, "phase": "gameplay_active", "input_device": "mkb", "cursor_captured": True, "os_cursor_visible": False},
+        {"eff_us": 92800_000, "phase": "title_menu", "input_device": "mkb", "cursor_captured": False, "os_cursor_visible": True, "ui_screen": "RootMenuContent"},
     ]
     tmp_dir.mkdir(parents=True, exist_ok=True)
     p = tmp_dir / "_selftest_mkb_state.jsonl"

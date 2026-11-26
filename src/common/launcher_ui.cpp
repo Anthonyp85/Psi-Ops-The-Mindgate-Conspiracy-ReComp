@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // 6-Tab Pre-Game Graphical Launcher (Win32 + D3D12 PerMonitorV2 & Linux SDL3 SDL_Renderer 1280x800).
 // Supports mouse, touch, keyboard, and gamepad (LB/RB tabs, D-Pad, A/B, Start=Play),
-// 5 Hardware Presets, live [Ready] plugin badges, Psi-Ops 22-action Click-to-Rebind Controls tab,
+// 5 Hardware Presets, live [Ready] plugin badges, Psi-Ops 25-action Click-to-Rebind Controls tab,
 // In-App XISO File Browser, --launcher-tab, --open-file-browser, --capture-launcher-bmp,
 // and strictly ZERO settings.toml writes on unconfigured Exit.
 
