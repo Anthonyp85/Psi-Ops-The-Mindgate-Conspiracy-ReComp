@@ -28,9 +28,9 @@
 
 #include <toml++/toml.hpp>
 
-static_assert(PSIOPS_VERSION_MAJOR == 1 && PSIOPS_VERSION_MINOR == 1 && PSIOPS_VERSION_PATCH == 0 &&
-                  std::string_view(PSIOPS_VERSION_STR) == "1.1.0",
-              "Keep game_info.cpp, version.h, and CMakeLists.txt synchronized (v1.1.0)");
+static_assert(PSIOPS_VERSION_MAJOR == 1 && PSIOPS_VERSION_MINOR == 2 && PSIOPS_VERSION_PATCH == 0 &&
+                  std::string_view(PSIOPS_VERSION_STR) == "1.2.0",
+              "Keep game_info.cpp, version.h, and CMakeLists.txt synchronized (v1.2.0)");
 
 uint32_t PsiOpsLiveCameraVa();
 uint64_t PsiOpsConsumeMkbActionsFired();

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 REPO_NAME="Psi-Ops-The-Mindgate-Conspiracy-ReComp"
-VERSION="v1.1.0"
+VERSION="v1.2.0"
 SKIP_BUILD=0
 
 while [[ $# -gt 0 ]]; do
@@ -19,7 +19,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [--version v1.1.0] [--skip-build]"
+            echo "Usage: $0 [--version v1.2.0] [--skip-build]"
             exit 0
             ;;
         *)
