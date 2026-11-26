@@ -462,7 +462,7 @@ void DrawLauncherFrame(LauncherState& st, void* native_owner_win, float ui_scale
         ImGui::TextUnformatted("Psi-Ops: The Mindgate Conspiracy v" PSIOPS_VERSION_STR " - Pre-Game Launcher");
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        ImGui::TextDisabled("   (LB / RB switch tabs  |  F1 in-game overlay  |  Start to Play)");
+        ImGui::TextDisabled("   (LB / RB switch tabs  |  F1 in-game overlay  |  F2 quick cheats  |  Start to Play)");
         ui_common::DrawLauncherHeaderUpdateButton(upd_snap, ui_scale, [&] {
             if (!ui_common::GetUpdatePrefs().dismissed_update_tag.empty()) {
                 ui_common::GetUpdatePrefs().dismissed_update_tag.clear();
@@ -564,6 +564,12 @@ void DrawLauncherFrame(LauncherState& st, void* native_owner_win, float ui_scale
                             st.tools_status =
                                 "Shader & PSO cache cleared. Full AOT pre-compilation will run on next launch.";
                         }
+                        ImGui::Spacing();
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.32f, 0.86f, 0.96f, 1.0f));
+                        ImGui::TextUnformatted("In-Game Cheats & Psychic Trainer (F2)");
+                        ImGui::PopStyleColor();
+                        ImGui::Separator();
+                        ui_common::DrawCheatsPanel(ui_scale, st.settings_modified, &st.tools_status);
                     }
                     ImGui::EndChild();
                     ImGui::EndTabItem();

@@ -3,6 +3,7 @@
 // and live-synced Settings panels for Pre-Game Launcher and in-game F1 Overlay.
 
 #include "common/ui_common.h"
+#include "../game/cheats.h"
 #include "../game/guest_settings.h"
 
 #include <algorithm>
@@ -916,6 +917,8 @@ void LoadUpdatePrefs(const void* toml_table) {
     } else {
         g_update_prefs.dismissed_update_tag.clear();
     }
+    g_update_prefs.show_cheats_hud =
+        root["show_cheats_hud"].value_or(g_update_prefs.show_cheats_hud);
 }
 
 void SaveUpdatePrefs(void* toml_table) {
@@ -924,6 +927,7 @@ void SaveUpdatePrefs(void* toml_table) {
     std::lock_guard<std::mutex> lk(g_update_prefs_lock);
     root.insert_or_assign("check_updates_on_startup", g_update_prefs.check_updates_on_startup);
     root.insert_or_assign("dismissed_update_tag", g_update_prefs.dismissed_update_tag);
+    root.insert_or_assign("show_cheats_hud", g_update_prefs.show_cheats_hud);
 }
 
 std::string SanitizeUiText(const std::string& s, bool single_line, size_t max_chars) {
@@ -1439,6 +1443,326 @@ void DrawUpdatesDiagnosticsSection(const psiops::UpdateStatusSnapshot& snap, boo
             ImGui::TextDisabled("Installed Version: %s  |  GitHub: %s", PSIOPS_VERSION_TAG, PSIOPS_GITHUB_REPO);
             break;
     }
+}
+
+namespace {
+
+const char* ShortCheatToggleFallbackLabel(psiops::cheats::CheatToggle id) {
+    switch (id) {
+        case psiops::cheats::CheatToggle::GodMode: return "God Mode (Invulnerability)";
+        case psiops::cheats::CheatToggle::InfinitePsi: return "Infinite Psi Energy";
+        case psiops::cheats::CheatToggle::BottomlessClip: return "Bottomless Magazine";
+        case psiops::cheats::CheatToggle::InfiniteReserveAmmo: return "Infinite Reserve Ammo";
+        case psiops::cheats::CheatToggle::SuperPsi: return "Super Psi Power";
+        case psiops::cheats::CheatToggle::OneHitKills: return "One-Hit Kills (Hostiles Only)";
+        case psiops::cheats::CheatToggle::Count:
+        default: return "Cheat Toggle";
+    }
+}
+
+const char* ShortCheatToggleSubtitle(psiops::cheats::CheatToggle id) {
+    switch (id) {
+        case psiops::cheats::CheatToggle::GodMode:
+            return "Zero damage taken; Nick stays at 100% Max Health";
+        case psiops::cheats::CheatToggle::InfinitePsi:
+            return "Psi energy stays at 100% and never drains";
+        case psiops::cheats::CheatToggle::BottomlessClip:
+            return "Active & holstered weapon magazines never deplete";
+        case psiops::cheats::CheatToggle::InfiniteReserveAmmo:
+            return "Reserve ammo pools stay at max capacity";
+        case psiops::cheats::CheatToggle::SuperPsi:
+            return "Amplified Psi power damage & telekinetic force";
+        case psiops::cheats::CheatToggle::OneHitKills:
+            return "Hostile minions die in one hit (bosses & NPCs safe)";
+        case psiops::cheats::CheatToggle::Count:
+        default:
+            return "";
+    }
+}
+
+const psiops::cheats::CheatActionInfo* FindCheatActionInfo(psiops::cheats::CheatAction action) {
+    const auto& infos = psiops::cheats::GetActionInfos();
+    const size_t idx = static_cast<size_t>(action);
+    if (idx < infos.size() && infos[idx].id == action) return &infos[idx];
+    for (const auto& info : infos) {
+        if (info.id == action) return &info;
+    }
+    return nullptr;
+}
+
+void DrawCheatActionButton(psiops::cheats::CheatAction action, const char* fallback_label, float s, bool can_run,
+                           std::string* out_status) {
+    const psiops::cheats::CheatActionInfo* info = FindCheatActionInfo(action);
+    const char* label = (info && info->label && *info->label) ? info->label : fallback_label;
+    ImGui::PushID(static_cast<int>(action));
+    if (ImGui::Button(label, ImVec2(-1.0f, std::round(30.0f * s)))) {
+        psiops::cheats::EnqueueAction(action);
+        if (out_status) {
+            *out_status = std::string("Queued cheat action: ") + label;
+        }
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (ImGui::BeginTooltip()) {
+            ImGui::PushTextWrapPos(420.0f * s);
+            if (info && info->description && *info->description) {
+                ImGui::TextUnformatted(info->description);
+            } else {
+                ImGui::TextUnformatted(label);
+            }
+            if (!can_run) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.98f, 0.78f, 0.30f, 1.0f),
+                                   "Requires an active gameplay mission with Nick Scryer alive.");
+            }
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+    }
+    ImGui::PopID();
+}
+
+}  // namespace
+
+void DrawCheatsPanel(float ui_scale, bool& dirty, std::string* out_status) {
+    const float s = std::clamp(ui_scale, 1.0f, 2.5f);
+    UpdateUiPrefs& ui_prefs = GetUpdatePrefs();
+    const psiops::cheats::CheatRuntimeStatus st = psiops::cheats::GetRuntimeStatus();
+    const bool replay_locked = st.replay_active;
+    const bool has_active_cheats = !replay_locked && st.active_toggle_count > 0;
+    const bool can_run_actions = !replay_locked && st.in_level && st.player_alive;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * s, 5.0f * s));
+
+    // 1. Live Status Header Card
+    ImVec4 card_bg(0.082f, 0.112f, 0.155f, 0.96f);
+    ImVec4 card_border(0.24f, 0.56f, 0.72f, 0.84f);
+    ImU32 accent_bar = IM_COL32(72, 206, 238, 230);
+    ImU32 accent_glow = IM_COL32(72, 206, 238, 46);
+    if (replay_locked) {
+        card_bg = ImVec4(0.145f, 0.090f, 0.096f, 0.96f);
+        card_border = ImVec4(0.78f, 0.30f, 0.30f, 0.88f);
+        accent_bar = IM_COL32(224, 82, 82, 235);
+        accent_glow = IM_COL32(224, 82, 82, 48);
+    } else if (has_active_cheats) {
+        card_bg = ImVec4(0.118f, 0.104f, 0.082f, 0.97f);
+        card_border = ImVec4(0.94f, 0.68f, 0.22f, 0.92f);
+        accent_bar = IM_COL32(246, 184, 58, 240);
+        accent_glow = IM_COL32(246, 184, 58, 54);
+    } else if (st.in_level) {
+        card_bg = ImVec4(0.076f, 0.132f, 0.138f, 0.96f);
+        card_border = ImVec4(0.30f, 0.74f, 0.58f, 0.86f);
+        accent_bar = IM_COL32(84, 218, 152, 230);
+        accent_glow = IM_COL32(84, 218, 152, 46);
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, card_bg);
+    ImGui::PushStyleColor(ImGuiCol_Border, card_border);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, std::max(1.5f, std::round(1.5f * s)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(11.0f * s, 6.5f * s));
+
+    constexpr ImGuiChildFlags kStatusFlags =
+        ImGuiChildFlags_Border | ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_NavFlattened;
+    if (ImGui::BeginChild("##PsiOpsCheatStatusCard", ImVec2(0.0f, 0.0f), kStatusFlags)) {
+        ImGui::AlignTextToFramePadding();
+        if (replay_locked) {
+            ImGui::TextColored(ImVec4(0.96f, 0.44f, 0.42f, 1.0f),
+                               "Deterministic Replay / Autotest Active - All cheats & actions are suppressed.");
+        } else if (st.in_level) {
+            if (!st.player_alive) {
+                ImGui::TextColored(ImVec4(0.96f, 0.38f, 0.38f, 1.0f), "[PLAYER DOWN]");
+            } else if (st.mind_controlling) {
+                ImGui::TextColored(ImVec4(0.68f, 0.56f, 1.00f, 1.0f), "[MIND CONTROL]");
+            } else {
+                ImGui::TextColored(ImVec4(0.45f, 0.94f, 0.62f, 1.0f), "[IN LEVEL]");
+            }
+            ImGui::SameLine(0.0f, 8.0f * s);
+            ImGui::Text("HP: %.0f/%.0f  |  Psi: %.0f/%.0f  |  Ammo: %d/%d (+%d/%d)  |  Weapons: %u",
+                        st.health, st.max_health, st.psi, st.max_psi, st.clip_ammo, st.max_clip_ammo,
+                        st.reserve_ammo, st.max_reserve_ammo, st.owned_weapon_count);
+            if (ImGui::IsItemHovered()) {
+                if (ImGui::BeginTooltip()) {
+                    ImGui::Text("Active Magazine: %d / %d  |  Reserve Pool: %d / %d  |  Owned Weapons: %u  |  Armed Toggles: %u",
+                                st.clip_ammo, st.max_clip_ammo, st.reserve_ammo, st.max_reserve_ammo,
+                                st.owned_weapon_count, st.active_toggle_count);
+                    ImGui::EndTooltip();
+                }
+            }
+        } else {
+            ImGui::TextColored(
+                ImVec4(0.96f, 0.80f, 0.34f, 1.0f),
+                "Load into a mission or training room for instant loadout/Psi actions - persistent toggles can be armed anytime.");
+        }
+
+        if (has_active_cheats) {
+            char dis_vis[48];
+            std::snprintf(dis_vis, sizeof(dis_vis), "Disable All Cheats (%u)", st.active_toggle_count);
+            std::string dis_id = std::string(dis_vis) + "##DisableAllCheatsBtn";
+            const float dis_w = ImGui::CalcTextSize(dis_vis).x + ImGui::GetStyle().FramePadding.x * 2.0f + 10.0f * s;
+            ImGui::SameLine();
+            const float avail_x = ImGui::GetContentRegionAvail().x;
+            if (avail_x >= dis_w + 8.0f * s) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail_x - dis_w);
+            } else {
+                ImGui::NewLine();
+            }
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.58f, 0.16f, 0.18f, 0.98f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.76f, 0.22f, 0.24f, 1.00f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.88f, 0.26f, 0.28f, 1.00f));
+            if (ImGui::Button(dis_id.c_str(), ImVec2(dis_w, 0.0f))) {
+                psiops::cheats::DisableAllCheats();
+                dirty = true;
+                if (out_status) *out_status = "Disabled all active persistent cheats.";
+            }
+            ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Turn off all armed persistent psychic & combat cheat toggles immediately.");
+            }
+        }
+
+        if (!replay_locked && !st.last_action_feedback.empty()) {
+            const std::string clean_fb = SanitizeUiText(st.last_action_feedback, true, 118);
+            const ImVec4 fb_col = st.last_action_is_warning ? ImVec4(0.98f, 0.78f, 0.30f, 1.0f)
+                                                            : ImVec4(0.48f, 0.95f, 0.62f, 1.0f);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(fb_col, "> %s", clean_fb.c_str());
+
+            const char* clr_txt = "Dismiss";
+            const float clr_w = ImGui::CalcTextSize(clr_txt).x + ImGui::GetStyle().FramePadding.x * 2.0f + 6.0f * s;
+            ImGui::SameLine();
+            const float clr_avail = ImGui::GetContentRegionAvail().x;
+            if (clr_avail >= clr_w + 8.0f * s) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + clr_avail - clr_w);
+            }
+            if (ImGui::SmallButton("Dismiss##ClearCheatFeedback")) {
+                psiops::cheats::ClearActionFeedback();
+            }
+        }
+    }
+    ImGui::EndChild();
+
+    const ImVec2 c_min = ImGui::GetItemRectMin();
+    const ImVec2 c_max = ImGui::GetItemRectMax();
+    if (c_max.x > c_min.x + 8.0f && c_max.y > c_min.y + 8.0f) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRect(ImVec2(c_min.x + 1.0f, c_min.y + 1.0f), ImVec2(c_max.x - 1.0f, c_max.y - 1.0f), accent_glow,
+                    6.0f * s, 0, std::max(1.0f, s));
+        dl->AddRectFilled(ImVec2(c_min.x + 1.0f, c_min.y + 3.0f * s),
+                          ImVec2(c_min.x + std::max(3.5f, std::round(3.5f * s)), c_max.y - 3.0f * s), accent_bar,
+                          2.0f * s);
+    }
+
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(2);
+
+    // 2. Persistent Psychic & Combat Toggles (2-Column Grid)
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.32f, 0.86f, 0.96f, 1.0f), "Psychic & Combat Toggles");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(Saved in settings.toml; arm anytime)");
+
+    if (replay_locked) ImGui::BeginDisabled(true);
+    const auto& toggle_infos = psiops::cheats::GetToggleInfos();
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(6.0f * s, 2.5f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f * s, 3.5f * s));
+    if (ImGui::BeginTable("##PsiOpsCheatTogglesGrid", 2, ImGuiTableFlags_SizingStretchSame)) {
+        for (size_t i = 0; i < toggle_infos.size(); ++i) {
+            ImGui::TableNextColumn();
+            const psiops::cheats::CheatToggleInfo& info = toggle_infos[i];
+            const char* lbl = (info.label && *info.label) ? info.label : ShortCheatToggleFallbackLabel(info.id);
+            bool armed = !replay_locked && psiops::cheats::GetToggle(info.id);
+            const bool style_pushed = armed;
+            ImGui::PushID(static_cast<int>(i));
+            if (style_pushed) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.90f, 0.62f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.28f, 0.20f, 0.08f, 0.98f));
+            }
+            if (ImGui::Checkbox(lbl, &armed)) {
+                psiops::cheats::SetToggle(info.id, armed);
+                dirty = true;
+            }
+            if (style_pushed) {
+                ImGui::PopStyleColor(2);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                if (ImGui::BeginTooltip()) {
+                    ImGui::PushTextWrapPos(420.0f * s);
+                    if (info.description && *info.description) {
+                        ImGui::TextUnformatted(info.description);
+                    } else {
+                        ImGui::TextUnformatted(ShortCheatToggleSubtitle(info.id));
+                    }
+                    if (armed && st.in_level && psiops::cheats::IsToggleEffective(info.id)) {
+                        ImGui::Spacing();
+                        ImGui::TextColored(ImVec4(0.45f, 0.94f, 0.62f, 1.0f), "Status: Active in current mission");
+                    }
+                    ImGui::PopTextWrapPos();
+                    ImGui::EndTooltip();
+                }
+            }
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f * s, 1.0f * s));
+            ImGui::TextDisabled("  %s", ShortCheatToggleSubtitle(info.id));
+            ImGui::PopStyleVar();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar(2);
+    if (replay_locked) ImGui::EndDisabled();
+
+    // 3. Instant Arsenal & Psi Power Actions (2x2 Grid)
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.32f, 0.86f, 0.96f, 1.0f), "Instant Arsenal & Psi Power Actions");
+    ImGui::SameLine();
+    if (can_run_actions) {
+        ImGui::TextColored(ImVec4(0.45f, 0.94f, 0.62f, 1.0f), "(Ready)");
+    } else {
+        ImGui::TextDisabled("(Requires active mission & live Nick Scryer)");
+    }
+
+    if (!can_run_actions) ImGui::BeginDisabled(true);
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(5.0f * s, 3.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f * s, 4.0f * s));
+    if (ImGui::BeginTable("##PsiOpsCheatActionsGrid", 2, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextColumn();
+        DrawCheatActionButton(psiops::cheats::CheatAction::FullHealAndPsi, "Full Heal & Max Psi", s, can_run_actions,
+                              out_status);
+        ImGui::TableNextColumn();
+        DrawCheatActionButton(psiops::cheats::CheatAction::RefillAllAmmo, "Refill All Weapon Ammo", s, can_run_actions,
+                              out_status);
+        ImGui::TableNextColumn();
+        DrawCheatActionButton(psiops::cheats::CheatAction::UnlockAllPsiPowers, "Unlock All 6 Psi Powers", s,
+                              can_run_actions, out_status);
+        ImGui::TableNextColumn();
+        DrawCheatActionButton(psiops::cheats::CheatAction::GiveAllWeaponsAndAmmo, "Give All Weapons & Max Ammo", s,
+                              can_run_actions, out_status);
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar(2);
+    if (!can_run_actions) ImGui::EndDisabled();
+
+    // 4. Subtle HUD Badge Option & Shortcut Legend
+    ImGui::Separator();
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(7.0f * s, 3.5f * s));
+    if (ImGui::Checkbox("Show Active Cheats Badge on HUD##CheatsHudToggle", &ui_prefs.show_cheats_hud)) {
+        dirty = true;
+    }
+    ImGui::PopStyleVar();
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Displays a subtle 'CHEATS ACTIVE (N)' pill in the bottom-left corner while cheats are armed.");
+    }
+
+    const char* legend = "F2: Quick Cheats  |  F1 / BACK+L3: Overlay  |  LB/RB: Switch Tabs";
+    const float leg_w = ImGui::CalcTextSize(legend).x;
+    ImGui::SameLine();
+    const float leg_avail = ImGui::GetContentRegionAvail().x;
+    if (leg_avail >= leg_w + 10.0f * s) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + leg_avail - leg_w);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("%s", legend);
+    }
+
+    ImGui::PopStyleVar();
 }
 
 }  // namespace ui_common

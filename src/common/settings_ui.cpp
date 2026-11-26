@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Live-Synced In-Game F1 / BACK+L3 Settings Overlay (5 tabs) and Upgraded Live HUD
-// (FPS | ms | Upscaler | Render -> Display).
+// Live-Synced In-Game F1 / F2 / BACK+L3 Settings & Cheats Overlay (6 tabs) and Upgraded Live HUD
+// (FPS | ms | Upscaler | Render -> Display + Active Cheats Pill).
 
 #include "common/settings_ui.h"
+#include "../game/cheats.h"
 #include "../game/guest_settings.h"
 #include "common/input_recorder.h"
 #include "common/mkb_input.h"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -40,18 +42,27 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <SDL3/SDL.h>
 #endif
 
 namespace settings_ui {
 
 namespace {
 
+constexpr int kSettingsTabCount = 6;
+constexpr int kTabControls = 3;
+constexpr int kTabDiagnostics = 4;
+constexpr int kTabCheats = 5;
+
 struct OverlayState {
     bool initialized = false;
     bool theme_applied = false;
     bool show_hud = false;
     int active_tab = 0;
+    bool tab_select_pending = false;
     bool chord_prev = false;
+    bool f2_prev_down = false;
     bool was_open = false;
     upscale::PluginProbe probe{};
     std::vector<app::GpuAdapterInfo> gpus;
@@ -83,14 +94,16 @@ uint64_t SteadyNowMs() {
 bool IsAutomationCliArg(std::string_view arg) {
     return arg.rfind("--capture-", 0) == 0 || arg == "--replay" || arg.rfind("--replay=", 0) == 0 ||
            arg.rfind("--replay-", 0) == 0 || arg.rfind("--record-input", 0) == 0 ||
-           arg.rfind("--state-log", 0) == 0 || arg == "--open-settings";
+           arg.rfind("--state-log", 0) == 0 || arg == "--open-settings" || arg == "--open-cheats" ||
+           arg.rfind("--settings-tab", 0) == 0;
 }
 
 bool CheckSuppressWarmupToastCliOrEnv() {
 #ifdef _WIN32
     static constexpr const wchar_t* kEnvVars[] = {
-        L"XBE_OPEN_SETTINGS",    L"XBE_CAPTURE_UI_BMP",  L"XBE_CAPTURE_DIR",  L"XBE_AUTOTEST_OUT_DIR",
-        L"XBE_AUTOTEST_SCRIPT",  L"XBE_INPUT_RECORD",    L"XBE_INPUT_REPLAY", L"XBE_STATE_LOG",
+        L"XBE_OPEN_SETTINGS",    L"XBE_OPEN_CHEATS",      L"XBE_SETTINGS_TAB", L"XBE_CAPTURE_UI_BMP",
+        L"XBE_CAPTURE_DIR",      L"XBE_AUTOTEST_OUT_DIR", L"XBE_AUTOTEST_SCRIPT", L"XBE_INPUT_RECORD",
+        L"XBE_INPUT_REPLAY",     L"XBE_STATE_LOG",
     };
     for (const wchar_t* name : kEnvVars) {
         if (const wchar_t* v = _wgetenv(name); v && *v && std::wcscmp(v, L"0") != 0) return true;
@@ -115,8 +128,9 @@ bool CheckSuppressWarmupToastCliOrEnv() {
     return false;
 #else
     static constexpr const char* kEnvVars[] = {
-        "XBE_OPEN_SETTINGS",    "XBE_CAPTURE_UI_BMP",  "XBE_CAPTURE_DIR",  "XBE_AUTOTEST_OUT_DIR",
-        "XBE_AUTOTEST_SCRIPT",  "XBE_INPUT_RECORD",    "XBE_INPUT_REPLAY", "XBE_STATE_LOG",
+        "XBE_OPEN_SETTINGS",    "XBE_OPEN_CHEATS",      "XBE_SETTINGS_TAB", "XBE_CAPTURE_UI_BMP",
+        "XBE_CAPTURE_DIR",      "XBE_AUTOTEST_OUT_DIR", "XBE_AUTOTEST_SCRIPT", "XBE_INPUT_RECORD",
+        "XBE_INPUT_REPLAY",     "XBE_STATE_LOG",
     };
     for (const char* name : kEnvVars) {
         if (const char* v = std::getenv(name); v && *v && std::strcmp(v, "0") != 0) return true;
@@ -346,19 +360,168 @@ void PollInGameUpdateTransitions(OverlayState& st, const psiops::UpdateStatusSna
     st.prev_upd_state = snap.state;
 }
 
-bool CheckOpenSettingsCliOrEnv() {
+int ParseSettingsTabToken(std::string_view raw) {
+    if (raw.empty()) return -1;
+    std::string low;
+    low.reserve(raw.size());
+    bool all_digits = true;
+    for (char c : raw) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (!std::isdigit(uc)) all_digits = false;
+        low.push_back(static_cast<char>(std::tolower(uc)));
+    }
+    if (all_digits) {
+        return std::clamp(std::atoi(low.c_str()), 0, kSettingsTabCount - 1);
+    }
+    if (low == "upscaling" || low == "graphics") return 0;
+    if (low == "display" || low == "gpu") return 1;
+    if (low == "audio") return 2;
+    if (low == "controls" || low == "input") return kTabControls;
+    if (low == "diagnostics" || low == "tools") return kTabDiagnostics;
+    if (low == "cheats" || low == "cheat" || low == "trainer") return kTabCheats;
+    return -1;
+}
+
+void ApplyStartupOverlayCliAndEnv(OverlayState& st) {
+    bool open_overlay = false;
+    int req_tab = -1;
 #ifdef _WIN32
-    if (const wchar_t* v = _wgetenv(L"XBE_OPEN_SETTINGS"); v && *v && std::wcscmp(v, L"0") != 0) return true;
-    const wchar_t* cmd = GetCommandLineW();
-    if (cmd && std::wcsstr(cmd, L"--open-settings") != nullptr) return true;
-    return false;
+    if (const wchar_t* v = _wgetenv(L"XBE_OPEN_SETTINGS"); v && *v && std::wcscmp(v, L"0") != 0) {
+        open_overlay = true;
+    }
+    if (const wchar_t* v = _wgetenv(L"XBE_OPEN_CHEATS"); v && *v && std::wcscmp(v, L"0") != 0) {
+        open_overlay = true;
+        req_tab = kTabCheats;
+    }
+    if (const wchar_t* v = _wgetenv(L"XBE_SETTINGS_TAB"); v && *v) {
+        int parsed = ParseSettingsTabToken(ui_common::WideToUtf8Str(v));
+        if (parsed >= 0) req_tab = parsed;
+    }
 #else
-    if (const char* v = std::getenv("XBE_OPEN_SETTINGS"); v && *v && std::strcmp(v, "0") != 0) return true;
-    std::ifstream f("/proc/self/cmdline", std::ios::binary);
-    if (!f) return false;
-    std::string raw((std::istreambuf_iterator<char>(f)), {});
-    return raw.find("--open-settings") != std::string::npos;
+    if (const char* v = std::getenv("XBE_OPEN_SETTINGS"); v && *v && std::strcmp(v, "0") != 0) {
+        open_overlay = true;
+    }
+    if (const char* v = std::getenv("XBE_OPEN_CHEATS"); v && *v && std::strcmp(v, "0") != 0) {
+        open_overlay = true;
+        req_tab = kTabCheats;
+    }
+    if (const char* v = std::getenv("XBE_SETTINGS_TAB"); v && *v) {
+        int parsed = ParseSettingsTabToken(v);
+        if (parsed >= 0) req_tab = parsed;
+    }
 #endif
+    const std::vector<std::string> args = ui_common::GetProcessArgsUtf8();
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--open-settings") {
+            open_overlay = true;
+        } else if (a == "--open-cheats") {
+            open_overlay = true;
+            req_tab = kTabCheats;
+        } else if (a == "--settings-tab" && i + 1 < args.size()) {
+            int parsed = ParseSettingsTabToken(args[++i]);
+            if (parsed >= 0) {
+                req_tab = parsed;
+                open_overlay = true;
+            }
+        } else if (a.rfind("--settings-tab=", 0) == 0) {
+            int parsed = ParseSettingsTabToken(std::string_view(a).substr(15));
+            if (parsed >= 0) {
+                req_tab = parsed;
+                open_overlay = true;
+            }
+        }
+    }
+    if (req_tab >= 0) {
+        st.active_tab = req_tab;
+        st.tab_select_pending = true;
+    }
+    if (open_overlay) {
+        mkb::SetOverlayOpen(true);
+    }
+}
+
+void ToggleOrSwitchCheatsOverlay(OverlayState& st) {
+    const bool open_now = mkb::IsOverlayOpen();
+    if (!open_now) {
+        mkb::CancelRebind();
+        st.active_tab = kTabCheats;
+        st.tab_select_pending = true;
+        mkb::SetOverlayOpen(true);
+    } else if (st.active_tab == kTabCheats) {
+        mkb::CancelRebind();
+        mkb::SetOverlayOpen(false);
+    } else {
+        mkb::CancelRebind();
+        st.active_tab = kTabCheats;
+        st.tab_select_pending = true;
+    }
+}
+
+void PollF2QuickCheatsHotkey(OverlayState& st) {
+    if (app::IsReplayOrAutotestActive() || input::AutotestActive() || mkb::IsAutotestActive() ||
+        input_rec::IsReplayActive() || input_rec::IsRecordActive()) {
+        st.f2_prev_down = false;
+        return;
+    }
+    bool down = false;
+#ifdef _WIN32
+    if (HWND fg = GetForegroundWindow()) {
+        DWORD fg_pid = 0;
+        GetWindowThreadProcessId(fg, &fg_pid);
+        if (fg_pid == GetCurrentProcessId() && !IsIconic(fg)) {
+            down = (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+        }
+    }
+#else
+    if (SDL_GetKeyboardFocus() != nullptr) {
+        int num_keys = 0;
+        const bool* ks = SDL_GetKeyboardState(&num_keys);
+        if (ks && int(SDL_SCANCODE_F2) < num_keys) {
+            down = ks[SDL_SCANCODE_F2];
+        }
+    }
+#endif
+    const bool rising = down && !st.f2_prev_down;
+    st.f2_prev_down = down;
+    if (rising && !mkb::IsRebinding()) {
+        ToggleOrSwitchCheatsOverlay(st);
+    }
+}
+
+bool ShouldShowActiveCheatsHud(uint32_t* out_count) {
+    if (!ui_common::GetUpdatePrefs().show_cheats_hud) return false;
+    if (g_suppress_warmup_toast.load(std::memory_order_relaxed) || app::IsReplayOrAutotestActive() ||
+        input::AutotestActive() || mkb::IsAutotestActive() || input_rec::IsReplayActive() ||
+        input_rec::IsRecordActive()) {
+        return false;
+    }
+    const uint32_t active_cnt = psiops::cheats::GetActiveToggleCount();
+    if (active_cnt == 0) return false;
+    if (out_count) *out_count = active_cnt;
+    return true;
+}
+
+void DrawActiveCheatsHud(uint32_t active_cnt) {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) return;
+
+    ImGui::SetNextWindowPos(ImVec2(14.0f, io.DisplaySize.y - 14.0f), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.78f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(9.0f, 5.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.118f, 0.100f, 0.072f, 0.90f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.94f, 0.68f, 0.22f, 0.88f));
+    constexpr ImGuiWindowFlags kPillFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                            ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs |
+                                            ImGuiWindowFlags_NoMove;
+    if (ImGui::Begin("##PsiOpsActiveCheatsHud", nullptr, kPillFlags)) {
+        ImGui::TextColored(ImVec4(1.00f, 0.86f, 0.38f, 1.0f), "CHEATS ACTIVE (%u)", active_cnt);
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
 }
 
 void DrawLiveHud(double fps) {
@@ -385,7 +548,8 @@ void DrawLiveHud(double fps) {
         ImGui::Text("%.1f FPS", fps);
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        ImGui::Text("| %.1f ms | %s | %ux%u -> %ux%u | %s | F1 Settings", ms, up_name, rw, rh, dw, dh, dev_str);
+        ImGui::Text("| %.1f ms | %s | %ux%u -> %ux%u | %s | F1 Settings | F2 Cheats", ms, up_name, rw, rh, dw, dh,
+                    dev_str);
     }
     ImGui::End();
     ImGui::PopStyleVar(2);
@@ -394,11 +558,16 @@ void DrawLiveHud(double fps) {
 }  // namespace
 
 bool HasVisibleUi() {
-    if (psiops::guest_settings::ConsumePendingHostSaveRequest()) {
+    OverlayState& st = St();
+    if (st.initialized) {
+        PollF2QuickCheatsHotkey(st);
+    }
+    if (psiops::guest_settings::ConsumePendingHostSaveRequest() ||
+        psiops::cheats::ConsumePendingHostSaveRequest()) {
         g_deferred_guest_save.store(true, std::memory_order_release);
     }
     return mkb::IsOverlayOpen() || g_show_hud.load(std::memory_order_relaxed) ||
-           g_deferred_guest_save.load(std::memory_order_acquire) ||
+           g_deferred_guest_save.load(std::memory_order_acquire) || ShouldShowActiveCheatsHud(nullptr) ||
            ShouldShowShaderWarmupToast(nullptr, nullptr) || ShouldShowUpdateAvailableToast(nullptr, nullptr);
 }
 
@@ -412,9 +581,7 @@ void Init() {
     const bool suppress_auto = CheckSuppressWarmupToastCliOrEnv();
     g_suppress_warmup_toast.store(suppress_auto, std::memory_order_relaxed);
     gpu::SetUiVisibleCallback(HasVisibleUi);
-    if (CheckOpenSettingsCliOrEnv()) {
-        mkb::SetOverlayOpen(true);
-    }
+    ApplyStartupOverlayCliAndEnv(st);
     const bool has_mock_upd = HasMockUpdateEnv();
     if ((!suppress_auto && !app::IsReplayOrAutotestActive()) || has_mock_upd) {
         if ((ui_common::GetUpdatePrefs().check_updates_on_startup && psiops::ShouldAutoCheckForUpdates()) ||
@@ -443,7 +610,8 @@ void Draw(double fps) {
     if (!st.initialized) Init();
 
     if (g_deferred_guest_save.exchange(false, std::memory_order_acq_rel) ||
-        psiops::guest_settings::ConsumePendingHostSaveRequest()) {
+        psiops::guest_settings::ConsumePendingHostSaveRequest() ||
+        psiops::cheats::ConsumePendingHostSaveRequest()) {
         if (!app::IsReplayOrAutotestActive() && !input::AutotestActive() && !mkb::IsAutotestActive() &&
             !input_rec::IsReplayActive() && !input_rec::IsRecordActive()) {
             app::Save();
@@ -459,6 +627,10 @@ void Draw(double fps) {
     if (st.show_hud || open_now) {
         DrawLiveHud(fps);
     }
+    uint32_t active_cheats_cnt = 0;
+    if (ShouldShowActiveCheatsHud(&active_cheats_cnt)) {
+        DrawActiveCheatsHud(active_cheats_cnt);
+    }
     gpu::CacheStats warmup_cs{};
     float warmup_alpha = 0.0f;
     if (ShouldShowShaderWarmupToast(&warmup_cs, &warmup_alpha)) {
@@ -471,7 +643,7 @@ void Draw(double fps) {
     }
     if (!open_now) {
         if (st.was_open) {
-            // Overlay just closed (F1 / Esc / BACK+L3 / Resume): don't leave gamepad keys latched in ImGui,
+            // Overlay just closed (F1 / F2 / Esc / BACK+L3 / Resume): don't leave gamepad keys latched in ImGui,
             // and drop any half-finished click-to-rebind capture.
             st.was_open = false;
             ui_common::ReleaseGamepadNavKeys(ImGui::GetIO());
@@ -485,8 +657,14 @@ void Draw(double fps) {
     ui_common::GamepadNavEvents nav = ui_common::PollGamepadNavToImGui(io);
     // LB/RB tab switching is suspended while a rebind capture is pending on the Controls tab.
     if (mkb::IsRebinding()) nav.tab_prev = nav.tab_next = false;
-    if (nav.tab_prev) st.active_tab = (st.active_tab + 4) % 5;
-    if (nav.tab_next) st.active_tab = (st.active_tab + 1) % 5;
+    if (nav.tab_prev) {
+        st.active_tab = (st.active_tab + kSettingsTabCount - 1) % kSettingsTabCount;
+        st.tab_select_pending = true;
+    }
+    if (nav.tab_next) {
+        st.active_tab = (st.active_tab + 1) % kSettingsTabCount;
+        st.tab_select_pending = true;
+    }
 
     ImVec2 ds = io.DisplaySize;
     float w = std::min(ds.x * 0.86f, 880.0f);
@@ -500,24 +678,26 @@ void Draw(double fps) {
     psiops::UpdateStatusSnapshot upd_snap = psiops::GetUpdateSnapshot();
     PollInGameUpdateTransitions(st, upd_snap);
 
-    if (ImGui::Begin("Psi-Ops: The Mindgate Conspiracy v" PSIOPS_VERSION_STR " - Live Settings (F1 / BACK+L3)",
+    if (ImGui::Begin("Psi-Ops: The Mindgate Conspiracy v" PSIOPS_VERSION_STR " - Live Settings (F1 / F2 / BACK+L3)",
                      &keep_open, ImGuiWindowFlags_NoCollapse)) {
         if (ImGui::Checkbox("Show Performance & Upscaler HUD", &st.show_hud)) {
             g_show_hud.store(st.show_hud, std::memory_order_relaxed);
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("  |  LB / RB switch tabs  |  Changes save & apply live");
+        ImGui::TextDisabled("  |  F2 Quick Cheats  |  LB / RB switch tabs  |  Changes save & apply live");
         ImGui::Separator();
 
-        static constexpr const char* kTabNames[5] = {
-            "Upscaling & Graphics", "Display & GPU", "Audio", "Controls", "Diagnostics",
+        static constexpr const char* kTabNames[kSettingsTabCount] = {
+            "Upscaling & Graphics", "Display & GPU", "Audio", "Controls", "Diagnostics", "Cheats",
         };
         if (ImGui::BeginTabBar("LiveOverlayTabs")) {
-            for (int t = 0; t < 5; ++t) {
+            for (int t = 0; t < kSettingsTabCount; ++t) {
                 ImGuiTabItemFlags tflags =
-                    (nav.tab_prev || nav.tab_next) && (st.active_tab == t) ? ImGuiTabItemFlags_SetSelected : 0;
+                    (st.tab_select_pending && st.active_tab == t) ? ImGuiTabItemFlags_SetSelected : 0;
                 if (ImGui::BeginTabItem(kTabNames[t], nullptr, tflags)) {
-                    st.active_tab = t;
+                    if (!st.tab_select_pending) {
+                        st.active_tab = t;
+                    }
                     float scroll_h = std::max(140.0f, ImGui::GetContentRegionAvail().y - 44.0f);
                     ImGui::BeginChild("OverlayTabBody", ImVec2(0.0f, scroll_h), false);
                     if (t == 0) {
@@ -530,11 +710,11 @@ void Draw(double fps) {
                         ui_common::DrawDisplayGpuPanel(st.gpus, st.monitors, true, dirty, needs_display_apply);
                     } else if (t == 2) {
                         ui_common::DrawAudioPanel(dirty);
-                    } else if (t == 3) {
+                    } else if (t == kTabControls) {
                         mkb::DrawControlsSettingsPanel(true, &dirty);
                         ImGui::Spacing();
                         ui_common::DrawInGameControlsOptionsPanel(dirty);
-                    } else if (t == 4) {
+                    } else if (t == kTabDiagnostics) {
                         ui_common::DrawUpdatesDiagnosticsSection(
                             upd_snap, false, 1.0f, dirty, st.upd_manual_pending, st.diag_status, [&] {
                                 app::Save();
@@ -572,15 +752,18 @@ void Draw(double fps) {
                             st.diag_status =
                                 "Shader & PSO cache reset scheduled. Full AOT pre-compilation will run on next launch.";
                         }
+                    } else if (t == kTabCheats) {
+                        ui_common::DrawCheatsPanel(1.0f, dirty, &st.diag_status);
                     }
                     ImGui::EndChild();
                     ImGui::EndTabItem();
                 }
             }
+            st.tab_select_pending = false;
             ImGui::EndTabBar();
         }
         // A rebind capture only lives while the Controls tab is the one on screen.
-        if (st.active_tab != 3) mkb::CancelRebind();
+        if (st.active_tab != kTabControls) mkb::CancelRebind();
 
         ImGui::Separator();
         if (ImGui::Button("Resume Game (F1)", ImVec2(180.0f, 32.0f))) {

@@ -44,6 +44,7 @@ void DrawDisplayGpuPanel(const std::vector<app::GpuAdapterInfo>& gpus,
 void DrawAudioPanel(bool& dirty);
 void DrawInGameControlsOptionsPanel(bool& dirty);
 void DrawToolsDiagnosticsPanel(const upscale::PluginProbe& probe, bool in_game, std::string& action_status);
+void DrawCheatsPanel(float ui_scale, bool& dirty, std::string* out_status = nullptr);
 
 // Gamepad poll edge-detector for UI navigation (D-Pad, A/B/X/Y, LB/RB tab switch, Start).
 struct GamepadNavEvents {
@@ -73,10 +74,11 @@ std::string WideToUtf8Str(std::wstring_view w);
 std::vector<std::string> GetProcessArgsUtf8();
 bool IsGamescope();
 
-// Persistent update-checker preferences stored in settings.toml.
+// Persistent update-checker & overlay HUD preferences stored in settings.toml.
 struct UpdateUiPrefs {
     bool check_updates_on_startup = true;
     std::string dismissed_update_tag;
+    bool show_cheats_hud = true;
 };
 UpdateUiPrefs& GetUpdatePrefs();
 void LoadUpdatePrefs(const void* toml_table);

@@ -21,20 +21,25 @@
 #include "core/log.h"
 #include "cpu/x86_context.h"
 #include "cpu/x86_ops.h"
+#include "game/cheats.h"
 #include "game/guest_settings.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
 
-// Top-level GameStatus lifecycle entry-point overrides (scanned by xbe_recomp --headers-only):
+// Top-level GameStatus & TakeDamage entry-point overrides (scanned by xbe_recomp --headers-only):
 //  - sub_000DA750: GameStatus::GameStatus ctor (__stdcall, ret 4, [esp+4] = 0x005ECC78)
 //  - sub_000DBF50: GameStatus::ReadProfile (__thiscall, ret 4, ecx = 0x005ECC78)
 //  - sub_000DC090: GameStatus::WriteProfile (__thiscall, ret 4, ecx = 0x005ECC78)
 //  - sub_000DD0D0: GameStatus::CommitOptionsTransaction (__thiscall, ret 0, ecx = 0x005ECC78)
+//  - sub_000FEF40: Player::TakeDamage (__thiscall, ret 0x10, ecx = Player*)
+//  - sub_0001FBE0: Character::TakeDamage (__thiscall, ret 0x10, ecx = Character*)
 X86_EXTERN_FUNC(__imp__sub_000DA750);
 X86_EXTERN_FUNC(__imp__sub_000DBF50);
 X86_EXTERN_FUNC(__imp__sub_000DC090);
 X86_EXTERN_FUNC(__imp__sub_000DD0D0);
+X86_EXTERN_FUNC(__imp__sub_000FEF40);
+X86_EXTERN_FUNC(__imp__sub_0001FBE0);
 
 namespace {
 
@@ -298,6 +303,345 @@ void SyncHostSettingsToGuestOnFrame(X86Context& ctx, uint8_t* base) {
     if (psiops::guest_settings::ConsumePendingGuestSync(&pending)) {
         WriteGuestUserSettingsToRamAndApply(ctx, base, pending, true);
     }
+}
+
+// ============================================================================
+// D5 — F2 In-Game Cheat System Guest Helpers (RTTI Matrix, Vitals, Weapons)
+// ============================================================================
+constexpr uint32_t kRttiIsKindOfMatrixVa = 0x005C4F00u;
+constexpr uint32_t kRttiClassCount = 0xA3u;
+constexpr uint8_t kCidAiMinion = 0x54u;
+constexpr uint8_t kCidAiLabCoat = 0x5Cu;
+constexpr uint8_t kCidAiBoss = 0x5Eu;
+constexpr uint8_t kCidPlayer = 0x6Au;
+constexpr uint8_t kCidHud = 0x91u;
+constexpr uint32_t kVtblPlayer = 0x004FCD08u;
+
+// Guest-thread state tracking for clean true -> false cheat flag restoration.
+uint32_t g_cheat_tracked_player = 0u;
+bool g_cheat_applied_inf_psi = false;
+bool g_cheat_applied_bottomless = false;
+bool g_cheat_applied_super_psi = false;
+
+bool GuestIsKindOf(const uint8_t* base, uint32_t actor, uint8_t target_cid) {
+    if (!ValidGuest(actor + 0x08u, 4u)) return false;
+    const uint32_t cid = ReadU32(base, actor + 0x08u);
+    if (cid >= kRttiClassCount || target_cid >= kRttiClassCount) return false;
+    const uint32_t cell_va = kRttiIsKindOfMatrixVa + cid * kRttiClassCount + uint32_t(target_cid);
+    return ValidGuest(cell_va, 1u) && ReadU8(base, cell_va) != 0u;
+}
+
+bool LocateLivePlayer(const uint8_t* base, bool& out_in_level, uint32_t& out_player) {
+    out_in_level = false;
+    out_player = 0u;
+    if (!ValidGuest(0x00586A04u, 4u)) return false;
+    const uint32_t app = ReadU32(base, 0x00586A04u);
+    if (!ValidGuest(app, 0xD8u)) return false;
+
+    const uint32_t state = ReadU32(base, app + 0x70u);
+    const uint32_t player = ReadU32(base, app + 0xD0u);
+    const uint32_t world = ReadU32(base, app + 0xD4u);
+
+    const bool status_ready = ValidGuest(kGameStatusInitGuardVa, 1u) && ((ReadU8(base, kGameStatusInitGuardVa) & 1u) != 0u);
+    const bool in_shell = !status_ready || !ValidGuest(0x005ECEA7u, 1u) || (ReadU8(base, 0x005ECEA7u) != 0u);
+    const bool fmv_active = ValidGuest(0x005C4198u, 4u) && ValidGuest(0x005C4250u, 4u) &&
+                            ReadU32(base, 0x005C4198u) != 0u && ReadU32(base, 0x005C4250u) == 0u;
+
+    if (in_shell || fmv_active || world == 0u || state == 8u) {
+        return false;
+    }
+    out_in_level = true;
+
+    if (!ValidGuest(player, 0x870u)) return false;
+    if (ReadU32(base, player) != kVtblPlayer && ReadU32(base, player + 0x08u) != uint32_t(kCidPlayer)) {
+        return false;
+    }
+    out_player = player;
+    return true;
+}
+
+uint32_t ResolveLiveHudVa(const uint8_t* base) {
+    if (!ValidGuest(0x005CCB90u, 4u)) return 0u;
+    const uint32_t hud = ReadU32(base, 0x005CCB90u);
+    if (!ValidGuest(hud, 0x3E0u) || !GuestIsKindOf(base, hud, kCidHud)) return 0u;
+    return hud;
+}
+
+void MarkHudDirty(uint8_t* base, bool health, bool psi, bool ammo) {
+    const uint32_t hud = ResolveLiveHudVa(base);
+    if (!hud) return;
+    if (health) base[hud + 0x3D8u] = 1u;
+    if (psi) base[hud + 0x3D9u] = 1u;
+    if (ammo) base[hud + 0x3DBu] = 1u;
+}
+
+uint32_t ResolveActivePlayerWeapon(const uint8_t* base, uint32_t player) {
+    if (!ValidGuest(player, 0x870u)) return 0u;
+    uint32_t wpn = ReadU32(base, player + 0x6FCu);
+    if (!wpn) {
+        const uint32_t holder = ReadU32(base, player + 0x788u);
+        if (holder != 0u && ValidGuest(holder + 0x04u, 4u)) {
+            wpn = ReadU32(base, holder + 0x04u);
+        }
+    }
+    return ValidGuest(wpn, 0x54u) ? wpn : 0u;
+}
+
+std::vector<uint32_t> CollectOwnedPlayerWeapons(const uint8_t* base, uint32_t player, uint32_t active_wpn) {
+    std::vector<uint32_t> out;
+    out.reserve(12);
+    auto add_unique = [&](uint32_t w) {
+        if (!ValidGuest(w, 0x54u)) return;
+        const uint32_t wtype = ReadU32(base, w + 0x10u);
+        if (wtype == 0u || wtype >= 64u) return;
+        if (std::find(out.begin(), out.end(), w) == out.end()) {
+            out.push_back(w);
+        }
+    };
+    if (active_wpn != 0u) add_unique(active_wpn);
+    if (!ValidGuest(player + 0x794u, 8u)) return out;
+    const uint32_t begin = ReadU32(base, player + 0x794u);
+    const uint32_t end = ReadU32(base, player + 0x798u);
+    if (end > begin && ((end - begin) % 4u) == 0u && (end - begin) <= 64u * 4u && ValidGuest(begin, end - begin)) {
+        for (uint32_t it = begin; it < end; it += 4u) {
+            const uint32_t slot = ReadU32(base, it);
+            if (slot != 0u && ValidGuest(slot + 0x04u, 4u)) {
+                add_unique(ReadU32(base, slot + 0x04u));
+            }
+        }
+    }
+    return out;
+}
+
+bool RefillWeaponAmmoList(uint8_t* base, const std::vector<uint32_t>& weapons, bool clips, bool reserves) {
+    bool changed = false;
+    for (uint32_t wpn : weapons) {
+        if (!ValidGuest(wpn, 0x54u)) continue;
+        if (clips) {
+            const int32_t cur_clip = int32_t(ReadU32(base, wpn + 0x48u));
+            const int32_t max_clip = int32_t(ReadU32(base, wpn + 0x4Cu));
+            if (max_clip > 0 && max_clip < 1000 && cur_clip < max_clip) {
+                WriteU32(base, wpn + 0x48u, uint32_t(max_clip));
+                changed = true;
+            }
+        }
+        if (reserves) {
+            const uint32_t pool = ReadU32(base, wpn + 0x44u);
+            if (pool != 0u && ValidGuest(pool, 8u)) {
+                const int32_t cur_res = int32_t(ReadU32(base, pool + 0x00u));
+                const int32_t max_res = int32_t(ReadU32(base, pool + 0x04u));
+                if (max_res > 0 && max_res < 100000 && cur_res < max_res) {
+                    WriteU32(base, pool + 0x00u, uint32_t(max_res));
+                    changed = true;
+                }
+            }
+        }
+    }
+    return changed;
+}
+
+void CallGameStatusBoolCheat(X86Context& ctx, uint8_t* base, uint32_t bool_id) {
+    if (!ValidGuest(kGameStatusInitGuardVa, 1u) || (ReadU8(base, kGameStatusInitGuardVa) & 1u) == 0u ||
+        !ValidGuest(kGameStatusVa, kGameStatusSize)) {
+        return;
+    }
+    const uint8_t saved_tx = ReadU8(base, kGameStatusTxActiveVa);
+    base[kGameStatusTxActiveVa] = 0u;
+    {
+        GuestCallFrame frame(ctx, base);
+        if (frame.ok()) {
+            ctx.ecx = kGameStatusVa;
+            frame.Push(1u);       // [esp+8] = enabled (1)
+            frame.Push(bool_id);  // [esp+4] = bool_opt id (3 = all Psi powers, 7 = all weapons)
+            frame.Call(kFnSetBoolOption);
+        }
+    }
+    base[kGameStatusTxActiveVa] = saved_tx;
+}
+
+void TickCheatsOnGuestFrame(X86Context& ctx, uint8_t* base) {
+    using namespace psiops::cheats;
+
+    if (ShouldBypassGuestSettings()) {
+        g_cheat_tracked_player = 0u;
+        g_cheat_applied_inf_psi = false;
+        g_cheat_applied_bottomless = false;
+        g_cheat_applied_super_psi = false;
+        CheatRuntimeStatus suppressed{};
+        suppressed.replay_active = true;
+        PublishRuntimeStatus(suppressed);
+        return;
+    }
+
+    bool in_level = false;
+    uint32_t player = 0u;
+    const bool has_player = LocateLivePlayer(base, in_level, player);
+
+    if (player != g_cheat_tracked_player) {
+        g_cheat_tracked_player = player;
+        g_cheat_applied_inf_psi = false;
+        g_cheat_applied_bottomless = false;
+        g_cheat_applied_super_psi = false;
+    }
+
+    float cur_hp = has_player ? ReadF32(base, player + 0x770u) : 0.0f;
+    float max_hp = has_player ? ReadF32(base, player + 0x76Cu) : 100.0f;
+    if (!std::isfinite(max_hp) || max_hp <= 0.0f) max_hp = 100.0f;
+    if (!std::isfinite(cur_hp)) cur_hp = 0.0f;
+    const bool player_alive = has_player && (cur_hp > 0.0f);
+
+    bool hp_dirty = false;
+    bool psi_dirty = false;
+    bool ammo_dirty = false;
+
+    uint32_t active_wpn = player_alive ? ResolveActivePlayerWeapon(base, player) : 0u;
+    std::vector<uint32_t> weapons = player_alive ? CollectOwnedPlayerWeapons(base, player, active_wpn)
+                                                 : std::vector<uint32_t>{};
+
+    // 1. Drain queued one-shot CheatActions on the guest main thread.
+    CheatAction act{};
+    while (ConsumeNextQueuedAction(&act)) {
+        if (!in_level) {
+            RecordActionFeedback(true, "Load into a mission or training room first to use instant player actions.");
+            continue;
+        }
+        if (!player_alive || player == 0u) {
+            RecordActionFeedback(true, "Cannot apply instant player action while Nick is dead.");
+            continue;
+        }
+        switch (act) {
+            case CheatAction::FullHealAndPsi: {
+                const float target_hp = std::max(ReadF32(base, player + 0x76Cu), 100.0f);
+                const float target_psi = std::max(ReadF32(base, player + 0x774u), 100.0f);
+                WriteF32(base, player + 0x770u, target_hp);
+                WriteF32(base, player + 0x778u, target_psi);
+                hp_dirty = true;
+                psi_dirty = true;
+                RecordActionFeedback(false, "Restored 100% Health and 100% Psi Energy.");
+                break;
+            }
+            case CheatAction::RefillAllAmmo: {
+                active_wpn = ResolveActivePlayerWeapon(base, player);
+                weapons = CollectOwnedPlayerWeapons(base, player, active_wpn);
+                if (weapons.empty()) {
+                    RecordActionFeedback(true, "No weapons currently in inventory to refill.");
+                } else {
+                    (void)RefillWeaponAmmoList(base, weapons, true, true);
+                    ammo_dirty = true;
+                    RecordActionFeedback(false, "Refilled magazines and reserve ammo for all owned weapons.");
+                }
+                break;
+            }
+            case CheatAction::UnlockAllPsiPowers: {
+                CallGameStatusBoolCheat(ctx, base, 3u);
+                const float target_psi = std::max(ReadF32(base, player + 0x774u), 100.0f);
+                WriteF32(base, player + 0x778u, target_psi);
+                psi_dirty = true;
+                RecordActionFeedback(false, "Unlocked all 6 Psi Powers (TK, RV, MD, PK, MC, AV).");
+                break;
+            }
+            case CheatAction::GiveAllWeaponsAndAmmo: {
+                CallGameStatusBoolCheat(ctx, base, 7u);
+                active_wpn = ResolveActivePlayerWeapon(base, player);
+                weapons = CollectOwnedPlayerWeapons(base, player, active_wpn);
+                (void)RefillWeaponAmmoList(base, weapons, true, true);
+                ammo_dirty = true;
+                RecordActionFeedback(false, "Granted full weapon arsenal with maximum ammo.");
+                break;
+            }
+            case CheatAction::Count:
+                break;
+        }
+    }
+
+    // 2. Apply persistent toggles & true -> false native flag restoration.
+    if (player_alive) {
+        if (IsToggleEffective(CheatToggle::GodMode)) {
+            const float target_hp = std::max(ReadF32(base, player + 0x76Cu), 100.0f);
+            if (ReadF32(base, player + 0x770u) < target_hp) {
+                WriteF32(base, player + 0x770u, target_hp);
+                hp_dirty = true;
+            }
+        }
+
+        const bool want_inf_psi = IsToggleEffective(CheatToggle::InfinitePsi);
+        if (want_inf_psi) {
+            if (ReadU8(base, player + 0x7C6u) != 1u) base[player + 0x7C6u] = 1u;
+            const float target_psi = std::max(ReadF32(base, player + 0x774u), 100.0f);
+            if (!std::isfinite(ReadF32(base, player + 0x778u)) || ReadF32(base, player + 0x778u) < target_psi) {
+                WriteF32(base, player + 0x778u, target_psi);
+                psi_dirty = true;
+            }
+            g_cheat_applied_inf_psi = true;
+        } else if (g_cheat_applied_inf_psi) {
+            base[player + 0x7C6u] = 0u;
+            g_cheat_applied_inf_psi = false;
+        }
+
+        const bool want_bottomless = IsToggleEffective(CheatToggle::BottomlessClip);
+        if (want_bottomless) {
+            if (ReadU8(base, player + 0x7C8u) != 1u) base[player + 0x7C8u] = 1u;
+            for (uint32_t wpn : weapons) {
+                if (ReadU8(base, wpn + 0x50u) != 1u) base[wpn + 0x50u] = 1u;
+            }
+            if (RefillWeaponAmmoList(base, weapons, true, false)) {
+                ammo_dirty = true;
+            }
+            g_cheat_applied_bottomless = true;
+        } else if (g_cheat_applied_bottomless) {
+            base[player + 0x7C8u] = 0u;
+            for (uint32_t wpn : weapons) {
+                if (ValidGuest(wpn, 0x54u)) base[wpn + 0x50u] = 0u;
+            }
+            ammo_dirty = true;
+            g_cheat_applied_bottomless = false;
+        }
+
+        if (IsToggleEffective(CheatToggle::InfiniteReserveAmmo)) {
+            if (RefillWeaponAmmoList(base, weapons, false, true)) {
+                ammo_dirty = true;
+            }
+        }
+
+        const bool want_super_psi = IsToggleEffective(CheatToggle::SuperPsi);
+        if (want_super_psi) {
+            if (ReadU8(base, player + 0x7C9u) != 1u) base[player + 0x7C9u] = 1u;
+            g_cheat_applied_super_psi = true;
+        } else if (g_cheat_applied_super_psi) {
+            base[player + 0x7C9u] = 0u;
+            g_cheat_applied_super_psi = false;
+        }
+    }
+
+    if (hp_dirty || psi_dirty || ammo_dirty) {
+        MarkHudDirty(base, hp_dirty, psi_dirty, ammo_dirty);
+    }
+
+    // 3. Snapshot live telemetry for the F2 UI thread.
+    CheatRuntimeStatus st{};
+    st.in_level = in_level;
+    st.player_alive = player_alive;
+    if (has_player) {
+        st.mind_controlling = (ReadU32(base, player + 0x764u) != 0u);
+        st.max_health = std::max(ReadF32(base, player + 0x76Cu), 100.0f);
+        st.health = std::clamp(ReadF32(base, player + 0x770u), 0.0f, st.max_health);
+        st.max_psi = std::max(ReadF32(base, player + 0x774u), 100.0f);
+        const float raw_psi = ReadF32(base, player + 0x778u);
+        st.psi = std::isfinite(raw_psi) ? std::clamp(raw_psi, 0.0f, st.max_psi) : 0.0f;
+        st.owned_weapon_count = uint32_t(weapons.size());
+
+        active_wpn = ResolveActivePlayerWeapon(base, player);
+        if (active_wpn != 0u) {
+            st.clip_ammo = std::max<int32_t>(0, int32_t(ReadU32(base, active_wpn + 0x48u)));
+            st.max_clip_ammo = std::max<int32_t>(0, int32_t(ReadU32(base, active_wpn + 0x4Cu)));
+            const uint32_t pool = ReadU32(base, active_wpn + 0x44u);
+            if (pool != 0u && ValidGuest(pool, 8u)) {
+                st.reserve_ammo = std::max<int32_t>(0, int32_t(ReadU32(base, pool + 0x00u)));
+                st.max_reserve_ammo = std::max<int32_t>(0, int32_t(ReadU32(base, pool + 0x04u)));
+            }
+        }
+    }
+    PublishRuntimeStatus(st);
 }
 
 }  // namespace
@@ -901,6 +1245,7 @@ int g_last_logged_ui_y0 = -99999;
 void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
     EnsurePlayerPortBound(base);
     SyncHostSettingsToGuestOnFrame(ctx, base);
+    TickCheatsOnGuestFrame(ctx, base);
     if (input_rec::ShouldBypassMkb() || mkb::IsOverlayOpen()) {
         mkb::ReportMenuUiTelemetry("", -1, 0);
         return;
@@ -1655,4 +2000,46 @@ X86_FUNC(sub_000DC090) {
         snap.has_saved_values = true;
         psiops::guest_settings::NotifyGuestCapturedSettings(snap, true);
     }
+}
+
+// Player::TakeDamage @ 0x000FEF40 (__thiscall, ret 0x10, ecx = Player*, [esp+4] = float damage).
+// Blocks all damage, hit reactions, and death on Nick Scryer when God Mode is active.
+X86_FUNC(sub_000FEF40) {
+    if (!ShouldBypassGuestSettings() && psiops::cheats::IsToggleEffective(psiops::cheats::CheatToggle::GodMode)) {
+        bool in_level = false;
+        uint32_t live_player = 0u;
+        if (LocateLivePlayer(base, in_level, live_player) && ctx.ecx == live_player && ValidGuest(ctx.esp, 0x14u)) {
+            ctx.eax = ctx.eax & 0xFFFFFF00u;
+            ctx.esp += 0x14u;
+            return;
+        }
+    }
+    __imp__sub_000FEF40(ctx, base);
+}
+
+// Character::TakeDamage @ 0x0001FBE0 (__thiscall, ret 0x10, ecx = Character*, [esp+4] = float damage).
+// Amplifies positive incoming damage to lethal (999999.0f) for hostile AI_Minion enemies when One-Hit Kills is active,
+// running the engine's native 0x0001FFBA death, ragdoll, weapon-drop, and Python OnDeath script pipeline while
+// strictly excluding Player (0x6A), scripted invulnerable NPCs (+0x4BA), Mind-Controlled puppets (player+0x764),
+// unarmed AI_LabCoat scientists (0x5C), and all AI_Boss classes (0x5E).
+X86_FUNC(sub_0001FBE0) {
+    if (!ShouldBypassGuestSettings() && psiops::cheats::IsToggleEffective(psiops::cheats::CheatToggle::OneHitKills)) {
+        const uint32_t actor = ctx.ecx;
+        if (actor != 0u && ValidGuest(actor, 0x4C0u) && ValidGuest(ctx.esp + 0x04u, 4u)) {
+            bool in_level = false;
+            uint32_t player = 0u;
+            (void)LocateLivePlayer(base, in_level, player);
+            const uint32_t mc_puppet = (player != 0u && ValidGuest(player + 0x764u, 4u))
+                                           ? ReadU32(base, player + 0x764u)
+                                           : 0u;
+            const float dmg = ReadF32(base, ctx.esp + 0x04u);
+            if (std::isfinite(dmg) && dmg > 0.0f && actor != player && !GuestIsKindOf(base, actor, kCidPlayer) &&
+                ReadU8(base, actor + 0x4BAu) == 0u && (player == 0u || actor != mc_puppet) &&
+                GuestIsKindOf(base, actor, kCidAiMinion) && !GuestIsKindOf(base, actor, kCidAiBoss) &&
+                ReadU32(base, actor + 0x08u) != uint32_t(kCidAiLabCoat)) {
+                WriteF32(base, ctx.esp + 0x04u, 999999.0f);
+            }
+        }
+    }
+    __imp__sub_0001FBE0(ctx, base);
 }

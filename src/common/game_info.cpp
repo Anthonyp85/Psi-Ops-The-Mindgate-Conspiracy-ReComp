@@ -11,6 +11,7 @@
 #include "common/version.h"
 #include "core/input.h"
 #include "core/perf.h"
+#include "game/cheats.h"
 #include "game/guest_settings.h"
 #include "gpu/backend.h"
 #include "kernel/kernel.h"
@@ -609,12 +610,14 @@ void OnPsiOpsLoadSettings(const void* toml_table) {
     mkb::LoadSettings(toml_table);
     ui_common::LoadUpdatePrefs(toml_table);
     LoadGuestGameOptions(toml_table);
+    psiops::cheats::LoadSettings(toml_table);
 }
 
 void OnPsiOpsSaveSettings(void* toml_table) {
     mkb::SaveSettings(toml_table);
     ui_common::SaveUpdatePrefs(toml_table);
     SaveGuestGameOptions(toml_table);
+    psiops::cheats::SaveSettings(toml_table);
 }
 
 void OnPsiOpsShutdown() {
