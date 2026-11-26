@@ -246,6 +246,10 @@ struct MkbState {
 
     // Real OS key/button state
     std::atomic<bool> key_down[size_t(KeyCode::Count)] = {};
+    // Latched mouse buttons (bits 0..4 for MouseLeft..Mouse5) pressed outside active 3D gameplay
+    // or held across a menu/modal/overlay -> 3D gameplay transition until physical button-up.
+    std::atomic<uint8_t> suppressed_mouse_mask{0};
+    bool prev_gameplay_mouse_allowed = false;
 
     // Physical controller previous state for edge-triggered Auto hot-switch immunity
     uint16_t prev_phys_buttons = 0;
@@ -417,6 +421,55 @@ bool ComputeWantCursorCapture(const MkbState& st) {
     if (!ComputeWantHideCursor(st)) return false;
     if (st.cfg.input_mode == InputMode::Controller) return false;
     return true;
+}
+
+constexpr uint8_t MouseButtonMaskBit(KeyCode kc) {
+    switch (kc) {
+        case KeyCode::MouseLeft: return uint8_t(1u << 0);
+        case KeyCode::MouseRight: return uint8_t(1u << 1);
+        case KeyCode::MouseMiddle: return uint8_t(1u << 2);
+        case KeyCode::Mouse4: return uint8_t(1u << 3);
+        case KeyCode::Mouse5: return uint8_t(1u << 4);
+        default: return 0u;
+    }
+}
+
+bool IsGameplayMouseButtonsAllowed(const MkbState& st) {
+    if (st.overlay_open.load(std::memory_order_relaxed)) return false;
+    if (st.cur_modal_ui.load(std::memory_order_relaxed)) return false;
+    if (st.cur_non_pointer_modal.load(std::memory_order_relaxed)) return false;
+    return st.cur_phase.load(std::memory_order_relaxed) == perf::Phase::GameplayActive;
+}
+
+void NoteMouseButtonEdge(MkbState& st, KeyCode kc, bool down) {
+    const uint8_t bit = MouseButtonMaskBit(kc);
+    if (bit == 0u) return;
+    if (down) {
+        if (!IsGameplayMouseButtonsAllowed(st)) {
+            st.suppressed_mouse_mask.fetch_or(bit, std::memory_order_acq_rel);
+        }
+    } else {
+        st.suppressed_mouse_mask.fetch_and(uint8_t(~bit), std::memory_order_acq_rel);
+    }
+}
+
+void LatchHeldMouseButtonsForTransition(MkbState& st) {
+    constexpr KeyCode kMouseBtns[5] = {
+        KeyCode::MouseLeft, KeyCode::MouseRight, KeyCode::MouseMiddle, KeyCode::Mouse4, KeyCode::Mouse5,
+    };
+    uint8_t mask = 0u;
+    for (size_t i = 0; i < 5; ++i) {
+        if (st.key_down[size_t(kMouseBtns[i])].load(std::memory_order_relaxed)) {
+            mask |= uint8_t(1u << i);
+        }
+    }
+    if (mask != 0u) {
+        st.suppressed_mouse_mask.fetch_or(mask, std::memory_order_acq_rel);
+    }
+    st.raw_dx.store(0, std::memory_order_relaxed);
+    st.raw_dy.store(0, std::memory_order_relaxed);
+    st.smooth_dx = 0.0f;
+    st.smooth_dy = 0.0f;
 }
 
 #ifdef _WIN32
@@ -1029,6 +1082,10 @@ bool IsKeyHeldLocked(const MkbState& st, KeyCode k) {
     if (st.autotest_active.load(std::memory_order_relaxed)) {
         return st.at_key_down[size_t(k)];
     }
+    const uint8_t mbit = MouseButtonMaskBit(k);
+    if (mbit != 0u && (st.suppressed_mouse_mask.load(std::memory_order_acquire) & mbit) != 0u) {
+        return false;
+    }
     return st.key_down[size_t(k)].load(std::memory_order_relaxed);
 }
 
@@ -1126,6 +1183,8 @@ float CmPer360At800Dpi(float sensitivity) {
 void Init() {
     MkbState& st = St();
     std::lock_guard<std::mutex> lk(st.lock);
+    st.suppressed_mouse_mask.store(0u, std::memory_order_release);
+    st.prev_gameplay_mouse_allowed = false;
     LoadAutotestScriptLocked(st);
     input::SetRumbleStrength(st.cfg.rumble_strength);
     input::SetDeadzones(st.cfg.controller_deadzone_left, st.cfg.controller_deadzone_right);
@@ -1135,6 +1194,8 @@ void Init() {
 void Shutdown() {
     MkbState& st = St();
     std::lock_guard<std::mutex> lk(st.lock);
+    st.suppressed_mouse_mask.store(0u, std::memory_order_release);
+    st.prev_gameplay_mouse_allowed = false;
     ApplyOsCursorCaptureLocked(st, false, false, true);
 #ifdef _WIN32
     ClipCursor(nullptr);
@@ -1394,9 +1455,11 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             return false;
         }
         case WM_LBUTTONDOWN:
+        case WM_LBUTTONDBLCLK:
         case WM_LBUTTONUP: {
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
-            bool down = (msg == WM_LBUTTONDOWN);
+            bool down = (msg != WM_LBUTTONUP);
+            NoteMouseButtonEdge(st, KeyCode::MouseLeft, down);
             if (down) {
                 recover_focus_on_input();
                 MarkMkbActivity(st);
@@ -1427,9 +1490,11 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             return false;
         }
         case WM_RBUTTONDOWN:
+        case WM_RBUTTONDBLCLK:
         case WM_RBUTTONUP: {
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
-            bool down = (msg == WM_RBUTTONDOWN);
+            bool down = (msg != WM_RBUTTONUP);
+            NoteMouseButtonEdge(st, KeyCode::MouseRight, down);
             if (down) {
                 recover_focus_on_input();
                 MarkMkbActivity(st);
@@ -1448,9 +1513,11 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             return false;
         }
         case WM_MBUTTONDOWN:
+        case WM_MBUTTONDBLCLK:
         case WM_MBUTTONUP: {
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
-            bool down = (msg == WM_MBUTTONDOWN);
+            bool down = (msg != WM_MBUTTONUP);
+            NoteMouseButtonEdge(st, KeyCode::MouseMiddle, down);
             if (down) {
                 recover_focus_on_input();
                 MarkMkbActivity(st);
@@ -1462,12 +1529,14 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             return false;
         }
         case WM_XBUTTONDOWN:
+        case WM_XBUTTONDBLCLK:
         case WM_XBUTTONUP: {
             if (st.autotest_active.load(std::memory_order_relaxed)) return false;
             WORD xbtn = HIWORD(wp);
             KeyCode kc = (xbtn == XBUTTON1) ? KeyCode::Mouse4 : ((xbtn == XBUTTON2) ? KeyCode::Mouse5 : KeyCode::None);
             if (kc != KeyCode::None) {
-                bool down = (msg == WM_XBUTTONDOWN);
+                bool down = (msg != WM_XBUTTONUP);
+                NoteMouseButtonEdge(st, kc, down);
                 if (down) {
                     recover_focus_on_input();
                     MarkMkbActivity(st);
@@ -1551,9 +1620,11 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                         auto set_btn = [&](USHORT down_flag, USHORT up_flag, KeyCode kc) {
                             if (rm.usButtonFlags & down_flag) {
                                 MarkMkbActivity(st);
+                                NoteMouseButtonEdge(st, kc, true);
                                 if (!handle_rebind_key(kc)) st.key_down[size_t(kc)].store(true, std::memory_order_relaxed);
                             }
                             if (rm.usButtonFlags & up_flag) {
+                                NoteMouseButtonEdge(st, kc, false);
                                 st.key_down[size_t(kc)].store(false, std::memory_order_relaxed);
                                 if (st.cursor_captured.load(std::memory_order_acquire)) {
                                     ReassertWin32ClipAndWarpOnGuiThread(st, hwnd, true);
@@ -1583,6 +1654,7 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                 if (!next) {
                     st.rebind_action = -1;
                     st.rebind_slot = -1;
+                    LatchHeldMouseButtonsForTransition(st);
                 }
                 ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
                 return true;
@@ -1608,6 +1680,7 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             if (!focused) {
                 for (size_t i = 0; i < size_t(KeyCode::Count); ++i)
                     st.key_down[i].store(false, std::memory_order_relaxed);
+                st.suppressed_mouse_mask.store(0u, std::memory_order_release);
             }
             std::lock_guard<std::mutex> lk(st.lock);
             ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
@@ -1620,6 +1693,7 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             if (!focused) {
                 for (size_t i = 0; i < size_t(KeyCode::Count); ++i)
                     st.key_down[i].store(false, std::memory_order_relaxed);
+                st.suppressed_mouse_mask.store(0u, std::memory_order_release);
             }
             std::lock_guard<std::mutex> lk(st.lock);
             ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
@@ -1630,6 +1704,7 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             st.window_focused.store(false, std::memory_order_release);
             for (size_t i = 0; i < size_t(KeyCode::Count); ++i)
                 st.key_down[i].store(false, std::memory_order_relaxed);
+            st.suppressed_mouse_mask.store(0u, std::memory_order_release);
             std::lock_guard<std::mutex> lk(st.lock);
             ApplyOsCursorCaptureLocked(st, false, false, true);
             return false;
@@ -1762,6 +1837,7 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             }
             if (kc != KeyCode::None) {
                 bool down = (msg == SDL_EVENT_MOUSE_BUTTON_DOWN);
+                NoteMouseButtonEdge(st, kc, down);
                 if (down) {
                     recover_sdl_focus();
                     MarkMkbActivity(st);
@@ -1832,6 +1908,7 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
                 if (!next) {
                     st.rebind_action = -1;
                     st.rebind_slot = -1;
+                    LatchHeldMouseButtonsForTransition(st);
                 }
                 ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
                 return true;
@@ -1851,6 +1928,7 @@ bool OnWindowMessage(void* window_handle, uint32_t msg, uintptr_t wp, intptr_t l
             st.window_focused.store(false, std::memory_order_release);
             for (size_t i = 0; i < size_t(KeyCode::Count); ++i)
                 st.key_down[i].store(false, std::memory_order_relaxed);
+            st.suppressed_mouse_mask.store(0u, std::memory_order_release);
             std::lock_guard<std::mutex> lk(st.lock);
             ApplyOsCursorCaptureLocked(st, false, false, true);
             return false;
@@ -2034,14 +2112,19 @@ void OnPresent(uint64_t /*present_frame*/, perf::Phase phase, bool modal_ui_open
             st.prev_present_phase = phase;
         }
 
-        // Discard any raw mouse delta outside active 3D gameplay so cursor motion during FMV/Loading/Pause
-        // never snaps the camera on the first frame of gameplay.
-        if (phase != perf::Phase::GameplayActive) {
+        // Click-through transition guard: when transitioning from menus, modals, FMVs, or the ImGui overlay
+        // into active 3D gameplay, latch all currently held mouse buttons until physically released and discard
+        // stale mouse delta so clicking "Resume Game" or dismissing a modal never fires a stray shot.
+        const bool allow_gameplay_mouse = IsGameplayMouseButtonsAllowed(st);
+        if (allow_gameplay_mouse && !st.prev_gameplay_mouse_allowed) {
+            LatchHeldMouseButtonsForTransition(st);
+        } else if (phase != perf::Phase::GameplayActive) {
             st.raw_dx.store(0, std::memory_order_relaxed);
             st.raw_dy.store(0, std::memory_order_relaxed);
             st.smooth_dx = 0.0f;
             st.smooth_dy = 0.0f;
         }
+        st.prev_gameplay_mouse_allowed = allow_gameplay_mouse;
 
         // Advance in-process XBE_MKB_AUTOTEST schedule on shared stall-clamped eff_us clock
         if (st.autotest_active.load(std::memory_order_relaxed)) {
@@ -2468,7 +2551,9 @@ void SetOverlayOpen(bool open) {
     if (!open) {
         st.rebind_action = -1;
         st.rebind_slot = -1;
+        LatchHeldMouseButtonsForTransition(st);
     }
+    st.prev_gameplay_mouse_allowed = IsGameplayMouseButtonsAllowed(st);
     ApplyOsCursorCaptureLocked(st, ComputeWantCursorCapture(st), ComputeWantHideCursor(st), true);
 }
 bool IsRebinding() {
