@@ -640,7 +640,7 @@ def run_pacing_matrix(exe_path: Path, platform: str, wsl_distro: str, dry_run: b
         for mode in PRESENT_MODES:
             is_60_mult = (hz % 60 == 0)
             if dry_run:
-                sync_interval = (hz // 60) if (mode == "vsync" or (mode == "auto" and is_60_mult)) else 0
+                sync_interval = (hz // 60) if (mode in ("auto", "vsync") and is_60_mult) else 0
                 vsync_paces = (sync_interval > 0)
                 case = {
                     "hz": hz,
@@ -685,6 +685,13 @@ def run_pacing_matrix(exe_path: Path, platform: str, wsl_distro: str, dry_run: b
                 else:
                     if si != 0 or vp:
                         out["errors"].append(f"{platform} {hz}Hz/auto (non-60Hz multiple) must avoid VBlank double-wait (expected sync_interval=0, vsync_pacing_active=false), got {data}")
+            elif mode == "vsync":
+                if is_60_mult:
+                    if si != hz // 60 or not vp or bool(data.get("allow_tearing", False)):
+                        out["errors"].append(f"{platform} {hz}Hz/vsync expected sync_interval={hz//60}, vsync_pacing_active=true & allow_tearing=false, got {data}")
+                else:
+                    if si != 0 or vp or bool(data.get("allow_tearing", False)):
+                        out["errors"].append(f"{platform} {hz}Hz/vsync (non-60Hz multiple) must use tear-free mailbox pacing (expected sync_interval=0, vsync_pacing_active=false, allow_tearing=false), got {data}")
             elif mode == "vrr":
                 if si != 0 or vp:
                     out["errors"].append(f"{platform} {hz}Hz/vrr must use sync_interval=0 & vsync_pacing_active=false, got {data}")

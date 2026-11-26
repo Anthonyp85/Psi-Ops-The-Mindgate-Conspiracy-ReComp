@@ -3,22 +3,29 @@
 // (FPS | ms | Upscaler | Render -> Display).
 
 #include "common/settings_ui.h"
+#include "common/input_recorder.h"
 #include "common/mkb_input.h"
 #include "common/ui_common.h"
 #include "upscale/upscaler_common.h"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <imgui.h>
 
 #include "app/app.h"
+#include "core/input.h"
 #include "gpu/backend.h"
 
 #ifdef _WIN32
@@ -49,10 +56,168 @@ struct OverlayState {
 };
 
 std::atomic<bool> g_show_hud{false};
+std::atomic<bool> g_suppress_warmup_toast{false};
+// 0 = waiting for boot AOT completion, 1..UINT64_MAX-1 = steady_clock start ms, UINT64_MAX = finished/suppressed.
+std::atomic<uint64_t> g_warmup_toast_start_ms{0};
 
 OverlayState& St() {
     static OverlayState s;
     return s;
+}
+
+uint64_t SteadyNowMs() {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+    uint64_t u = (ms > 0) ? uint64_t(ms) : 1ull;
+    return (u == UINT64_MAX) ? (UINT64_MAX - 1ull) : u;
+}
+
+bool IsAutomationCliArg(std::string_view arg) {
+    return arg.rfind("--capture-", 0) == 0 || arg == "--replay" || arg.rfind("--replay=", 0) == 0 ||
+           arg.rfind("--replay-", 0) == 0 || arg.rfind("--record-input", 0) == 0 ||
+           arg.rfind("--state-log", 0) == 0 || arg == "--open-settings";
+}
+
+bool CheckSuppressWarmupToastCliOrEnv() {
+#ifdef _WIN32
+    static constexpr const wchar_t* kEnvVars[] = {
+        L"XBE_OPEN_SETTINGS",    L"XBE_CAPTURE_UI_BMP",  L"XBE_CAPTURE_DIR",  L"XBE_AUTOTEST_OUT_DIR",
+        L"XBE_AUTOTEST_SCRIPT",  L"XBE_INPUT_RECORD",    L"XBE_INPUT_REPLAY", L"XBE_STATE_LOG",
+    };
+    for (const wchar_t* name : kEnvVars) {
+        if (const wchar_t* v = _wgetenv(name); v && *v && std::wcscmp(v, L"0") != 0) return true;
+    }
+    const wchar_t* cmd = GetCommandLineW();
+    if (!cmd) return false;
+    const wchar_t* p = cmd;
+    bool first = true;
+    while (*p) {
+        while (*p && std::iswspace(*p)) ++p;
+        if (!*p) break;
+        std::string tok;
+        bool q = false;
+        while (*p && (q || !std::iswspace(*p))) {
+            if (*p == L'"') q = !q;
+            else tok.push_back((*p < 0x80) ? char(*p) : '?');
+            ++p;
+        }
+        if (!first && IsAutomationCliArg(tok)) return true;
+        first = false;
+    }
+    return false;
+#else
+    static constexpr const char* kEnvVars[] = {
+        "XBE_OPEN_SETTINGS",    "XBE_CAPTURE_UI_BMP",  "XBE_CAPTURE_DIR",  "XBE_AUTOTEST_OUT_DIR",
+        "XBE_AUTOTEST_SCRIPT",  "XBE_INPUT_RECORD",    "XBE_INPUT_REPLAY", "XBE_STATE_LOG",
+    };
+    for (const char* name : kEnvVars) {
+        if (const char* v = std::getenv(name); v && *v && std::strcmp(v, "0") != 0) return true;
+    }
+    std::ifstream f("/proc/self/cmdline", std::ios::binary);
+    if (!f) return false;
+    std::string raw((std::istreambuf_iterator<char>(f)), {});
+    size_t pos = 0;
+    bool first = true;
+    while (pos < raw.size()) {
+        size_t nul = raw.find('\0', pos);
+        if (nul == std::string::npos) nul = raw.size();
+        std::string_view arg(raw.data() + pos, nul - pos);
+        if (!first && IsAutomationCliArg(arg)) return true;
+        first = false;
+        pos = nul + 1;
+    }
+    return false;
+#endif
+}
+
+bool ShouldShowShaderWarmupToast(gpu::CacheStats* out_cs, float* out_alpha) {
+    uint64_t start_ms = g_warmup_toast_start_ms.load(std::memory_order_relaxed);
+    if (start_ms == UINT64_MAX) return false;
+
+    if (g_suppress_warmup_toast.load(std::memory_order_relaxed) || app::IsReplayOrAutotestActive() ||
+        input::AutotestActive() || mkb::IsAutotestActive() || input_rec::IsReplayActive() ||
+        input_rec::IsRecordActive()) {
+        g_warmup_toast_start_ms.store(UINT64_MAX, std::memory_order_relaxed);
+        return false;
+    }
+
+    gpu::CacheStats cs{};
+    bool have_cs = false;
+    if (start_ms == 0) {
+        cs = gpu::GetCacheStats();
+        have_cs = true;
+        if (!cs.enabled) {
+            g_warmup_toast_start_ms.store(UINT64_MAX, std::memory_order_relaxed);
+            return false;
+        }
+        if (!cs.aot_ready) return false;
+        if (cs.shaders == 0 && cs.psos == 0 && cs.aot_compiled_shaders == 0 && cs.aot_built_psos == 0) {
+            g_warmup_toast_start_ms.store(UINT64_MAX, std::memory_order_relaxed);
+            return false;
+        }
+        uint64_t now_init = SteadyNowMs();
+        uint64_t expected = 0;
+        if (g_warmup_toast_start_ms.compare_exchange_strong(expected, now_init, std::memory_order_relaxed)) {
+            start_ms = now_init;
+        } else {
+            start_ms = expected;
+            if (start_ms == UINT64_MAX) return false;
+        }
+    }
+
+    const uint64_t now_ms = SteadyNowMs();
+    const uint64_t age_ms = (now_ms >= start_ms) ? (now_ms - start_ms) : 0ull;
+    constexpr uint64_t kShowDurationMs = 3500;
+    constexpr uint64_t kFadeStartMs = 2750;
+    if (age_ms >= kShowDurationMs) {
+        g_warmup_toast_start_ms.store(UINT64_MAX, std::memory_order_relaxed);
+        return false;
+    }
+    const float alpha =
+        (age_ms <= kFadeStartMs)
+            ? 1.0f
+            : std::clamp(float(kShowDurationMs - age_ms) / float(kShowDurationMs - kFadeStartMs), 0.0f, 1.0f);
+    if (alpha <= 0.02f) {
+        g_warmup_toast_start_ms.store(UINT64_MAX, std::memory_order_relaxed);
+        return false;
+    }
+
+    if (out_cs) *out_cs = have_cs ? cs : gpu::GetCacheStats();
+    if (out_alpha) *out_alpha = alpha;
+    return true;
+}
+
+void DrawShaderWarmupToast(const gpu::CacheStats& cs, float alpha) {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f) return;
+
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 16.0f, io.DisplaySize.y - 16.0f), ImGuiCond_Always,
+                            ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.82f * alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+    constexpr ImGuiWindowFlags kToastFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs |
+                                             ImGuiWindowFlags_NoMove;
+    if (ImGui::Begin("##PsiOpsShaderWarmupToast", nullptr, kToastFlags)) {
+        if (cs.aot_compiled_shaders > 0) {
+            ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.65f, 1.0f),
+                               "Shader Cache Ready: %u compiled | %u Shaders, %u PSOs (%.0f ms)",
+                               cs.aot_compiled_shaders, cs.shaders, cs.psos, cs.aot_ms);
+        } else if (cs.aot_built_psos > 0) {
+            ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.65f, 1.0f),
+                               "Shader Cache Ready: %u PSOs built | %u Shaders, %u PSOs (%.0f ms)",
+                               cs.aot_built_psos, cs.shaders, cs.psos, cs.aot_ms);
+        } else {
+            ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.65f, 1.0f),
+                               "Shader Cache Loaded: %u Shaders | %u PSOs (%.0f ms)", cs.shaders, cs.psos, cs.aot_ms);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(3);
 }
 
 bool CheckOpenSettingsCliOrEnv() {
@@ -102,7 +267,10 @@ void DrawLiveHud(double fps) {
 
 }  // namespace
 
-bool HasVisibleUi() { return mkb::IsOverlayOpen() || g_show_hud.load(std::memory_order_relaxed); }
+bool HasVisibleUi() {
+    return mkb::IsOverlayOpen() || g_show_hud.load(std::memory_order_relaxed) ||
+           ShouldShowShaderWarmupToast(nullptr, nullptr);
+}
 
 void Init() {
     OverlayState& st = St();
@@ -111,6 +279,7 @@ void Init() {
     st.monitors = app::EnumerateMonitors();
     st.initialized = true;
     g_show_hud.store(st.show_hud, std::memory_order_relaxed);
+    g_suppress_warmup_toast.store(CheckSuppressWarmupToastCliOrEnv(), std::memory_order_relaxed);
     gpu::SetUiVisibleCallback(HasVisibleUi);
     if (CheckOpenSettingsCliOrEnv()) {
         mkb::SetOverlayOpen(true);
@@ -140,6 +309,11 @@ void Draw(double fps) {
     const bool open_now = mkb::IsOverlayOpen();
     if (st.show_hud || open_now) {
         DrawLiveHud(fps);
+    }
+    gpu::CacheStats warmup_cs{};
+    float warmup_alpha = 0.0f;
+    if (ShouldShowShaderWarmupToast(&warmup_cs, &warmup_alpha)) {
+        DrawShaderWarmupToast(warmup_cs, warmup_alpha);
     }
     if (!open_now) {
         if (st.was_open) {
