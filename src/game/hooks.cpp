@@ -15,14 +15,26 @@
 #include <thread>
 #include <vector>
 
+#include "app/app.h"
 #include "common/input_recorder.h"
 #include "common/mkb_input.h"
 #include "core/log.h"
 #include "cpu/x86_context.h"
 #include "cpu/x86_ops.h"
+#include "game/guest_settings.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
+
+// Top-level GameStatus lifecycle entry-point overrides (scanned by xbe_recomp --headers-only):
+//  - sub_000DA750: GameStatus::GameStatus ctor (__stdcall, ret 4, [esp+4] = 0x005ECC78)
+//  - sub_000DBF50: GameStatus::ReadProfile (__thiscall, ret 4, ecx = 0x005ECC78)
+//  - sub_000DC090: GameStatus::WriteProfile (__thiscall, ret 4, ecx = 0x005ECC78)
+//  - sub_000DD0D0: GameStatus::CommitOptionsTransaction (__thiscall, ret 0, ecx = 0x005ECC78)
+X86_EXTERN_FUNC(__imp__sub_000DA750);
+X86_EXTERN_FUNC(__imp__sub_000DBF50);
+X86_EXTERN_FUNC(__imp__sub_000DC090);
+X86_EXTERN_FUNC(__imp__sub_000DD0D0);
 
 namespace {
 
@@ -134,6 +146,157 @@ void SyncLookSpring(uint8_t* base, bool mkb_active) {
     } else if (g_look_spring_overridden.exchange(false, std::memory_order_acq_rel)) {
         uint32_t orig = g_saved_look_spring.load(std::memory_order_relaxed);
         std::memcpy(base + kLookSpringVa, &orig, sizeof(orig));
+    }
+}
+
+// Binary-verified GameStatus (0x005ECC78, size 0x640) user-preference VAs & subsystem apply helpers.
+constexpr uint32_t kGameStatusVa = 0x005ECC78u;
+constexpr uint32_t kGameStatusSize = 0x640u;
+constexpr uint32_t kGameStatusInitGuardVa = 0x005ED2B8u;
+constexpr uint32_t kGameStatusTxActiveVa = 0x005ED034u;  // GameStatus + 0x3BC (Options staging active)
+constexpr uint32_t kSoundMgrPtrVa = 0x005ECAE0u;
+constexpr uint32_t kRumbleMgrPtrVa = 0x005CC840u;
+
+constexpr uint32_t kFnApplyAudioOptions = 0x0007BA20u;    // __cdecl, ret 0
+constexpr uint32_t kFnSetBoolOption = 0x000DC630u;        // __thiscall, ecx=GS, [esp+4]=id, [esp+8]=val, ret 8
+constexpr uint32_t kFnSetControllerLayout = 0x000DCEE0u;  // custom, esi=GS, [esp+4]=layout (2..4), ret 4
+
+// Guest-thread re-entrancy guard while applying host [game_options] to GameStatus subsystems.
+bool g_applying_host_guest_settings = false;
+
+bool ShouldBypassGuestSettings() {
+    return app::IsReplayOrAutotestActive() || input_rec::IsReplayActive() || input_rec::IsRecordActive() ||
+           input_rec::ShouldBypassMkb() || mkb::IsAutotestActive();
+}
+
+psiops::guest_settings::GuestUserSettings ReadGuestUserSettingsFromRam(const uint8_t* base) {
+    psiops::guest_settings::GuestUserSettings s = psiops::guest_settings::MakeDefaultSettings();
+    if (!ValidGuest(kGameStatusVa, kGameStatusSize)) return s;
+
+    s.sfx_volume = int32_t(ReadU32(base, 0x005ECD4Cu));       // GlobalIntMap opt[4] (GS + 0xD4)
+    s.music_volume = int32_t(ReadU32(base, 0x005ECD50u));     // GlobalIntMap opt[5] (GS + 0xD8)
+    s.controller_layout = ReadU32(base, 0x005ECEB4u);         // controllerLayout (GS + 0x23C: 2..4)
+    s.controller_invert_y = (ReadU32(base, 0x005ECD5Cu) == 0u);  // opt[8]: 0 = Inverted (default), 1 = Normal
+    s.controller_invert_x = (ReadU32(base, 0x005ECD60u) != 0u);  // opt[9]: 0 = Normal (default), 1 = Inverted
+    s.yaw_speed = int32_t(ReadU32(base, 0x005ECD70u));        // GlobalIntMap opt[13] (GS + 0xF8)
+    s.pitch_speed = int32_t(ReadU32(base, 0x005ECD74u));      // GlobalIntMap opt[14] (GS + 0xFC)
+
+    // GetBoolOption(2) @ 0x000DCA46 reads [RumbleMgr + 0x161] whenever 0x005CC840 is initialized.
+    uint32_t rumble_mgr = ValidGuest(kRumbleMgrPtrVa, 4u) ? ReadU32(base, kRumbleMgrPtrVa) : 0u;
+    if (rumble_mgr != 0u && ValidGuest(rumble_mgr + 0x161u, 1u)) {
+        s.vibration = (ReadU8(base, rumble_mgr + 0x161u) != 0u);
+    } else {
+        s.vibration = (ReadU8(base, 0x005ECEA2u) != 0u);
+    }
+
+    if (g_look_spring_overridden.load(std::memory_order_acquire)) {
+        s.look_spring = ((g_saved_look_spring.load(std::memory_order_relaxed) & 0xFFu) != 0u);
+    } else {
+        s.look_spring = (ReadU8(base, 0x005ECEB8u) != 0u);
+    }
+
+    s.camera_config = ReadU32(base, 0x005ECEB0u);             // cameraConfig (GS + 0x238: 0..2)
+    s.quick_tips = (ReadU8(base, 0x005ECEA3u) != 0u);         // QuickTipsEnabled (GS + 0x22B, bool_opt[16])
+    s.hud_visible = (ReadU8(base, 0x005ECEA5u) != 0u);        // HUDVisible (GS + 0x22D, bool_opt[19])
+    s.auto_hide_hud = (ReadU8(base, 0x005ECEABu) != 0u);      // AutoHideHUD (GS + 0x233, bool_opt[21])
+    return psiops::guest_settings::SanitizeSettings(s);
+}
+
+void WriteGuestUserSettingsToRamAndApply(X86Context& ctx, uint8_t* base,
+                                         const psiops::guest_settings::GuestUserSettings& raw,
+                                         bool apply_live_subsystems) {
+    if (!ValidGuest(kGameStatusVa, kGameStatusSize)) return;
+    const psiops::guest_settings::GuestUserSettings s = psiops::guest_settings::SanitizeSettings(raw);
+    const uint32_t prev_layout = ReadU32(base, 0x005ECEB4u);
+
+    // 1. Write live GameStatus user-preference fields (leaving progression/unlocks completely untouched).
+    WriteU32(base, 0x005ECD4Cu, uint32_t(s.sfx_volume));
+    WriteU32(base, 0x005ECD50u, uint32_t(s.music_volume));
+    WriteU32(base, 0x005ECD5Cu, s.controller_invert_y ? 0u : 1u);
+    WriteU32(base, 0x005ECD60u, s.controller_invert_x ? 1u : 0u);
+    WriteU32(base, 0x005ECD70u, uint32_t(s.yaw_speed));
+    WriteU32(base, 0x005ECD74u, uint32_t(s.pitch_speed));
+    base[0x005ECEA2u] = s.vibration ? 1u : 0u;
+    base[0x005ECEA3u] = s.quick_tips ? 1u : 0u;
+    base[0x005ECEA5u] = s.hud_visible ? 1u : 0u;
+    base[0x005ECEABu] = s.auto_hide_hud ? 1u : 0u;
+    WriteU32(base, 0x005ECEB0u, s.camera_config);
+    WriteU32(base, 0x005ECEB4u, s.controller_layout);
+
+    if (g_look_spring_overridden.load(std::memory_order_acquire)) {
+        uint32_t saved_word = g_saved_look_spring.load(std::memory_order_relaxed);
+        saved_word = (saved_word & 0xFFFFFF00u) | (s.look_spring ? 1u : 0u);
+        g_saved_look_spring.store(saved_word, std::memory_order_relaxed);
+    } else {
+        base[0x005ECEB8u] = s.look_spring ? 1u : 0u;
+    }
+
+    // 2. If an in-game Options screen transaction is currently open ([GS + 0x3BC] != 0), mirror into the
+    //    staging buffer too so clicking "Accept" later does not clobber host edits made via F1.
+    const uint8_t tx_active = ReadU8(base, kGameStatusTxActiveVa);
+    if (tx_active != 0u) {
+        WriteU32(base, kGameStatusVa + 0x534u + 4u * 4u, uint32_t(s.sfx_volume));
+        WriteU32(base, kGameStatusVa + 0x534u + 5u * 4u, uint32_t(s.music_volume));
+        WriteU32(base, kGameStatusVa + 0x534u + 8u * 4u, s.controller_invert_y ? 0u : 1u);
+        WriteU32(base, kGameStatusVa + 0x534u + 9u * 4u, s.controller_invert_x ? 1u : 0u);
+        WriteU32(base, kGameStatusVa + 0x534u + 13u * 4u, uint32_t(s.yaw_speed));
+        WriteU32(base, kGameStatusVa + 0x534u + 14u * 4u, uint32_t(s.pitch_speed));
+
+        base[kGameStatusVa + 0x3BDu + 2u] = s.vibration ? 1u : 0u;
+        base[kGameStatusVa + 0x3BDu + 16u] = s.quick_tips ? 1u : 0u;
+        base[kGameStatusVa + 0x3BDu + 18u] = s.look_spring ? 1u : 0u;
+        base[kGameStatusVa + 0x3BDu + 19u] = s.hud_visible ? 1u : 0u;
+        base[kGameStatusVa + 0x3BDu + 21u] = s.auto_hide_hud ? 1u : 0u;
+
+        WriteU32(base, kGameStatusVa + 0x62Cu, s.camera_config);
+        WriteU32(base, kGameStatusVa + 0x630u, s.controller_layout);
+    }
+
+    if (!apply_live_subsystems) return;
+
+    // 3. Push live updates to SoundManager/HUD audio buses, RumbleMgr, and Config1/2/3 prompt string table.
+    g_applying_host_guest_settings = true;
+    base[kGameStatusTxActiveVa] = 0u;
+
+    if (ValidGuest(kSoundMgrPtrVa, 4u) && ReadU32(base, kSoundMgrPtrVa) != 0u) {
+        GuestCallFrame frame(ctx, base);
+        if (frame.ok()) {
+            frame.Call(kFnApplyAudioOptions);
+        }
+    }
+
+    if (ValidGuest(kRumbleMgrPtrVa, 4u) && ReadU32(base, kRumbleMgrPtrVa) != 0u) {
+        GuestCallFrame frame(ctx, base);
+        if (frame.ok()) {
+            ctx.ecx = kGameStatusVa;
+            frame.Push(s.vibration ? 1u : 0u);  // [esp+8] = val
+            frame.Push(2u);                     // [esp+4] = bool_opt[2] (VibrationEnabled)
+            frame.Call(kFnSetBoolOption);
+        }
+    }
+
+    if (prev_layout != s.controller_layout && ValidGuest(kGameStatusVa + 0x638u, 4u) &&
+        ReadU32(base, kGameStatusVa + 0x638u) != 0u) {
+        GuestCallFrame frame(ctx, base);
+        if (frame.ok()) {
+            ctx.esi = kGameStatusVa;
+            frame.Push(s.controller_layout);  // [esp+4] = layout (2..4)
+            frame.Call(kFnSetControllerLayout);
+        }
+    }
+
+    base[kGameStatusTxActiveVa] = tx_active;
+    g_applying_host_guest_settings = false;
+}
+
+void SyncHostSettingsToGuestOnFrame(X86Context& ctx, uint8_t* base) {
+    if (ShouldBypassGuestSettings() || g_applying_host_guest_settings) return;
+    if (!ValidGuest(kGameStatusInitGuardVa, 1u) || (ReadU8(base, kGameStatusInitGuardVa) & 1u) == 0u) {
+        return;
+    }
+    psiops::guest_settings::GuestUserSettings pending{};
+    if (psiops::guest_settings::ConsumePendingGuestSync(&pending)) {
+        WriteGuestUserSettingsToRamAndApply(ctx, base, pending, true);
     }
 }
 
@@ -737,6 +900,7 @@ int g_last_logged_ui_y0 = -99999;
 // UIManager (hud + 0xB0) in binary-verified 512x465 (y_off=+10) Layer 0x17 ortho space.
 void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
     EnsurePlayerPortBound(base);
+    SyncHostSettingsToGuestOnFrame(ctx, base);
     if (input_rec::ShouldBypassMkb() || mkb::IsOverlayOpen()) {
         mkb::ReportMenuUiTelemetry("", -1, 0);
         return;
@@ -1074,6 +1238,7 @@ uint32_t PsiOpsGetMkbReloadCount() { return g_mkb_reload_count.load(std::memory_
 // updates active Psi slot (1..6) + wheel zoom/push latches, and executes manual Weapon::Reload on R tap.
 void Hook_InputManagerUpdate(X86Context& ctx, uint8_t* base) {
     using mkb::Action;
+    SyncHostSettingsToGuestOnFrame(ctx, base);
     if (input_rec::ShouldBypassMkb()) {
         g_im.valid = false;
         g_im_sniper_weapon_or_scoped.store(false, std::memory_order_relaxed);
@@ -1407,4 +1572,87 @@ bool Hook_InputManagerGetActionValue(X86Context& ctx, uint8_t* base) {
     }
     x87_push(ctx, double(val));
     return true;
+}
+
+// GameStatus::GameStatus ctor @ 0x000DA750 (__stdcall, ret 4, [esp+4] = 0x005ECC78).
+// Applies persisted [game_options] immediately after factory defaults initialize on cold boot.
+X86_FUNC(sub_000DA750) {
+    const uint32_t gs_va = ValidGuest(ctx.esp + 0x04u, 4u) ? ReadU32(base, ctx.esp + 0x04u) : 0u;
+    __imp__sub_000DA750(ctx, base);
+    if (ShouldBypassGuestSettings() || g_applying_host_guest_settings || gs_va != kGameStatusVa ||
+        !ValidGuest(kGameStatusVa, kGameStatusSize)) {
+        return;
+    }
+    const psiops::guest_settings::GuestUserSettings s = psiops::guest_settings::GetSettings();
+    if (s.has_saved_values) {
+        const uint32_t saved_eax = ctx.eax;
+        WriteGuestUserSettingsToRamAndApply(ctx, base, s, true);
+        ctx.eax = saved_eax;
+        LOGR("settings: applied persisted [game_options] on GameStatus init (sfx=%d, music=%d, layout=%u, inv_y=%u, vib=%u)",
+             s.sfx_volume, s.music_volume, s.controller_layout, s.controller_invert_y ? 1u : 0u,
+             s.vibration ? 1u : 0u);
+    }
+}
+
+// GameStatus::ReadProfile @ 0x000DBF50 (__thiscall, ret 4, ecx = 0x005ECC78, [esp+4] = Scribe*).
+// Preserves all Xbox PsiOpsProfile progression ('PermanentEvents', 'Unlocked', 'GlobalOptionsArray') while:
+//  - Re-applying host [game_options] when present (fixing the retail XBE bug at 0x000DBF6C..0x000DBF7B that
+//    forcibly resets SFX opt[4] and Music opt[5] back to 100 on every profile load!), OR
+//  - Seeding host [game_options] on first run from an existing Xbox PsiOpsProfile.
+X86_FUNC(sub_000DBF50) {
+    const uint32_t gs_va = ctx.ecx;
+    __imp__sub_000DBF50(ctx, base);
+    if (ShouldBypassGuestSettings() || g_applying_host_guest_settings || gs_va != kGameStatusVa ||
+        !ValidGuest(kGameStatusVa, kGameStatusSize)) {
+        return;
+    }
+    const uint32_t saved_eax = ctx.eax;
+    const psiops::guest_settings::GuestUserSettings host_s = psiops::guest_settings::GetSettings();
+    if (host_s.has_saved_values) {
+        WriteGuestUserSettingsToRamAndApply(ctx, base, host_s, true);
+        LOGR("settings: re-applied [game_options] after PsiOpsProfile load (sfx=%d, music=%d)",
+             host_s.sfx_volume, host_s.music_volume);
+    } else {
+        psiops::guest_settings::GuestUserSettings prof_snap = ReadGuestUserSettingsFromRam(base);
+        prof_snap.has_saved_values = true;
+        psiops::guest_settings::NotifyGuestCapturedSettings(prof_snap, true);
+        LOGR("settings: seeded [game_options] from PsiOpsProfile");
+    }
+    ctx.eax = saved_eax;
+}
+
+// GameStatus::CommitOptionsTransaction @ 0x000DD0D0 (__thiscall, ret 0, ecx = 0x005ECC78).
+// Invoked when the player clicks "Accept" (UI command 0x819) in any native in-game Options screen.
+X86_FUNC(sub_000DD0D0) {
+    const uint32_t gs_va = ctx.ecx;
+    __imp__sub_000DD0D0(ctx, base);
+    if (ShouldBypassGuestSettings() || g_applying_host_guest_settings || gs_va != kGameStatusVa ||
+        !ValidGuest(kGameStatusVa, kGameStatusSize)) {
+        return;
+    }
+    psiops::guest_settings::GuestUserSettings snap = ReadGuestUserSettingsFromRam(base);
+    snap.has_saved_values = true;
+    psiops::guest_settings::NotifyGuestCapturedSettings(snap, true);
+}
+
+// GameStatus::WriteProfile @ 0x000DC090 (__thiscall, ret 4, ecx = 0x005ECC78, [esp+4] = Scribe*).
+// Ensures M&K's temporary LookSpring=0 override is never serialized into U:\PsiOpsProfile, and mirrors
+// any direct guest option changes back to settings.toml.
+X86_FUNC(sub_000DC090) {
+    const uint32_t gs_va = ctx.ecx;
+    const bool active = !ShouldBypassGuestSettings() && !g_applying_host_guest_settings &&
+                        (gs_va == kGameStatusVa) && ValidGuest(kGameStatusVa, kGameStatusSize);
+    const bool restore_zero_after = active && g_look_spring_overridden.load(std::memory_order_acquire);
+    if (restore_zero_after) {
+        base[0x005ECEB8u] = uint8_t(g_saved_look_spring.load(std::memory_order_relaxed) & 0xFFu);
+    }
+    __imp__sub_000DC090(ctx, base);
+    if (restore_zero_after) {
+        base[0x005ECEB8u] = 0u;
+    }
+    if (active) {
+        psiops::guest_settings::GuestUserSettings snap = ReadGuestUserSettingsFromRam(base);
+        snap.has_saved_values = true;
+        psiops::guest_settings::NotifyGuestCapturedSettings(snap, true);
+    }
 }

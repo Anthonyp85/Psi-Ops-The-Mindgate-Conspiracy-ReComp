@@ -521,6 +521,8 @@ void DrawLauncherFrame(LauncherState& st, void* native_owner_win, float ui_scale
                         ui_common::DrawAudioPanel(st.settings_modified);
                     } else if (t == 4) {
                         mkb::DrawControlsSettingsPanel(false, &st.settings_modified);
+                        ImGui::Spacing();
+                        ui_common::DrawInGameControlsOptionsPanel(st.settings_modified);
                     } else if (t == 5) {
                         ui_common::DrawUpdatesDiagnosticsSection(
                             upd_snap, true, ui_scale, st.settings_modified, st.upd_manual_pending, st.tools_status, [&] {

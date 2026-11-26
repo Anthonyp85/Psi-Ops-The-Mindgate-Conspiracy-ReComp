@@ -3,6 +3,7 @@
 // and live-synced Settings panels for Pre-Game Launcher and in-game F1 Overlay.
 
 #include "common/ui_common.h"
+#include "../game/guest_settings.h"
 
 #include <algorithm>
 #include <cctype>
@@ -559,6 +560,151 @@ void DrawAudioPanel(bool& dirty) {
     }
 
     if (ImGui::Checkbox("Mute When Window Loses Focus", &s.mute_unfocused)) {
+        dirty = true;
+    }
+
+    SectionHeading("In-Game Audio (Synced with Xbox Profile & [game_options])");
+    psiops::guest_settings::GuestUserSettings gs = psiops::guest_settings::GetSettings();
+    bool gs_changed = false;
+
+    int sfx_vol = std::clamp(int(gs.sfx_volume), 0, 100);
+    if (ImGui::SliderInt("SFX / Voice / FMV Volume (%)", &sfx_vol, 0, 100, "%d%%")) {
+        gs.sfx_volume = std::clamp(sfx_vol, 0, 100);
+        gs_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Synced 1:1 with in-game Options -> Audio -> SFX Volume and persisted in settings.toml [game_options].");
+    }
+
+    int mus_vol = std::clamp(int(gs.music_volume), 0, 100);
+    if (ImGui::SliderInt("Music Volume (%)", &mus_vol, 0, 100, "%d%%")) {
+        gs.music_volume = std::clamp(mus_vol, 0, 100);
+        gs_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Synced 1:1 with in-game Options -> Audio -> Music Volume and persisted in settings.toml [game_options].");
+    }
+
+    if (gs_changed) {
+        psiops::guest_settings::ApplyUiSettings(gs);
+        dirty = true;
+    }
+}
+
+void DrawInGameControlsOptionsPanel(bool& dirty) {
+    SectionHeading("In-Game Controller & Gameplay Options ([game_options])");
+    ImGui::TextDisabled(
+        "Live-synced with Psi-Ops Xbox profile options and persisted in settings.toml [game_options].");
+
+    psiops::guest_settings::GuestUserSettings gs = psiops::guest_settings::GetSettings();
+    bool gs_changed = false;
+
+    static constexpr const char* kLayouts[3] = {"Config 1 (Default)", "Config 2", "Config 3"};
+    int layout_idx = std::clamp(int(gs.controller_layout) - 2, 0, 2);
+    if (ImGui::Combo("Controller Button Layout", &layout_idx, kLayouts, 3)) {
+        gs.controller_layout = uint32_t(layout_idx + 2);
+        gs_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Synced 1:1 with in-game Options -> Controller Config (1, 2, or 3).");
+    }
+
+    static constexpr const char* kCameras[3] = {"Camera A", "Camera B (Default)", "Camera C"};
+    int cam_idx = std::clamp(int(gs.camera_config), 0, 2);
+    if (ImGui::Combo("Camera Preset", &cam_idx, kCameras, 3)) {
+        gs.camera_config = uint32_t(cam_idx);
+        gs_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Synced 1:1 with in-game Options -> Camera Preset (A, B, or C).");
+    }
+
+    int yaw_spd = std::clamp(int(gs.yaw_speed), 0, 100);
+    if (ImGui::SliderInt("Horizontal Look Sensitivity", &yaw_spd, 0, 100)) {
+        gs.yaw_speed = std::clamp(yaw_spd, 0, 100);
+        gs_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Controller right-stick horizontal turn speed (0..100, default 44).");
+    }
+
+    int pitch_spd = std::clamp(int(gs.pitch_speed), 0, 100);
+    if (ImGui::SliderInt("Vertical Look Sensitivity", &pitch_spd, 0, 100)) {
+        gs.pitch_speed = std::clamp(pitch_spd, 0, 100);
+        gs_changed = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Controller right-stick vertical pitch speed (0..100, default 43).");
+    }
+
+    if (ImGui::BeginTable("##InGameOptsToggles", 2, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("Controller Invert Y-Axis", &gs.controller_invert_y)) {
+            gs_changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Controller right-stick pitch inversion (Xbox default: Inverted). Independent from PC Mouse Invert Y.");
+        }
+
+        if (ImGui::Checkbox("Controller Invert X-Axis", &gs.controller_invert_x)) {
+            gs_changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Controller right-stick yaw inversion (default: Normal).");
+        }
+
+        if (ImGui::Checkbox("Controller Vibration", &gs.vibration)) {
+            if (!gs.vibration) input::Rumble(0, 0, 0);
+            gs_changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Enables or disables in-game Xbox controller rumble motors.");
+        }
+
+        if (ImGui::Checkbox("Controller Look Spring", &gs.look_spring)) {
+            gs_changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Auto-centers controller camera pitch while moving (automatically bypassed while aiming with Mouse & Keyboard).");
+        }
+
+        ImGui::TableNextColumn();
+        if (ImGui::Checkbox("Quick Tips", &gs.quick_tips)) {
+            gs_changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Show in-game tutorial Quick Tips popups.");
+        }
+
+        if (ImGui::Checkbox("HUD Visibility", &gs.hud_visible)) {
+            gs_changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Show health, Psi energy, and weapon HUD in gameplay.");
+        }
+
+        if (ImGui::Checkbox("Auto-Hide HUD", &gs.auto_hide_hud)) {
+            gs_changed = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Automatically fade the HUD out when out of combat.");
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button("Reset In-Game Options to Defaults")) {
+        psiops::guest_settings::ResetToDefaults(true);
+        psiops::guest_settings::ApplyUiSettings(psiops::guest_settings::MakeDefaultSettings());
+        dirty = true;
+    }
+
+    if (gs_changed) {
+        psiops::guest_settings::ApplyUiSettings(gs);
         dirty = true;
     }
 }

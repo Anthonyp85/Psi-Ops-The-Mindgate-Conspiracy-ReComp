@@ -3,6 +3,7 @@
 // (FPS | ms | Upscaler | Render -> Display).
 
 #include "common/settings_ui.h"
+#include "../game/guest_settings.h"
 #include "common/input_recorder.h"
 #include "common/mkb_input.h"
 #include "common/ui_common.h"
@@ -62,6 +63,7 @@ struct OverlayState {
 
 std::atomic<bool> g_show_hud{false};
 std::atomic<bool> g_suppress_warmup_toast{false};
+std::atomic<bool> g_deferred_guest_save{false};
 // 0 = waiting for boot AOT completion, 1..UINT64_MAX-1 = steady_clock start ms, UINT64_MAX = finished/suppressed.
 std::atomic<uint64_t> g_warmup_toast_start_ms{0};
 
@@ -392,7 +394,11 @@ void DrawLiveHud(double fps) {
 }  // namespace
 
 bool HasVisibleUi() {
+    if (psiops::guest_settings::ConsumePendingHostSaveRequest()) {
+        g_deferred_guest_save.store(true, std::memory_order_release);
+    }
     return mkb::IsOverlayOpen() || g_show_hud.load(std::memory_order_relaxed) ||
+           g_deferred_guest_save.load(std::memory_order_acquire) ||
            ShouldShowShaderWarmupToast(nullptr, nullptr) || ShouldShowUpdateAvailableToast(nullptr, nullptr);
 }
 
@@ -435,6 +441,14 @@ void OnPadPoll(int port, const input::Pad& pad) {
 void Draw(double fps) {
     OverlayState& st = St();
     if (!st.initialized) Init();
+
+    if (g_deferred_guest_save.exchange(false, std::memory_order_acq_rel) ||
+        psiops::guest_settings::ConsumePendingHostSaveRequest()) {
+        if (!app::IsReplayOrAutotestActive() && !input::AutotestActive() && !mkb::IsAutotestActive() &&
+            !input_rec::IsReplayActive() && !input_rec::IsRecordActive()) {
+            app::Save();
+        }
+    }
 
     if (!st.theme_applied) {
         ui_common::ApplyMindgateTheme(1.0f);
@@ -518,6 +532,8 @@ void Draw(double fps) {
                         ui_common::DrawAudioPanel(dirty);
                     } else if (t == 3) {
                         mkb::DrawControlsSettingsPanel(true, &dirty);
+                        ImGui::Spacing();
+                        ui_common::DrawInGameControlsOptionsPanel(dirty);
                     } else if (t == 4) {
                         ui_common::DrawUpdatesDiagnosticsSection(
                             upd_snap, false, 1.0f, dirty, st.upd_manual_pending, st.diag_status, [&] {

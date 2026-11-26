@@ -11,16 +11,21 @@
 #include "common/version.h"
 #include "core/input.h"
 #include "core/perf.h"
+#include "game/guest_settings.h"
 #include "gpu/backend.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "upscale/upscaler_manager.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string_view>
+#include <utility>
+
+#include <toml++/toml.hpp>
 
 static_assert(PSIOPS_VERSION_MAJOR == 1 && PSIOPS_VERSION_MINOR == 1 && PSIOPS_VERSION_PATCH == 0 &&
                   std::string_view(PSIOPS_VERSION_STR) == "1.1.0",
@@ -536,14 +541,80 @@ void OnPsiOpsRumble(int port, uint16_t& left, uint16_t& right) {
     input_rec::OnRumble(port, left, right);
 }
 
+void LoadGuestGameOptions(const void* toml_table) {
+    psiops::guest_settings::GuestUserSettings gs = psiops::guest_settings::MakeDefaultSettings();
+    if (toml_table != nullptr) {
+        const auto& root = *static_cast<const toml::table*>(toml_table);
+        if (const auto* go = root["game_options"].as_table()) {
+            if (auto v = (*go)["sfx_volume"].value<int64_t>()) {
+                gs.sfx_volume = static_cast<int32_t>(std::clamp<int64_t>(*v, 0, 100));
+            }
+            if (auto v = (*go)["music_volume"].value<int64_t>()) {
+                gs.music_volume = static_cast<int32_t>(std::clamp<int64_t>(*v, 0, 100));
+            }
+            if (auto v = (*go)["controller_layout"].value<int64_t>()) {
+                gs.controller_layout = static_cast<uint32_t>(std::clamp<int64_t>(*v, 2, 4));
+            }
+            if (auto v = (*go)["controller_invert_y"].value<bool>()) gs.controller_invert_y = *v;
+            if (auto v = (*go)["controller_invert_x"].value<bool>()) gs.controller_invert_x = *v;
+            if (auto v = (*go)["yaw_speed"].value<int64_t>()) {
+                gs.yaw_speed = static_cast<int32_t>(std::clamp<int64_t>(*v, 0, 100));
+            }
+            if (auto v = (*go)["pitch_speed"].value<int64_t>()) {
+                gs.pitch_speed = static_cast<int32_t>(std::clamp<int64_t>(*v, 0, 100));
+            }
+            if (auto v = (*go)["vibration"].value<bool>()) gs.vibration = *v;
+            if (auto v = (*go)["look_spring"].value<bool>()) gs.look_spring = *v;
+            if (auto v = (*go)["camera_config"].value<int64_t>()) {
+                gs.camera_config = static_cast<uint32_t>(std::clamp<int64_t>(*v, 0, 2));
+            }
+            if (auto v = (*go)["quick_tips"].value<bool>()) gs.quick_tips = *v;
+            if (auto v = (*go)["hud_visible"].value<bool>()) gs.hud_visible = *v;
+            if (auto v = (*go)["auto_hide_hud"].value<bool>()) gs.auto_hide_hud = *v;
+
+            gs = psiops::guest_settings::SanitizeSettings(gs);
+            gs.has_saved_values = true;
+        }
+    }
+    psiops::guest_settings::SetSettingsFromConfig(gs);
+}
+
+void SaveGuestGameOptions(void* toml_table) {
+    if (toml_table == nullptr) return;
+    auto& root = *static_cast<toml::table*>(toml_table);
+    const psiops::guest_settings::GuestUserSettings gs =
+        psiops::guest_settings::SanitizeSettings(psiops::guest_settings::GetSettings());
+    if (gs.has_saved_values) {
+        toml::table go;
+        go.insert("sfx_volume", static_cast<int64_t>(gs.sfx_volume));
+        go.insert("music_volume", static_cast<int64_t>(gs.music_volume));
+        go.insert("controller_layout", static_cast<int64_t>(gs.controller_layout));
+        go.insert("controller_invert_y", gs.controller_invert_y);
+        go.insert("controller_invert_x", gs.controller_invert_x);
+        go.insert("yaw_speed", static_cast<int64_t>(gs.yaw_speed));
+        go.insert("pitch_speed", static_cast<int64_t>(gs.pitch_speed));
+        go.insert("vibration", gs.vibration);
+        go.insert("look_spring", gs.look_spring);
+        go.insert("camera_config", static_cast<int64_t>(gs.camera_config));
+        go.insert("quick_tips", gs.quick_tips);
+        go.insert("hud_visible", gs.hud_visible);
+        go.insert("auto_hide_hud", gs.auto_hide_hud);
+        root.insert_or_assign("game_options", std::move(go));
+    } else {
+        root.erase("game_options");
+    }
+}
+
 void OnPsiOpsLoadSettings(const void* toml_table) {
     mkb::LoadSettings(toml_table);
     ui_common::LoadUpdatePrefs(toml_table);
+    LoadGuestGameOptions(toml_table);
 }
 
 void OnPsiOpsSaveSettings(void* toml_table) {
     mkb::SaveSettings(toml_table);
     ui_common::SaveUpdatePrefs(toml_table);
+    SaveGuestGameOptions(toml_table);
 }
 
 void OnPsiOpsShutdown() {

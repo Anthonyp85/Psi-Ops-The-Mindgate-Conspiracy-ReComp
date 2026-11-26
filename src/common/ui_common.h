@@ -42,6 +42,7 @@ void DrawDisplayGpuPanel(const std::vector<app::GpuAdapterInfo>& gpus,
                          const std::vector<app::MonitorInfo>& monitors, bool in_game, bool& dirty,
                          bool& needs_display_apply);
 void DrawAudioPanel(bool& dirty);
+void DrawInGameControlsOptionsPanel(bool& dirty);
 void DrawToolsDiagnosticsPanel(const upscale::PluginProbe& probe, bool in_game, std::string& action_status);
 
 // Gamepad poll edge-detector for UI navigation (D-Pad, A/B/X/Y, LB/RB tab switch, Start).
