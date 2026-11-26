@@ -11,8 +11,10 @@ A native **Windows x64** (D3D12 + XAudio2 + SDL3) and **Native Linux x86_64 / St
 ## Features
 
 - **Native Dual-Platform Static Recompilation:** No emulator overhead — lifts all 9 executable sections (Midway ESP engine, Havok physics, Python 2.2.1, AI.implant, DirectSound 5849, and CRI Sofdec `PSGSFD*` video) to native x86-64 C++20.
-- **Direct Read-Only XISO Mounting (`>2 GiB` 64-Bit Safe):** Streams directly from your untouched `.xiso.iso` via a sharded `16 MiB` `Disc::BlockCache` (`64 KiB` blocks) with full 64-bit offsets for all 21 `>2 GiB` CRI Sofdec `.sfd` FMVs.
+- **Direct Read-Only XISO Mounting (`>2 GiB` 64-Bit Safe):** Streams directly from your untouched `.xiso.iso` via a sharded `32 MiB` `Disc::BlockCache` (`64 KiB` blocks + `128 KiB` sequential read-ahead) with full 64-bit offsets for all 21 `>2 GiB` CRI Sofdec `.sfd` FMVs.
 - **6-Tab Pre-Game Launcher & Live `F1` / `BACK+L3` Overlay:** Configure disc image, upscaling, GPU/display, audio, controls, and diagnostics with mouse, touch, or gamepad (`L1`/`R1` tab switching, `Start` to play), including an in-app XISO file browser with Steam Deck microSD Quick-Jump and live disc validation.
+- **Bidirectional In-Game Options Sync (`[game_options]`):** Configure in-game SFX/Music volumes, controller button layout (`Config 1/2/3`), controller X/Y inversion, horizontal/vertical look sensitivity, controller vibration, look spring, camera preset (`Camera A/B/C`), Quick Tips, and HUD visibility/auto-hide directly from the Pre-Game Launcher or `F1` Overlay — persisted in `settings.toml` under `[game_options]` and synchronized 1:1 with the Xbox `PsiOpsProfile` (fixing the retail profile-load audio-volume reset bug while keeping unlocks and progression untouched).
+- **Built-In GitHub Update Checker & Staged Self-Updater:** Asynchronous GitHub Releases check (native WinHTTP on Windows, zero-`DT_NEEDED` `curl`/`wget`/`python3` subprocesses on Linux), FIPS 180-4 SHA-256 archive verification, dismissible Launcher/Overlay release alerts, and one-click staged self-updates (`update_apply.cmd` / `update_apply.sh`) that preserve `settings.toml`, `hdd/` saves, shader caches, and disc images while refreshing recompiled game binaries on relaunch.
 - **9-Upscaler Graphics Suite & Native `16:9` / `16:10` Support:**
   - **6 Built-In Zero-DLL Spatial Upscalers (Windows D3D12 & Linux Vulkan 1.2):** `FSR 1.0` (default), `NVIDIA NIS v1.0.3`, `AMD CAS`, `Bicubic 5-Tap` (supports `>100%` SSAA), `Integer`, and `Bilinear`.
   - **3 Retail Vendor-Signed Temporal Upscalers (Windows D3D12, bundled in `plugins/`):** `NVIDIA DLSS 4` (Presets Auto/E/J/K & DLAA + automatic NGX driver-store fallback), `AMD FSR 3.1`, and `Intel XeSS 2` — driven by true `16:9` square-pixel rendering, Halton `(2,3)` camera jitter, `RG16F` motion vectors, and `R8_UNORM` HUD reactive masking (auto-bypassed on 2D menus, loading screens, and FMVs; gracefully falls back to `FSR 1.0` on Linux Vulkan or missing DLLs).
@@ -20,7 +22,7 @@ A native **Windows x64** (D3D12 + XAudio2 + SDL3) and **Native Linux x86_64 / St
   - `WM_INPUT` Raw Input (Windows) & `SDL_SetWindowRelativeMouseMode` (Linux) injected past the controller deadzone & slew filter with `1px` micro-aim precision, `0.000°` stop-drift, `dt`-independent sensitivity (`cm/360 @ 800 DPI`), decoupled PC Mouse Invert-Y, `Raw 1:1 Aim` auto-steer bypass, normalized `WASD` (`1.000`), engine-level decoupled `InputManager` actions (`E` Interact/Pickup, `Space` Jump/Mantle, `Q`/`Mouse4` Melee, `LCtrl`/`C` Crouch, `LAlt` Wall Cover, `R`/`MMB` instant manual Reload / MC Secondary, `WheelUp`/`WheelDown` bidirectional Next/Prev Weapon & Sniper Zoom / TK Push-Pull, `RMB`/`V` Sniper Scope / Target Lock-On, `LShift`/`Mouse5` + `1–6` Psi powers, mouse-flick TK Throw, `G` TK Camera Control, `X` MC Head Pop), smart OS cursor capture/release, and portable OS-independent `settings.toml` bindings (`Primary` + `Secondary` slots across 25 actions).
   - Full SDL3 controller support (DualSense 5 / Edge with Touchpad-as-Back, Xbox, Switch, Steam Deck) with sustained rumble keepalive and deterministic `.rec` recording/replay.
 - **Cross-Hardware Performance & Frame Pacing:**
-  - `NvOptimusEnablement` & `AmdPowerXpressRequestHighPerformance` exports, `--list-gpus` / `--gpu <idx>`, adaptive `16 / 32 / 64 MiB` upload rings, `32 MiB` GPU texture slab sub-allocators, per-VID/DID shader/PSO/metadata disk caches with parallel boot pre-warm & background async writes, `0` mid-frame GPU flushes, de-conflicted VRR/VSync pacing (`60/90/120/144/165 Hz`), RAM-bounded first-launch compilation (`~768 MiB`/slot), and binary-verified `60 FPS` (default) & `30 FPS` `1.00x` Havok simulation fidelity.
+  - `NvOptimusEnablement` & `AmdPowerXpressRequestHighPerformance` exports, `--list-gpus` / `--gpu <idx>`, adaptive `16 / 32 / 64 MiB` upload rings, `32 MiB` GPU texture slab sub-allocators with aliasing barriers, `MmFreeContiguousMemory` GPU target/texture cache invalidation, `512 KiB` `FastMemHash64` surface hashing, driver-update resilient per-VID/DID shader/PSO/metadata disk caches (`kAotSchemaVersion=4`) with parallel boot pre-warm & post-boot status toast, `0` mid-frame GPU flushes, D3D12 waitable swapchains + tear-free `60 FPS` pacing across divisor and non-divisor refresh rates (`60/90/120/144/165 Hz`), single-core guest thread priority hierarchy with a `25 ms` loading watchdog, RAM-bounded first-launch compilation (`~768 MiB`/slot), and binary-verified `60 FPS` (default) & `30 FPS` `1.00x` Havok simulation fidelity.
 
 ---
 
@@ -143,8 +145,8 @@ release.bat
 # Linux (Ubuntu 22.04): creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.1.0-linux-x86_64.tar.gz
 ./release_linux.sh
 
-# Run full 6-gate copyright, sanitization, binary ABI, and media integrity audit
-python tools/audit_release.py
+# Run full release audit (Gates 1, 2, 2b built-binary path hygiene, and Gates 3-6 archive/ABI/media checks)
+python tools/audit_release.py --build-dir out/build/release
 ```
 
 ---
