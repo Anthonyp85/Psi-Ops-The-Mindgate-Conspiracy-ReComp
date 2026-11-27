@@ -54,6 +54,8 @@ if [[ "$ALLOW_NO_XBE" == "OFF" ]]; then
         XBE_PATH=".local/xbe/default.xbe"
     elif [[ -f "assets/default.xbe" ]]; then
         XBE_PATH="assets/default.xbe"
+    elif [[ -f ".local/xbe/pal/default.xbe" ]]; then
+        XBE_PATH=".local/xbe/pal/default.xbe"
     else
         echo "[2/4] Extracting private .local/xbe/default.xbe from XISO..."
         python3 tools/extract_xbe.py

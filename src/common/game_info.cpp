@@ -12,6 +12,7 @@
 #include "core/input.h"
 #include "core/perf.h"
 #include "game/cheats.h"
+#include "game/disc_revision.h"
 #include "game/guest_settings.h"
 #include "gpu/backend.h"
 #include "kernel/kernel.h"
@@ -19,6 +20,7 @@
 #include "upscale/upscaler_manager.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -36,13 +38,23 @@ uint32_t PsiOpsLiveCameraVa();
 uint64_t PsiOpsConsumeMkbActionsFired();
 uint32_t PsiOpsGetMkbReloadCount();
 
+namespace dispatch {
+uint32_t EntryPoint();
+}
+
 namespace {
+
+std::atomic_bool g_european_game{false};
+
+void OnPsiOpsLoaded() {
+    g_european_game.store(dispatch::EntryPoint() == psiops::kEuropeEntry, std::memory_order_release);
+}
 
 // Bounds check for guest pointer chains read by telemetry/camera callbacks (same contract as hooks.cpp ValidGuest):
 // rejects null / first-64 KiB (null + field offset) pointers, 32-bit wrap-around, and spans whose first or last
 // byte is not committed. These run on host threads while the guest mutates the objects, so check the full span.
 bool ValidGuest(uint32_t va, uint32_t bytes) {
-    if (kernel::g_base == nullptr || bytes == 0u || va < mem::kUserLow) return false;
+    if (psiops::EuropeanGameLoaded() || kernel::g_base == nullptr || bytes == 0u || va < mem::kUserLow) return false;
     if (va > 0xFFFFFFFFu - (bytes - 1u)) return false;
     if (!mem::IsCommitted(va)) return false;
     return bytes == 1u || mem::IsCommitted(va + (bytes - 1u));
@@ -522,6 +534,7 @@ void OnPsiOpsPresent(uint64_t present_frame, std::filesystem::path& out_capture_
     // 1. Advance shared eff_us clock, advance deterministic replay, and log frame telemetry first
     //    (captures consumed mouse_dx/dy & d_yaw/d_pitch from the frame just rendered).
     input_rec::OnPresent(present_frame, out_capture_bmp, out_should_exit);
+    if (psiops::EuropeanGameLoaded()) return;
     // 2. Advance M&K autotest schedule and update Smart OS Cursor Capture for the upcoming frame.
     PsiOpsRawPhase raw = ReadPsiOpsPhaseRaw();
     mkb::OnPresent(present_frame, raw.pi.phase, raw.modal_ui_open, out_capture_bmp, out_should_exit,
@@ -534,7 +547,7 @@ void OnPsiOpsPad(int port, input::Pad& pad) {
         input_rec::OnPadPoll(port, pad);
         return;
     }
-    mkb::OnPadPoll(port, pad);
+    if (!psiops::EuropeanGameLoaded()) mkb::OnPadPoll(port, pad);
     input_rec::OnPadPoll(port, pad);
 }
 
@@ -642,6 +655,10 @@ void OnPsiOpsInit() {
 
 }  // namespace
 
+bool psiops::EuropeanGameLoaded() {
+    return g_european_game.load(std::memory_order_acquire);
+}
+
 const app::GameInfo app::kGame = {
     .title = L"Psi-Ops: The Mindgate Conspiracy",
     .short_title = L"Psi-Ops",
@@ -649,19 +666,19 @@ const app::GameInfo app::kGame = {
     .log = "psiops",
     .settings = "settings.toml",
     .splash = L"splash",
-    .missing = L"Provide Psi-Ops: The Mindgate Conspiracy (USA) as a read-only Xbox disc image (.xiso.iso / .iso) via --iso, settings.toml (iso_path), or inside the assets/ or game folder.",
+    .missing = L"Provide a retail USA or Europe (PAL) Psi-Ops Xbox disc image (.xiso.iso / .iso) via --iso, settings.toml (iso_path), or the assets/ or game folder.",
     .images = {{"default.xbe", "PsiOps"}},
     .options = {},
     .load = OnPsiOpsLoadSettings,
     .save = OnPsiOpsSaveSettings,
     .init = OnPsiOpsInit,
-    .loaded = nullptr,
+    .loaded = OnPsiOpsLoaded,
     .window = mkb::OnWindowCreated,
     .message = mkb::OnWindowMessage,
     .ui = settings_ui::Draw,
     .pad = OnPsiOpsPad,
     .rumble = OnPsiOpsRumble,
-    .releases = {},
+    .releases = {{"default.xbe", psiops::kUsaXbeSha1}, {"default.xbe", psiops::kEuropeXbeSha1}},
     .expected_title_id = 0x4D570016u,
     .cs_aliases = {},
     .single_core_guest = true,

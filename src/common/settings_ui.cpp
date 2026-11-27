@@ -4,6 +4,7 @@
 
 #include "common/settings_ui.h"
 #include "../game/cheats.h"
+#include "../game/disc_revision.h"
 #include "../game/guest_settings.h"
 #include "common/input_recorder.h"
 #include "common/mkb_input.h"
@@ -459,6 +460,7 @@ void ToggleOrSwitchCheatsOverlay(OverlayState& st) {
 }
 
 void PollF2QuickCheatsHotkey(OverlayState& st) {
+    if (psiops::EuropeanGameLoaded()) return;
     if (app::IsReplayOrAutotestActive() || input::AutotestActive() || mkb::IsAutotestActive() ||
         input_rec::IsReplayActive() || input_rec::IsRecordActive()) {
         st.f2_prev_down = false;
@@ -490,6 +492,7 @@ void PollF2QuickCheatsHotkey(OverlayState& st) {
 }
 
 bool ShouldShowActiveCheatsHud(uint32_t* out_count) {
+    if (psiops::EuropeanGameLoaded()) return false;
     if (!ui_common::GetUpdatePrefs().show_cheats_hud) return false;
     if (g_suppress_warmup_toast.load(std::memory_order_relaxed) || app::IsReplayOrAutotestActive() ||
         input::AutotestActive() || mkb::IsAutotestActive() || input_rec::IsReplayActive() ||
@@ -711,9 +714,13 @@ void Draw(double fps) {
                     } else if (t == 2) {
                         ui_common::DrawAudioPanel(dirty);
                     } else if (t == kTabControls) {
-                        mkb::DrawControlsSettingsPanel(true, &dirty);
-                        ImGui::Spacing();
-                        ui_common::DrawInGameControlsOptionsPanel(dirty);
+                        if (psiops::EuropeanGameLoaded()) {
+                            ImGui::TextWrapped("PAL preview: use a controller and change controls in the game's options.");
+                        } else {
+                            mkb::DrawControlsSettingsPanel(true, &dirty);
+                            ImGui::Spacing();
+                            ui_common::DrawInGameControlsOptionsPanel(dirty);
+                        }
                     } else if (t == kTabDiagnostics) {
                         ui_common::DrawUpdatesDiagnosticsSection(
                             upd_snap, false, 1.0f, dirty, st.upd_manual_pending, st.diag_status, [&] {
@@ -753,7 +760,11 @@ void Draw(double fps) {
                                 "Shader & PSO cache reset scheduled. Full AOT pre-compilation will run on next launch.";
                         }
                     } else if (t == kTabCheats) {
-                        ui_common::DrawCheatsPanel(1.0f, dirty, &st.diag_status);
+                        if (psiops::EuropeanGameLoaded()) {
+                            ImGui::TextDisabled("Cheats are available with the USA disc.");
+                        } else {
+                            ui_common::DrawCheatsPanel(1.0f, dirty, &st.diag_status);
+                        }
                     }
                     ImGui::EndChild();
                     ImGui::EndTabItem();

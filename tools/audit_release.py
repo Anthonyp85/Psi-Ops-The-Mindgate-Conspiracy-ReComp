@@ -965,6 +965,7 @@ def _win64_path_allowed(rel: str) -> bool:
         "PsiOps.exe",
         "psiops.png",
         "config/game.toml",
+        "config/europe.toml",
         "LICENSE",
         "THIRD_PARTY_NOTICES.md",
         "README.md",
@@ -977,6 +978,7 @@ def _win64_path_allowed(rel: str) -> bool:
         "compiler/PsiOps.lib",
         "compiler/LLVM-LICENSE.txt",
         "compiler/config/game.toml",
+        "compiler/config/europe.toml",
         "compiler/vcruntime140.dll",
         "compiler/vcruntime140_1.dll",
         "compiler/msvcp140.dll",
@@ -1014,6 +1016,7 @@ def run_gate_4_win64_zip(dist_dir: pathlib.Path, repo_name: str, version: str) -
         "PsiOps.exe",
         "psiops.png",
         "config/game.toml",
+        "config/europe.toml",
         "LICENSE",
         "THIRD_PARTY_NOTICES.md",
         "README.md",
@@ -1023,6 +1026,7 @@ def run_gate_4_win64_zip(dist_dir: pathlib.Path, repo_name: str, version: str) -
         "compiler/PsiOps.lib",
         "compiler/LLVM-LICENSE.txt",
         "compiler/config/game.toml",
+        "compiler/config/europe.toml",
         "compiler/xdk/5849/layout.toml",
         "compiler/xdk/5849/signatures.toml",
         "plugins/nvngx_dlss.dll",
@@ -1111,6 +1115,7 @@ def _linux_path_allowed(rel: str) -> bool:
         "psi-ops-recomp.desktop",
         "psiops.png",
         "config/game.toml",
+        "config/europe.toml",
         "LICENSE",
         "THIRD_PARTY_NOTICES.md",
         "README.md",
@@ -1119,6 +1124,7 @@ def _linux_path_allowed(rel: str) -> bool:
         "compiler/ld.lld",
         "compiler/LLVM-LICENSE.txt",
         "compiler/config/game.toml",
+        "compiler/config/europe.toml",
     }
     if rel in exact:
         return True
@@ -1150,6 +1156,7 @@ def run_gate_5_linux_tarball(dist_dir: pathlib.Path, repo_name: str, version: st
         "psi-ops-recomp.desktop",
         "psiops.png",
         "config/game.toml",
+        "config/europe.toml",
         "LICENSE",
         "THIRD_PARTY_NOTICES.md",
         "README.md",
@@ -1158,6 +1165,7 @@ def run_gate_5_linux_tarball(dist_dir: pathlib.Path, repo_name: str, version: st
         "compiler/ld.lld",
         "compiler/LLVM-LICENSE.txt",
         "compiler/config/game.toml",
+        "compiler/config/europe.toml",
         "compiler/xdk/5849/layout.toml",
         "compiler/xdk/5849/signatures.toml",
     }

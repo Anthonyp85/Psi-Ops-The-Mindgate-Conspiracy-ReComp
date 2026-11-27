@@ -4,7 +4,16 @@
 
 A native **Windows x64** (D3D12 + XAudio2 + SDL3) and **Native Linux x86_64 / Steam Deck** (Vulkan 1.2 + SDL3 + `GLIBC 2.35`) static recompilation of the Original Xbox (2004, Intel x86, Title ID `0x4D570016` / `MW-022`) edition of *Psi-Ops: The Mindgate Conspiracy*, built on [`XboxXBERecomp`](https://github.com/TGP482/XboxXBERecomp) (`cc9edda3a821a4204dc28783f429b88a27ade4f9`).
 
-> **Legal Notice:** This repository and its binary releases contain **zero** copyrighted game assets, disc images, or Original Xbox executables (`.xbe`/`.iso`). You must supply your own legally owned retail USA Original Xbox disc image (`.xiso.iso` / `.iso`). On first launch, the launcher compiles your local `default.xbe` directly on your machine using the bundled freestanding compiler into `PsiOps.dll` (Windows) or `libPsiOps.so` (Linux) while mounting your `.xiso.iso` strictly read-only.
+> **Legal Notice:** This repository and its binary releases contain **zero** copyrighted game assets, disc images, or Original Xbox executables (`.xbe`/`.iso`). Supply your own retail USA or Europe (PAL, MW02202E) Original Xbox disc image (`.xiso.iso` / `.iso`). On first launch, the launcher compiles your local `default.xbe` directly on your machine using the bundled freestanding compiler into `PsiOps.dll` (Windows) or `libPsiOps.so` (Linux) while mounting the disc image read-only.
+
+| Retail Xbox edition | `default.xbe` SHA-1 | Status |
+| --- | --- | --- |
+| USA (MW02201A) | `42dd95fa444039b82f843ff02a31833da97d41cf` | Original configuration |
+| Europe (En,Fr,De,Es,It), PAL (MW02202E) | `c3a77918a64407a209c5edfda6a9d2123c912e63` | Experimental. Use a controller and the game's own options. |
+
+The PAL profile uses its own guest addresses and leaves the USA-specific mouse
+and keyboard hooks, trainer, options sync, and camera-based enhancements disabled.
+The separate Germany disc revision (MW02203E) still needs a recompiler profile.
 
 ---
 
@@ -32,7 +41,7 @@ A native **Windows x64** (D3D12 + XAudio2 + SDL3) and **Native Linux x86_64 / St
 ### Windows x64 (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.0-win64-launcher.zip`)
 1. Extract the `.zip` archive to any writable folder (e.g. `C:\Games\PsiOps`).
 2. Double-click **`PsiOps.exe`** to open the 6-Tab Pre-Game Launcher.
-3. In **Play & Game Disc**, browse to your retail USA `Psi-Ops - The Mindgate Conspiracy (USA).xiso.iso` (or place it inside an `assets/` folder beside `PsiOps.exe`).
+3. In **Play & Game Disc**, browse to your retail USA or Europe (PAL) XISO (or place it in the `assets/` folder beside `PsiOps.exe`).
 4. Choose a one-click **Hardware Preset** (`1080p Mainstream`, `1440p High`, `4K Ultra`, `Handheld / iGPU`, or `Steam Deck`) and click **Play**.
    - On first launch, `PsiOps.exe` compiles `PsiOps.dll` locally from your XISO using the bundled `compiler/` toolchain and caches it for instant subsequent launches.
 
@@ -140,17 +149,17 @@ build.bat
 ./build_linux.sh
 ```
 
-For PAL porting work, you can extract the retail Europe (MW02202E) or Germany
-(MW02203E) executable from your own disc image:
+To build directly from the retail Europe disc, extract its executable first and
+then run `build.bat` or `./build_linux.sh`:
 
 ```bash
 python tools/extract_xbe.py --pal --iso "/path/to/Psi-Ops (Europe).xiso.iso"
 ```
 
-The extractor identifies the revision by its published XBE checksum and saves
-`default.xbe` under the git-ignored `.local/xbe/pal/` directory. This mode is
-for analysis. The launcher and game build currently still require the USA disc
-and its matching recompiler configuration.
+The extractor saves `default.xbe` in the git-ignored `.local/xbe/pal/`
+directory. The build uses that file if its standard USA input paths are empty.
+For the first-run launcher build, use `build.bat --headers-only` or
+`./build_linux.sh --headers-only` and select your XISO in the launcher.
 
 ### 4. Building Distributable Archives & Running the Release Audit
 ```bash
@@ -168,7 +177,7 @@ python tools/audit_release.py --build-dir out/build/release
 
 ## Legal, Clean-Room & Trademark Disclaimer
 
-- **Copyright-Clean Distribution:** This repository and all official release archives contain **zero** copyrighted game code, Original Xbox executables (`default.xbe`), disc images (`.iso`/`.xiso.iso`), audio, video, or artwork. You must supply your own legally obtained retail USA Original Xbox copy of *Psi-Ops: The Mindgate Conspiracy*. On first launch, the bundled freestanding compiler translates your local `default.xbe` on your own machine while mounting your disc image strictly read-only.
+- **Copyright-Clean Distribution:** This repository and all official release archives contain **zero** copyrighted game code, Original Xbox executables (`default.xbe`), disc images (`.iso`/`.xiso.iso`), audio, video, or artwork. Supply your own retail Xbox disc from the table above. On first launch, the bundled freestanding compiler translates your local `default.xbe` on your own machine while mounting the disc image read-only.
 - **Independent Preservation Project:** This is an independent, non-commercial technical preservation project and is not affiliated with, endorsed by, or sponsored by Midway Games, Warner Bros. Interactive Entertainment, Microsoft, Valve, NVIDIA, AMD, or Intel.
 - **Trademarks:** *Psi-Ops: The Mindgate Conspiracy*, *Xbox*, *Direct3D*, *Steam Deck*, *NVIDIA DLSS*, *AMD FidelityFX*, and *Intel XeSS* are trademarks or registered trademarks of their respective owners.
 

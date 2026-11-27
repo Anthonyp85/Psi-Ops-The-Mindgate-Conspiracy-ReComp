@@ -73,6 +73,8 @@ if /i "%ALLOW_NO_XBE%"=="OFF" (
         set "XBE_PATH=.local\xbe\default.xbe"
     ) else if exist "assets\default.xbe" (
         set "XBE_PATH=assets\default.xbe"
+    ) else if exist ".local\xbe\pal\default.xbe" (
+        set "XBE_PATH=.local\xbe\pal\default.xbe"
     ) else (
         echo [2/4] Extracting private .local\xbe\default.xbe from XISO...
         python tools\extract_xbe.py || exit /b 1

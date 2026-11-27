@@ -6,6 +6,7 @@
 // and strictly ZERO settings.toml writes on unconfigured Exit.
 
 #include "common/launcher_ui.h"
+#include "game/disc_revision.h"
 #include "common/file_browser_ui.h"
 #include "common/mkb_input.h"
 #include "common/ui_common.h"
@@ -350,15 +351,17 @@ void DrawPlayAndDiscTab(LauncherState& st, void* native_owner_win, bool show_upd
     ImGui::Spacing();
 
     if (st.has_disc_info && st.disc_info.valid) {
-        ui_common::DrawBadge("[Verified Retail]", ImVec4(0.11f, 0.48f, 0.28f, 1.0f));
+        const bool europe = st.disc_info.sha1 == psiops::kEuropeXbeSha1;
+        ui_common::DrawBadge(europe ? "[Europe PAL]" : "[USA Retail]", ImVec4(0.11f, 0.48f, 0.28f, 1.0f));
         ImGui::SameLine();
         ImGui::Text("%s (Title ID 0x%08X, XDK %u)", st.disc_info.title_name.c_str(), st.disc_info.title_id,
                     unsigned(st.disc_info.xdk_build));
         ImGui::TextDisabled("Configured Disc: %s", s.iso_path.c_str());
+        if (europe) ImGui::TextDisabled("PAL preview: use a controller and the game's own options.");
     } else if (st.has_valid_game) {
         ui_common::DrawBadge("[Auto-Discovered Ready]", ImVec4(0.11f, 0.48f, 0.28f, 1.0f));
         ImGui::SameLine();
-        ImGui::TextUnformatted("Verified Psi-Ops retail USA Xbox disc image detected automatically.");
+        ImGui::TextUnformatted("Verified Psi-Ops retail Xbox disc image detected automatically.");
         ImGui::TextDisabled("Zero copyrighted assets are bundled - your local read-only disc image is mounted directly.");
     } else if (st.has_disc_info && !st.disc_info.valid) {
         ui_common::DrawBadge(st.disc_info.code.c_str(), ImVec4(0.60f, 0.14f, 0.16f, 1.0f));
@@ -367,7 +370,7 @@ void DrawPlayAndDiscTab(LauncherState& st, void* native_owner_win, bool show_upd
     } else {
         ui_common::DrawBadge("Disc Image Required", ImVec4(0.55f, 0.36f, 0.08f, 1.0f));
         ImGui::SameLine();
-        ImGui::TextWrapped("Select your legally owned Psi-Ops: The Mindgate Conspiracy (USA) Xbox .xiso.iso / .iso.");
+        ImGui::TextWrapped("Select your Psi-Ops USA or Europe (PAL) Xbox disc image (.xiso.iso / .iso).");
     }
 
     ImGui::Spacing();

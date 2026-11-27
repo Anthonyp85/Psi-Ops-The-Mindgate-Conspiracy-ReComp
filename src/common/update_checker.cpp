@@ -146,8 +146,7 @@ bool HasUnsafeUrlChars(std::string_view url) {
 
 bool IsAllowedReleasePageUrl(std::string_view url) {
     if (HasUnsafeUrlChars(url)) return false;
-    constexpr std::string_view kPrefix =
-        "https://github.com/anthonyp85/psi-ops-the-mindgate-conspiracy-recomp";
+    constexpr std::string_view kPrefix = PSIOPS_REPO_URL;
     if (!StartsWithCaseInsensitive(url, kPrefix)) return false;
     if (url.size() == kPrefix.size()) return true;
     char next = url[kPrefix.size()];
@@ -156,8 +155,7 @@ bool IsAllowedReleasePageUrl(std::string_view url) {
 
 bool IsAllowedAssetDownloadUrl(std::string_view url) {
     if (HasUnsafeUrlChars(url)) return false;
-    return StartsWithCaseInsensitive(
-               url, "https://github.com/anthonyp85/psi-ops-the-mindgate-conspiracy-recomp/") ||
+    return StartsWithCaseInsensitive(url, PSIOPS_REPO_URL "/") ||
            StartsWithCaseInsensitive(url, "https://objects.githubusercontent.com/") ||
            StartsWithCaseInsensitive(url, "https://release-assets.githubusercontent.com/");
 }
@@ -165,11 +163,9 @@ bool IsAllowedAssetDownloadUrl(std::string_view url) {
 bool IsAllowedRedirectUrl(std::string_view url) {
     if (IsAllowedAssetDownloadUrl(url)) return true;
     if (HasUnsafeUrlChars(url)) return false;
-    return StartsWithCaseInsensitive(
-               url, "https://api.github.com/repos/anthonyp85/psi-ops-the-mindgate-conspiracy-recomp/") ||
+    return StartsWithCaseInsensitive(url, "https://api.github.com/repos/" PSIOPS_GITHUB_REPO "/") ||
            StartsWithCaseInsensitive(url, "https://github-releases.githubusercontent.com/") ||
-           StartsWithCaseInsensitive(
-               url, "https://codeload.github.com/anthonyp85/psi-ops-the-mindgate-conspiracy-recomp/");
+           StartsWithCaseInsensitive(url, "https://codeload.github.com/" PSIOPS_GITHUB_REPO "/");
 }
 
 std::string SanitizeAssetFilename(std::string_view raw) {

@@ -97,6 +97,7 @@ install -m 0755 "${SCRIPT_DIR}/packaging/steamdeck/install-steamdeck.sh" "${STAG
 install -m 0644 "${SCRIPT_DIR}/packaging/steamdeck/psi-ops-recomp.desktop" "${STAGE_DIR}/psi-ops-recomp.desktop"
 install -m 0644 "${SCRIPT_DIR}/resources/psiops.png" "${STAGE_DIR}/psiops.png"
 install -m 0644 "${SCRIPT_DIR}/config/game.toml" "${STAGE_DIR}/config/game.toml"
+install -m 0644 "${SCRIPT_DIR}/config/europe.toml" "${STAGE_DIR}/config/europe.toml"
 
 for doc in LICENSE THIRD_PARTY_NOTICES.md README.md; do
     if [[ ! -f "${SCRIPT_DIR}/${doc}" ]]; then

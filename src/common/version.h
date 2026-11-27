@@ -15,9 +15,9 @@
 #define PSIOPS_WVERSION_STR PSIOPS_WIDE(PSIOPS_VERSION_STR)
 #define PSIOPS_WVERSION_TAG PSIOPS_WIDE(PSIOPS_VERSION_TAG)
 
-#define PSIOPS_GITHUB_REPO "AnthonyP85/Psi-Ops-The-Mindgate-Conspiracy-ReComp"
-#define PSIOPS_REPO_URL "https://github.com/AnthonyP85/Psi-Ops-The-Mindgate-Conspiracy-ReComp"
-#define PSIOPS_RELEASES_URL "https://github.com/AnthonyP85/Psi-Ops-The-Mindgate-Conspiracy-ReComp/releases"
+#define PSIOPS_GITHUB_REPO "Suvukaraz/Psi-Ops-The-Mindgate-Conspiracy-ReComp"
+#define PSIOPS_REPO_URL "https://github.com/" PSIOPS_GITHUB_REPO
+#define PSIOPS_RELEASES_URL PSIOPS_REPO_URL "/releases"
 #define PSIOPS_USER_AGENT "Psi-Ops-The-Mindgate-Conspiracy-ReComp/" PSIOPS_VERSION_STR
 
 #ifdef PSIOPS_CMAKE_VER_MAJOR

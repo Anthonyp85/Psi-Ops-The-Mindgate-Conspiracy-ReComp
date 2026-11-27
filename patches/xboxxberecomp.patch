@@ -523,7 +523,7 @@ index 2b0454c..d088cc3 100644
  
  }  // namespace app
 diff --git a/runtime/app/game_code.cpp b/runtime/app/game_code.cpp
-index f3f0bff..e8ed8ff 100644
+index f3f0bff..99ac80b 100644
 --- a/runtime/app/game_code.cpp
 +++ b/runtime/app/game_code.cpp
 @@ -1,7 +1,8 @@
@@ -547,7 +547,15 @@ index f3f0bff..e8ed8ff 100644
  #include <fstream>
  #include <string_view>
  #include <thread>
-@@ -51,9 +54,11 @@ struct Image {
+@@ -23,7 +26,6 @@
+ #include "app/app.h"
+ #include "core/input.h"
+ #include "core/log.h"
+-#include "hook_exports.h"
+ #include "image_symbols.h"
+ #include "kernel/disc.h"
+ #include "xbe/xbe.h"
+@@ -51,9 +53,11 @@ struct Image {
  constexpr wchar_t kClangFlags[] =
      L"-target x86_64-pc-windows-msvc -fms-compatibility-version=19.40 -std=c++20 -O2 -march=x86-64-v2 "
      L"-fno-strict-aliasing -DNDEBUG -DX86_GAME_CODE -nostdinc -nostdinc++ -w";
@@ -562,7 +570,16 @@ index f3f0bff..e8ed8ff 100644
  
  // the window's colours
  constexpr COLORREF kBackground = RGB(10, 11, 10);
-@@ -186,7 +191,7 @@ bool ReadXbe(const GameFiles& game, const char* name, std::vector<uint8_t>& out)
+@@ -108,7 +112,7 @@ fs::path ConfigFor(const std::string& xbe, const std::vector<uint8_t>& data = {}
+             toml::table t = toml::parse_file(e.path().string());
+             if (fs::path(t["xbe"]["path"].value_or(std::string())).filename() != xbe) continue;
+             if (entry && t["xbe"]["entry"].value_or(int64_t(0)) == entry) return e.path();
+-            if (first.empty()) first = e.path();
++            if (data.empty() && first.empty()) first = e.path();
+         } catch (const toml::parse_error&) {
+         }
+     }
+@@ -186,7 +190,7 @@ bool ReadXbe(const GameFiles& game, const char* name, std::vector<uint8_t>& out)
  std::vector<Target> StaleTargets(const GameFiles& game, std::vector<Image>& images) {
      std::vector<Target> stale;
      for (Image& image : images) {
@@ -571,7 +588,7 @@ index f3f0bff..e8ed8ff 100644
          if (!ReadXbe(game, image.xbe.c_str(), target.xbe)) {
              LOGR("Game code: no %s in the game files, %ls is not built", image.xbe.c_str(), image.exe.c_str());
              continue;
-@@ -240,15 +245,69 @@ void AddJobs(const Image& image, std::vector<Job>& jobs) {
+@@ -240,15 +244,69 @@ void AddJobs(const Image& image, std::vector<Job>& jobs) {
      }
  }
  
@@ -646,7 +663,17 @@ index f3f0bff..e8ed8ff 100644
  // starts and waits on the build's processes; closing the job, or this process ending, ends them all
  class Processes {
  public:
-@@ -358,11 +417,15 @@ bool FinishJob(const Job& job, HANDLE process) {
+@@ -315,6 +373,9 @@ private:
+ bool Translate(std::vector<Target>& targets, Processes& run) {
+     std::vector<HANDLE> processes;
+     for (Target& target : targets) {
++        if (target.image->config.empty()) {
++            return RecordFailure(L"No recompiler config matches the selected disc revision.");
++        }
+         fs::path work = WorkDir(*target.image);
+         fs::path xbe = work / target.image->xbe;
+         std::ofstream(xbe, std::ios::binary).write(reinterpret_cast<const char*>(target.xbe.data()), target.xbe.size());
+@@ -358,11 +419,15 @@ bool FinishJob(const Job& job, HANDLE process) {
      return true;
  }
  
@@ -665,7 +692,7 @@ index f3f0bff..e8ed8ff 100644
      for (const Job& job : jobs) g_progress.bytes_total += job.bytes;
      g_progress.files_total = uint32_t(jobs.size());
      g_progress.first_wave = uint32_t(std::min(slots, jobs.size()));
-@@ -374,6 +437,13 @@ bool Compile(std::vector<Job>& jobs, Processes& run) {
+@@ -374,6 +439,13 @@ bool Compile(std::vector<Job>& jobs, Processes& run) {
      size_t next = 0;
      while (next < jobs.size() || !running.empty()) {
          for (; running.size() < slots && next < jobs.size(); next++) {
@@ -679,7 +706,7 @@ index f3f0bff..e8ed8ff 100644
              HANDLE process = run.Start(CompileCommand(jobs[next]), jobs[next].source.parent_path());
              if (!process) {
                  RecordFailure(L"clang.exe could not be started.");
-@@ -664,6 +734,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+@@ -664,6 +736,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                  return 0;
              }
              g_compiler_bytes = CompilerBytes();
@@ -703,7 +730,7 @@ index f3f0bff..e8ed8ff 100644
              FlashWindow(hwnd, TRUE);
              return 0;
      }
-@@ -750,6 +837,12 @@ bool BuildWithWindow(std::vector<Target>& targets) {
+@@ -750,6 +839,12 @@ bool BuildWithWindow(std::vector<Target>& targets) {
  
  }  // namespace
  
@@ -716,7 +743,7 @@ index f3f0bff..e8ed8ff 100644
  bool PrepareGameCode(const GameFiles& game) {
      // one build at a time: a second copy of the game started meanwhile waits for it, then finds the DLL current
      std::wstring mutex_name = std::wstring(kGame.name) + L"-GameCode";
-@@ -770,3 +863,930 @@ bool PrepareGameCode(const GameFiles& game) {
+@@ -770,3 +865,932 @@ bool PrepareGameCode(const GameFiles& game) {
  }
  
  }  // namespace app
@@ -753,7 +780,6 @@ index f3f0bff..e8ed8ff 100644
 +#include "app/app.h"
 +#include "core/input.h"
 +#include "core/log.h"
-+#include "hook_exports.h"
 +#include "image_symbols.h"
 +#include "kernel/disc.h"
 +#include "xbe/xbe.h"
@@ -890,7 +916,7 @@ index f3f0bff..e8ed8ff 100644
 +            toml::table t = toml::parse_file(e.path().string());
 +            if (fs::path(t["xbe"]["path"].value_or(std::string())).filename() != xbe) continue;
 +            if (entry && t["xbe"]["entry"].value_or(int64_t(0)) == entry) return e.path();
-+            if (first.empty()) first = e.path();
++            if (data.empty() && first.empty()) first = e.path();
 +        } catch (const toml::parse_error&) {
 +        }
 +    }
@@ -1178,6 +1204,9 @@ index f3f0bff..e8ed8ff 100644
 +bool Translate(std::vector<Target>& targets, Processes& run) {
 +    std::vector<pid_t> pids;
 +    for (Target& target : targets) {
++        if (target.image->config.empty()) {
++            return RecordFailure("No recompiler config matches the selected disc revision.");
++        }
 +        fs::path work = WorkDir(*target.image);
 +        fs::path xbe = work / target.image->xbe;
 +        std::ofstream(xbe, std::ios::binary).write(reinterpret_cast<const char*>(target.xbe.data()), target.xbe.size());
@@ -1648,7 +1677,7 @@ index f3f0bff..e8ed8ff 100644
 +}  // namespace app
 +#endif
 diff --git a/runtime/app/game_files.cpp b/runtime/app/game_files.cpp
-index a7ddee4..fec8a79 100644
+index a7ddee4..12713d5 100644
 --- a/runtime/app/game_files.cpp
 +++ b/runtime/app/game_files.cpp
 @@ -1,5 +1,6 @@
@@ -2012,7 +2041,7 @@ index a7ddee4..fec8a79 100644
 +    if (!Runs(out.sha1)) {
 +        char buf[384];
 +        std::snprintf(buf, sizeof(buf),
-+                      "Unsupported revision of \"%s\" (XDK %u, SHA-1 %s). Supported: USA Retail (extract-xiso or Redump).",
++                      "Unsupported revision of \"%s\" (XDK %u, SHA-1 %s). Supported: USA Retail and Europe PAL Retail (MW02202E).",
 +                      out.title_name.empty() ? WideToUtf8(kGame.title).c_str() : out.title_name.c_str(),
 +                      unsigned(out.xdk_build), out.sha1.c_str());
 +        out.code = "ERR_UNSUPPORTED_REVISION";

@@ -106,6 +106,7 @@ mkdir "%STAGE_DIR%\plugins"
 copy /y "%BUILD_DIR%\PsiOps.exe" "%STAGE_DIR%\PsiOps.exe" >nul || exit /b 1
 copy /y "%REPO_ROOT%\resources\psiops.png" "%STAGE_DIR%\psiops.png" >nul || exit /b 1
 copy /y "%REPO_ROOT%\config\game.toml" "%STAGE_DIR%\config\game.toml" >nul || exit /b 1
+copy /y "%REPO_ROOT%\config\europe.toml" "%STAGE_DIR%\config\europe.toml" >nul || exit /b 1
 for %%F in (LICENSE THIRD_PARTY_NOTICES.md README.md) do (
     if not exist "%REPO_ROOT%\%%F" (
         echo   ERROR: Missing required release document "%%F".

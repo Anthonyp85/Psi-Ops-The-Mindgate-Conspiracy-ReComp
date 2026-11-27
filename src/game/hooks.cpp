@@ -34,12 +34,12 @@
 //  - sub_000DD0D0: GameStatus::CommitOptionsTransaction (__thiscall, ret 0, ecx = 0x005ECC78)
 //  - sub_000FEF40: Player::TakeDamage (__thiscall, ret 0x10, ecx = Player*)
 //  - sub_0001FBE0: Character::TakeDamage (__thiscall, ret 0x10, ecx = Character*)
-X86_EXTERN_FUNC(__imp__sub_000DA750);
-X86_EXTERN_FUNC(__imp__sub_000DBF50);
-X86_EXTERN_FUNC(__imp__sub_000DC090);
-X86_EXTERN_FUNC(__imp__sub_000DD0D0);
-X86_EXTERN_FUNC(__imp__sub_000FEF40);
-X86_EXTERN_FUNC(__imp__sub_0001FBE0);
+X86_EXTERN_FUNC(__imp__sub_PsiOpsGameStatusInit);
+X86_EXTERN_FUNC(__imp__sub_PsiOpsReadProfile);
+X86_EXTERN_FUNC(__imp__sub_PsiOpsWriteProfile);
+X86_EXTERN_FUNC(__imp__sub_PsiOpsCommitOptions);
+X86_EXTERN_FUNC(__imp__sub_PsiOpsPlayerTakeDamage);
+X86_EXTERN_FUNC(__imp__sub_PsiOpsCharacterTakeDamage);
 
 namespace {
 
@@ -650,7 +650,7 @@ void TickCheatsOnGuestFrame(X86Context& ctx, uint8_t* base) {
 // ADXM_Unlock (0x003FFC20) calls SuspendThread on this thread, but XboxXBERecomp uses cooperative
 // SuspendPoint() checks inside kernel calls; because 0x003FFD00..0x003FFD12 makes zero kernel calls,
 // checking kernel::SuspendPoint() here lets SuspendThread park it cleanly on both Windows and Linux.
-void Hook_AdxSpinYield(X86Context& ctx, uint8_t* base) {
+X86_HOST_API void Hook_AdxSpinYield(X86Context& ctx, uint8_t* base) {
     (void)ctx;
     (void)base;
     kernel::SuspendPoint();
@@ -665,7 +665,7 @@ void Hook_AdxSpinYield(X86Context& ctx, uint8_t* base) {
 // 1:1 mouse aim with 0 deadzone, 0.000 stop-drift, decoupled PC Invert-Y, and preserved +-70 deg clamp & quaternion.
 uint32_t PsiOpsLiveCameraVa() { return g_live_camera_va.load(std::memory_order_acquire); }
 
-void Hook_CameraApplyManualAim(X86Context& ctx, uint8_t* base) {
+X86_HOST_API void Hook_CameraApplyManualAim(X86Context& ctx, uint8_t* base) {
     // Camera fields used here and by game_info.cpp telemetry span [cam+0x2D8, cam+0x384).
     constexpr uint32_t kCameraSpan = 0x384u;
     if (ValidGuest(ctx.edi, kCameraSpan)) {
@@ -730,7 +730,7 @@ void Hook_CameraApplyManualAim(X86Context& ctx, uint8_t* base) {
 
 // PsiPower::RemoteViewUpdate -> call QuatFromEuler @ 0x00115E3C
 // Stack at call site: [esp+0] = float d_pitch_rad, [esp+4] = float d_yaw_rad, [esp+8] = float roll.
-void Hook_RemoteViewAim(X86Context& ctx, uint8_t* base) {
+X86_HOST_API void Hook_RemoteViewAim(X86Context& ctx, uint8_t* base) {
     if (input_rec::ShouldBypassMkb() || !mkb::IsMkbActiveForGameplay()) return;
     if (!ValidGuest(ctx.esp, 8u)) return;  // d_pitch, d_yaw
 
@@ -749,7 +749,7 @@ void Hook_RemoteViewAim(X86Context& ctx, uint8_t* base) {
 // Player::UpdateTKPitch @ 0x000FC680
 // ABI at entry: edi = Player*, [esp+4] = float dt (ret 4).
 // Adds mouse pitch delta directly into TK held-object elevation [player+0x744] clamped to +-70 deg when TK is active.
-void Hook_UpdateTKPitch(X86Context& ctx, uint8_t* base) {
+X86_HOST_API void Hook_UpdateTKPitch(X86Context& ctx, uint8_t* base) {
     if (input_rec::ShouldBypassMkb() || !mkb::IsMkbActiveForGameplay()) return;
     uint32_t player = ctx.edi;
     if (!ValidGuest(player + 0x6F4u, 0x54u)) return;  // [player+0x6F4] psi_mgr .. [player+0x744] elevation
@@ -773,7 +773,7 @@ void Hook_UpdateTKPitch(X86Context& ctx, uint8_t* base) {
 //               [esp+0x18] = float* out_yaw, [esp+0x1C] = float* out_pitch.
 // When M&K is active with Raw 1:1 Aim enabled, zeroes *out_yaw/*out_pitch and returns early to bypass auto-steer
 // (except while the player explicitly holds RMB/V Target Lock-On on a non-sniper weapon).
-bool Hook_CameraAutoSteerBypass(X86Context& ctx, uint8_t* base) {
+X86_HOST_API bool Hook_CameraAutoSteerBypass(X86Context& ctx, uint8_t* base) {
     if (input_rec::ShouldBypassMkb() || !mkb::IsMkbActiveForGameplay() || !mkb::IsRawAimEnabled()) {
         return false;
     }
@@ -1242,7 +1242,7 @@ int g_last_logged_ui_y0 = -99999;
 // HUD::Update @ 0x000C1040 (ecx = HUD*, runs every frame in both Frontend Shell and In-Game Pause/Modals).
 // Implements full PC Mouse point-and-click support across all Psi-Ops UI screens using the single embedded
 // UIManager (hud + 0xB0) in binary-verified 512x465 (y_off=+10) Layer 0x17 ortho space.
-void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
+X86_HOST_API void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
     EnsurePlayerPortBound(base);
     SyncHostSettingsToGuestOnFrame(ctx, base);
     TickCheatsOnGuestFrame(ctx, base);
@@ -1581,7 +1581,7 @@ uint32_t PsiOpsGetMkbReloadCount() { return g_mkb_reload_count.load(std::memory_
 // InputManager::Update @ 0x00294130 (edi = InputManager*, single ret @ 0x294154).
 // Snapshots decoupled M&K state once per guest frame, computes 1-frame rising edges,
 // updates active Psi slot (1..6) + wheel zoom/push latches, and executes manual Weapon::Reload on R tap.
-void Hook_InputManagerUpdate(X86Context& ctx, uint8_t* base) {
+X86_HOST_API void Hook_InputManagerUpdate(X86Context& ctx, uint8_t* base) {
     using mkb::Action;
     SyncHostSettingsToGuestOnFrame(ctx, base);
     if (input_rec::ShouldBypassMkb()) {
@@ -1742,7 +1742,7 @@ void Hook_InputManagerUpdate(X86Context& ctx, uint8_t* base) {
 // ABI: esi = InputManager*, [esp+4] = uint32_t action_id, returns float in x87 st(0).
 // Decouples every PC M&K gameplay action cleanly regardless of Xbox Config 1/2/3 while
 // passing through 100% untouched for Controller mode, .rec replays, UI/menus, and script overrides.
-bool Hook_InputManagerGetActionValue(X86Context& ctx, uint8_t* base) {
+X86_HOST_API bool Hook_InputManagerGetActionValue(X86Context& ctx, uint8_t* base) {
     using mkb::Action;
     if (input_rec::ShouldBypassMkb() || !mkb::IsMkbActiveForGameplay() || mkb::IsOverlayOpen()) return false;
     if (!g_im.valid) return false;
@@ -1921,9 +1921,9 @@ bool Hook_InputManagerGetActionValue(X86Context& ctx, uint8_t* base) {
 
 // GameStatus::GameStatus ctor @ 0x000DA750 (__stdcall, ret 4, [esp+4] = 0x005ECC78).
 // Applies persisted [game_options] immediately after factory defaults initialize on cold boot.
-X86_FUNC(sub_000DA750) {
+X86_FUNC(sub_PsiOpsGameStatusInit) {
     const uint32_t gs_va = ValidGuest(ctx.esp + 0x04u, 4u) ? ReadU32(base, ctx.esp + 0x04u) : 0u;
-    __imp__sub_000DA750(ctx, base);
+    __imp__sub_PsiOpsGameStatusInit(ctx, base);
     if (ShouldBypassGuestSettings() || g_applying_host_guest_settings || gs_va != kGameStatusVa ||
         !ValidGuest(kGameStatusVa, kGameStatusSize)) {
         return;
@@ -1944,9 +1944,9 @@ X86_FUNC(sub_000DA750) {
 //  - Re-applying host [game_options] when present (fixing the retail XBE bug at 0x000DBF6C..0x000DBF7B that
 //    forcibly resets SFX opt[4] and Music opt[5] back to 100 on every profile load!), OR
 //  - Seeding host [game_options] on first run from an existing Xbox PsiOpsProfile.
-X86_FUNC(sub_000DBF50) {
+X86_FUNC(sub_PsiOpsReadProfile) {
     const uint32_t gs_va = ctx.ecx;
-    __imp__sub_000DBF50(ctx, base);
+    __imp__sub_PsiOpsReadProfile(ctx, base);
     if (ShouldBypassGuestSettings() || g_applying_host_guest_settings || gs_va != kGameStatusVa ||
         !ValidGuest(kGameStatusVa, kGameStatusSize)) {
         return;
@@ -1968,9 +1968,9 @@ X86_FUNC(sub_000DBF50) {
 
 // GameStatus::CommitOptionsTransaction @ 0x000DD0D0 (__thiscall, ret 0, ecx = 0x005ECC78).
 // Invoked when the player clicks "Accept" (UI command 0x819) in any native in-game Options screen.
-X86_FUNC(sub_000DD0D0) {
+X86_FUNC(sub_PsiOpsCommitOptions) {
     const uint32_t gs_va = ctx.ecx;
-    __imp__sub_000DD0D0(ctx, base);
+    __imp__sub_PsiOpsCommitOptions(ctx, base);
     if (ShouldBypassGuestSettings() || g_applying_host_guest_settings || gs_va != kGameStatusVa ||
         !ValidGuest(kGameStatusVa, kGameStatusSize)) {
         return;
@@ -1983,7 +1983,7 @@ X86_FUNC(sub_000DD0D0) {
 // GameStatus::WriteProfile @ 0x000DC090 (__thiscall, ret 4, ecx = 0x005ECC78, [esp+4] = Scribe*).
 // Ensures M&K's temporary LookSpring=0 override is never serialized into U:\PsiOpsProfile, and mirrors
 // any direct guest option changes back to settings.toml.
-X86_FUNC(sub_000DC090) {
+X86_FUNC(sub_PsiOpsWriteProfile) {
     const uint32_t gs_va = ctx.ecx;
     const bool active = !ShouldBypassGuestSettings() && !g_applying_host_guest_settings &&
                         (gs_va == kGameStatusVa) && ValidGuest(kGameStatusVa, kGameStatusSize);
@@ -1991,7 +1991,7 @@ X86_FUNC(sub_000DC090) {
     if (restore_zero_after) {
         base[0x005ECEB8u] = uint8_t(g_saved_look_spring.load(std::memory_order_relaxed) & 0xFFu);
     }
-    __imp__sub_000DC090(ctx, base);
+    __imp__sub_PsiOpsWriteProfile(ctx, base);
     if (restore_zero_after) {
         base[0x005ECEB8u] = 0u;
     }
@@ -2004,7 +2004,7 @@ X86_FUNC(sub_000DC090) {
 
 // Player::TakeDamage @ 0x000FEF40 (__thiscall, ret 0x10, ecx = Player*, [esp+4] = float damage).
 // Blocks all damage, hit reactions, and death on Nick Scryer when God Mode is active.
-X86_FUNC(sub_000FEF40) {
+X86_FUNC(sub_PsiOpsPlayerTakeDamage) {
     if (!ShouldBypassGuestSettings() && psiops::cheats::IsToggleEffective(psiops::cheats::CheatToggle::GodMode)) {
         bool in_level = false;
         uint32_t live_player = 0u;
@@ -2014,7 +2014,7 @@ X86_FUNC(sub_000FEF40) {
             return;
         }
     }
-    __imp__sub_000FEF40(ctx, base);
+    __imp__sub_PsiOpsPlayerTakeDamage(ctx, base);
 }
 
 // Character::TakeDamage @ 0x0001FBE0 (__thiscall, ret 0x10, ecx = Character*, [esp+4] = float damage).
@@ -2022,7 +2022,7 @@ X86_FUNC(sub_000FEF40) {
 // running the engine's native 0x0001FFBA death, ragdoll, weapon-drop, and Python OnDeath script pipeline while
 // strictly excluding Player (0x6A), scripted invulnerable NPCs (+0x4BA), Mind-Controlled puppets (player+0x764),
 // unarmed AI_LabCoat scientists (0x5C), and all AI_Boss classes (0x5E).
-X86_FUNC(sub_0001FBE0) {
+X86_FUNC(sub_PsiOpsCharacterTakeDamage) {
     if (!ShouldBypassGuestSettings() && psiops::cheats::IsToggleEffective(psiops::cheats::CheatToggle::OneHitKills)) {
         const uint32_t actor = ctx.ecx;
         if (actor != 0u && ValidGuest(actor, 0x4C0u) && ValidGuest(ctx.esp + 0x04u, 4u)) {
@@ -2041,5 +2041,5 @@ X86_FUNC(sub_0001FBE0) {
             }
         }
     }
-    __imp__sub_0001FBE0(ctx, base);
+    __imp__sub_PsiOpsCharacterTakeDamage(ctx, base);
 }
