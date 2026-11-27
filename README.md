@@ -16,9 +16,10 @@ A native **Windows x64** (D3D12 + XAudio2 + SDL3) and **Native Linux x86_64 / St
 - **Bidirectional In-Game Options Sync (`[game_options]`):** Configure in-game SFX/Music volumes, controller button layout (`Config 1/2/3`), controller X/Y inversion, horizontal/vertical look sensitivity, controller vibration, look spring, camera preset (`Camera A/B/C`), Quick Tips, and HUD visibility/auto-hide directly from the Pre-Game Launcher or `F1` Overlay — persisted in `settings.toml` under `[game_options]` and synchronized 1:1 with the Xbox `PsiOpsProfile` (fixing the retail profile-load audio-volume reset bug while keeping unlocks and progression untouched).
 - **In-Game `F2` Cheat Menu & Psychic Trainer (`[cheats]`):** Open the live Trainer tab directly in-game with `F2` (or preview/pre-arm toggles from the Pre-Game Launcher and `F1` Overlay): 6 persistent toggles (`God Mode`, `Infinite Psi Energy`, `Bottomless Clip`, `Infinite Reserve Ammo`, `Super Psi Damage (3x)`, and RTTI-safe `One-Hit Kills` that excludes Nick, scripted/friendly NPCs, Mind-Control puppets, lab scientists, and boss phase scripts) plus 4 live gameplay instant actions (`Full Heal + Psi`, `Refill All Ammo`, `Unlock All 6 Psi Powers`, and `Give All Weapons + Full Ammo`), optional compact active-cheats HUD pill, `[cheats]` persistence in `settings.toml` (omitted until configured), and automatic suppression during `.rec` recording/replay and automated tests.
 - **Built-In GitHub Update Checker & Staged Self-Updater:** Asynchronous GitHub Releases check (native WinHTTP on Windows, zero-`DT_NEEDED` `curl`/`wget`/`python3` subprocesses on Linux), FIPS 180-4 SHA-256 archive verification, dismissible Launcher/Overlay release alerts, and one-click staged self-updates (`update_apply.cmd` / `update_apply.sh`) that preserve `settings.toml`, `hdd/` saves, shader caches, and disc images while refreshing recompiled game binaries on relaunch.
-- **9-Upscaler Graphics Suite & Native `16:9` / `16:10` Support:**
+- **9-Upscaler Graphics Suite, Native `16:9` / `16:10` Widescreen & Aspect-Correct 4:3 UI / `1:1` Crosshairs:**
   - **6 Built-In Zero-DLL Spatial Upscalers (Windows D3D12 & Linux Vulkan 1.2):** `FSR 1.0` (default), `NVIDIA NIS v1.0.3`, `AMD CAS`, `Bicubic 5-Tap` (supports `>100%` SSAA), `Integer`, and `Bilinear`.
   - **3 Retail Vendor-Signed Temporal Upscalers (Windows D3D12, bundled in `plugins/`):** `NVIDIA DLSS 4` (Presets Auto/E/J/K & DLAA + automatic NGX driver-store fallback), `AMD FSR 3.1`, and `Intel XeSS 2` — driven by true `16:9` square-pixel rendering, Halton `(2,3)` camera jitter, `RG16F` motion vectors, and `R8_UNORM` HUD reactive masking (auto-bypassed on 2D menus, loading screens, and FMVs; gracefully falls back to `FSR 1.0` on Linux Vulkan or missing DLLs).
+  - **Configurable Widescreen UI & Crosshair Aspect Ratio (`[ui_aspect]` in `settings.toml`, Launcher, and `F1` Overlay):** Defaults to `Aspect-Correct 4:3 UI & 1:1 Crosshair` (pillarboxes 2D menus, modals, and Sniper Scope to 4:3 with black sidebars, keeps HUD widgets at unstretched 4:3 proportions, renders circular `1:1` weapon crosshairs around 16:9 lock-on targets, and remaps PC mouse menu hit-testing to 4:3), with optional `4:3 Menus & 1:1 Crosshair + 16:9 Edge HUD` and `Stretched 16:9 (Original Xbox Widescreen)` modes.
 - **Native-PC 1:1 Mouse & Keyboard + Multi-Vendor Controller Support:**
   - `WM_INPUT` Raw Input (Windows) & `SDL_SetWindowRelativeMouseMode` (Linux) injected past the controller deadzone & slew filter with `1px` micro-aim precision, `0.000°` stop-drift, `dt`-independent sensitivity (`cm/360 @ 800 DPI`), decoupled PC Mouse Invert-Y, `Raw 1:1 Aim` auto-steer bypass, normalized `WASD` (`1.000`), engine-level decoupled `InputManager` actions (`E` Interact/Pickup, `Space` Jump/Mantle, `Q`/`Mouse4` Melee, `LCtrl`/`C` Crouch, `LAlt` Wall Cover, `R`/`MMB` instant manual Reload / MC Secondary, `WheelUp`/`WheelDown` bidirectional Next/Prev Weapon & Sniper Zoom / TK Push-Pull, `RMB`/`V` Sniper Scope / Target Lock-On, `LShift`/`Mouse5` + `1–6` Psi powers, mouse-flick TK Throw, `G` TK Camera Control, `X` MC Head Pop), smart OS cursor capture/release with menu-exit mouse-click suppression (held `LMB`/`RMB` clicks dismissing menus or overlays never bleed into gunfire or scope toggles), and portable OS-independent `settings.toml` bindings (`Primary` + `Secondary` slots across 25 actions).
   - Full SDL3 controller support (DualSense 5 / Edge with Touchpad-as-Back, Xbox, Switch, Steam Deck) with sustained rumble keepalive and deterministic `.rec` recording/replay.
@@ -29,20 +30,20 @@ A native **Windows x64** (D3D12 + XAudio2 + SDL3) and **Native Linux x86_64 / St
 
 ## Quick Start (Pre-Built Release Archives)
 
-### Windows x64 (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.0-win64-launcher.zip`)
+### Windows x64 (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.1-win64-launcher.zip`)
 1. Extract the `.zip` archive to any writable folder (e.g. `C:\Games\PsiOps`).
 2. Double-click **`PsiOps.exe`** to open the 6-Tab Pre-Game Launcher.
 3. In **Play & Game Disc**, browse to your retail USA `Psi-Ops - The Mindgate Conspiracy (USA).xiso.iso` (or place it inside an `assets/` folder beside `PsiOps.exe`).
 4. Choose a one-click **Hardware Preset** (`1080p Mainstream`, `1440p High`, `4K Ultra`, `Handheld / iGPU`, or `Steam Deck`) and click **Play**.
    - On first launch, `PsiOps.exe` compiles `PsiOps.dll` locally from your XISO using the bundled `compiler/` toolchain and caches it for instant subsequent launches.
 
-### Native Linux x86_64 & Steam Deck (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.0-linux-x86_64.tar.gz`)
+### Native Linux x86_64 & Steam Deck (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.1-linux-x86_64.tar.gz`)
 > **IMPORTANT (Steam Deck / SteamOS):** `PsiOps` is a **native Linux x86_64 ELF binary** (`GLIBC 2.35`, Vulkan 1.2, SDL3). **Do NOT enable Proton / Steam Play compatibility** on the Steam shortcut!
 
 1. Extract the tarball on your Steam Deck or Linux PC:
    ```bash
    mkdir -p ~/Games/PsiOps
-   tar -xzf Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.0-linux-x86_64.tar.gz -C ~/Games/PsiOps
+   tar -xzf Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.1-linux-x86_64.tar.gz -C ~/Games/PsiOps
    cd ~/Games/PsiOps
    ```
 2. *(Optional, Steam Deck / Desktop shortcut)* Register the native Linux Non-Steam Game shortcut and icon:
@@ -142,10 +143,10 @@ build.bat
 
 ### 4. Building Distributable Archives & Running the Release Audit
 ```bash
-# Windows: creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.0-{win64-launcher,source}.zip
+# Windows: creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.1-{win64-launcher,source}.zip
 release.bat
 
-# Linux (Ubuntu 22.04): creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.0-linux-x86_64.tar.gz
+# Linux (Ubuntu 22.04): creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.1-linux-x86_64.tar.gz
 ./release_linux.sh
 
 # Run full release audit (Gates 1, 2, 2b built-binary path hygiene, and Gates 3-6 archive/ABI/media checks)

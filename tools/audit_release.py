@@ -30,7 +30,7 @@ from typing import Any
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_REPO_NAME = "Psi-Ops-The-Mindgate-Conspiracy-ReComp"
-DEFAULT_VERSION = "v1.2.0"
+DEFAULT_VERSION = "v1.2.1"
 PINNED_SDK_SHA = "cc9edda3a821a4204dc28783f429b88a27ade4f9"
 ALLOWED_OWNER_NAME = "anthonyp85"
 ALLOWED_OWNER_EMAIL = "214066322+anthonyp85@users.noreply.github.com"
