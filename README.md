@@ -140,6 +140,18 @@ build.bat
 ./build_linux.sh
 ```
 
+For PAL porting work, you can extract the retail Europe (MW02202E) or Germany
+(MW02203E) executable from your own disc image:
+
+```bash
+python tools/extract_xbe.py --pal --iso "/path/to/Psi-Ops (Europe).xiso.iso"
+```
+
+The extractor identifies the revision by its published XBE checksum and saves
+`default.xbe` under the git-ignored `.local/xbe/pal/` directory. This mode is
+for analysis. The launcher and game build currently still require the USA disc
+and its matching recompiler configuration.
+
 ### 4. Building Distributable Archives & Running the Release Audit
 ```bash
 # Windows: creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.0-{win64-launcher,source}.zip
