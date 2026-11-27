@@ -6,6 +6,7 @@
 #include "common/launcher_ui.h"
 #include "common/mkb_input.h"
 #include "common/settings_ui.h"
+#include "common/ui_aspect.h"
 #include "common/ui_common.h"
 #include "common/update_checker.h"
 #include "common/version.h"
@@ -519,6 +520,9 @@ input_rec::GuestStateSnapshot QueryPsiOpsGuestState() {
 
 void OnPsiOpsPresent(uint64_t present_frame, std::filesystem::path& out_capture_bmp, bool& out_should_exit) {
     ApplyPsiOpsAspectFix();
+    if (!app::Widescreen()) {
+        psiops::ui_aspect::SetMenuPillarboxed43Active(false);
+    }
     // 1. Advance shared eff_us clock, advance deterministic replay, and log frame telemetry first
     //    (captures consumed mouse_dx/dy & d_yaw/d_pitch from the frame just rendered).
     input_rec::OnPresent(present_frame, out_capture_bmp, out_should_exit);
@@ -611,6 +615,7 @@ void OnPsiOpsLoadSettings(const void* toml_table) {
     ui_common::LoadUpdatePrefs(toml_table);
     LoadGuestGameOptions(toml_table);
     psiops::cheats::LoadSettings(toml_table);
+    psiops::ui_aspect::LoadSettings(toml_table);
 }
 
 void OnPsiOpsSaveSettings(void* toml_table) {
@@ -618,6 +623,7 @@ void OnPsiOpsSaveSettings(void* toml_table) {
     ui_common::SaveUpdatePrefs(toml_table);
     SaveGuestGameOptions(toml_table);
     psiops::cheats::SaveSettings(toml_table);
+    psiops::ui_aspect::SaveSettings(toml_table);
 }
 
 void OnPsiOpsShutdown() {

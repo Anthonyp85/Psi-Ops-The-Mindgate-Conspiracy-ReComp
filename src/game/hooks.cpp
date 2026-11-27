@@ -18,28 +18,41 @@
 #include "app/app.h"
 #include "common/input_recorder.h"
 #include "common/mkb_input.h"
+#include "common/ui_aspect.h"
 #include "core/log.h"
 #include "cpu/x86_context.h"
 #include "cpu/x86_ops.h"
 #include "game/cheats.h"
 #include "game/guest_settings.h"
+#include "gpu/backend.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
 
-// Top-level GameStatus & TakeDamage entry-point overrides (scanned by xbe_recomp --headers-only):
+// Top-level GameStatus, TakeDamage, UI/Font2D/Crosshair & Sniper Scope entry-point overrides
+// (scanned by xbe_recomp --headers-only):
 //  - sub_000DA750: GameStatus::GameStatus ctor (__stdcall, ret 4, [esp+4] = 0x005ECC78)
 //  - sub_000DBF50: GameStatus::ReadProfile (__thiscall, ret 4, ecx = 0x005ECC78)
 //  - sub_000DC090: GameStatus::WriteProfile (__thiscall, ret 4, ecx = 0x005ECC78)
 //  - sub_000DD0D0: GameStatus::CommitOptionsTransaction (__thiscall, ret 0, ecx = 0x005ECC78)
 //  - sub_000FEF40: Player::TakeDamage (__thiscall, ret 0x10, ecx = Player*)
 //  - sub_0001FBE0: Character::TakeDamage (__thiscall, ret 0x10, ecx = Character*)
+//  - sub_000C25A0: HUD::SetScopeVisible (custom eax = HUD*, [esp+4] = uint8_t visible, ret 4)
+//  - sub_00315480: Layer0x17_BeginOrtho (__cdecl, ret 0, sets 512x465 y_off=+10 ortho @ [renderer+0x270])
+//  - sub_003154A0: Layer0x17_EndOrtho (__cdecl, ret 0, restores 640x480 ortho @ [renderer+0x270])
+//  - sub_002FA180: Font2D::Render (__thiscall, ecx = UIText*/Font2D*, uses static 640x480 ortho @ 0x005EC038)
+//  - sub_002FB690: Quad2D::Render (__thiscall, ret 4, ecx = Quad2D*; Crosshair/dot vtable = 0x0051C314)
 X86_EXTERN_FUNC(__imp__sub_000DA750);
 X86_EXTERN_FUNC(__imp__sub_000DBF50);
 X86_EXTERN_FUNC(__imp__sub_000DC090);
 X86_EXTERN_FUNC(__imp__sub_000DD0D0);
 X86_EXTERN_FUNC(__imp__sub_000FEF40);
 X86_EXTERN_FUNC(__imp__sub_0001FBE0);
+X86_EXTERN_FUNC(__imp__sub_000C25A0);
+X86_EXTERN_FUNC(__imp__sub_00315480);
+X86_EXTERN_FUNC(__imp__sub_003154A0);
+X86_EXTERN_FUNC(__imp__sub_002FA180);
+X86_EXTERN_FUNC(__imp__sub_002FB690);
 
 namespace {
 
@@ -1237,12 +1250,160 @@ std::string g_last_logged_ui_screen;
 size_t g_last_logged_ui_count = 0;
 int g_last_logged_ui_y0 = -99999;
 
+// ============================================================================
+// Widescreen 2D UI Pillarboxing (Layer 0x17 + Font2D) & 1:1 Crosshair Helpers
+// ============================================================================
+constexpr uint32_t kVtblCrosshairQuad = 0x0051C314u;
+constexpr uint32_t kFont2DOrthoMatrixVa = 0x005EC038u;
+constexpr uint32_t kFont2DOrthoGuardVa = 0x005EC078u;
+constexpr float kWidescreen43ScaleX = 0.75f;  // (4/3) / (16/9) = 9/12 = 0.75f
+
+uint32_t g_scope_hud_va = 0u;
+bool g_scope_overlay_visible = false;
+bool g_in_layer17_pillarbox = false;
+bool g_in_layer17_semi_modal = false;
+bool g_draw_layer17_sidebars = false;
+
+struct UiAspectFrameState {
+    bool pillarbox_layer17 = false;
+    bool semi_transparent_modal = false;
+    bool draw_opaque_sidebars = false;
+    bool fix_crosshair = false;
+};
+
+UiAspectFrameState EvaluateUiAspectState(const uint8_t* base) {
+    UiAspectFrameState out{};
+    const psiops::ui_aspect::Mode mode = psiops::ui_aspect::GetMode();
+    if (mode == psiops::ui_aspect::Mode::Stretched16x9 || !app::Widescreen()) {
+        return out;
+    }
+    if (!ValidGuest(0x005CCBD0u, 1u) || ReadU8(base, 0x005CCBD0u) == 0u) {
+        return out;
+    }
+    const bool fmv_active = ValidGuest(0x005C4198u, 4u) && ValidGuest(0x005C4250u, 4u) &&
+                            ReadU32(base, 0x005C4198u) != 0u && ReadU32(base, 0x005C4250u) == 0u;
+    if (fmv_active) {
+        return out;
+    }
+
+    const bool status_ready =
+        ValidGuest(kGameStatusInitGuardVa, 1u) && ((ReadU8(base, kGameStatusInitGuardVa) & 1u) != 0u);
+    const bool in_shell = !status_ready || !ValidGuest(0x005ECEA7u, 1u) || (ReadU8(base, 0x005ECEA7u) != 0u);
+
+    uint32_t app = ValidGuest(0x00586A04u, 4u) ? ReadU32(base, 0x00586A04u) : 0u;
+    uint32_t app_state = ValidGuest(app, 0xD8u) ? ReadU32(base, app + 0x70u) : 0u;
+    uint32_t world = ValidGuest(app, 0xD8u) ? ReadU32(base, app + 0xD4u) : 0u;
+    const bool loading_or_no_world = (world == 0u) || (app_state == 8u);
+
+    if (in_shell || loading_or_no_world) {
+        g_scope_overlay_visible = false;
+    }
+
+    const uint32_t hud = ResolveLiveHudVa(base);
+    bool hud_modal_lock = false;
+    bool pause_open = false;
+    bool objectives_open = false;
+    bool opaque_modal_screen = false;
+
+    if (hud != 0u && ValidGuest(hud + 0x324u, 0x98u)) {
+        hud_modal_lock = (ReadU8(base, hud + 0x324u) != 0u);
+        pause_open = (ReadU8(base, hud + 0x3B4u) != 0u);
+        objectives_open = (ReadU8(base, hud + 0x3B5u) != 0u);
+    }
+
+    const bool modal_open = pause_open || objectives_open || hud_modal_lock || (!loading_or_no_world && app_state != 0u);
+    if (modal_open && hud != 0u) {
+        const uint32_t ui_mgr = hud + 0xB0u;
+        if (ValidGuest(ui_mgr, 0x240u) && ReadU32(base, ui_mgr + 0x10u) == 0u &&
+            ReadU32(base, ui_mgr + 0x14u) != 0u) {
+            const int32_t stack_top = int32_t(ReadU32(base, ui_mgr + 0x1A4u));
+            if (stack_top >= 0 && stack_top < 16) {
+                const uint32_t top_screen = ReadU32(base, ui_mgr + 0x1A8u + uint32_t(stack_top) * 4u);
+                if (ValidGuest(top_screen, 0x68u)) {
+                    char sname[64] = {};
+                    for (int i = 0; i < 63; ++i) {
+                        const uint8_t c = ReadU8(base, top_screen + 0x8u + uint32_t(i));
+                        if (c == 0u || c < 0x20u || c >= 0x7Fu) break;
+                        sname[i] = char(c);
+                    }
+                    // Full-screen opaque end-of-level modals (HUD/UI/LevelEnd/{StatsScreen,LevelEnd}) need black
+                    // sidebars, whereas gameplay Pause/Options (HUD/UI/Menu) and Tip/Objectives (HUD/UI/Tip) sit over
+                    // the dimmed 3D scene and must NOT draw opaque sidebars.
+                    if (std::strstr(sname, "Stats") != nullptr || std::strstr(sname, "LevelEnd") != nullptr) {
+                        opaque_modal_screen = true;
+                    }
+                }
+            }
+        }
+    }
+
+    const bool scope_visible = (hud != 0u) && (hud == g_scope_hud_va) && g_scope_overlay_visible &&
+                               !in_shell && !loading_or_no_world;
+
+    out.fix_crosshair = true;
+    if (mode == psiops::ui_aspect::Mode::AspectCorrect) {
+        out.pillarbox_layer17 = true;
+    } else {
+        // Mode::MenusAndCrosshair: keep active 3D gameplay HUD bars at 16:9 edges while 4:3-pillarboxing all
+        // frontend shell menus, loading screens, pause/modal/tip/objective screens, and Sniper Scope overlay.
+        out.pillarbox_layer17 = in_shell || loading_or_no_world || modal_open || scope_visible;
+    }
+
+    out.draw_opaque_sidebars =
+        out.pillarbox_layer17 && (in_shell || loading_or_no_world || scope_visible || opaque_modal_screen);
+    out.semi_transparent_modal = out.pillarbox_layer17 && !out.draw_opaque_sidebars && modal_open;
+    return out;
+}
+
+void ScaleRowVecMatrixCol0(uint8_t* base, uint32_t mat_va, float scale_x) {
+    for (uint32_t row = 0u; row < 4u; ++row) {
+        const uint32_t elem_va = mat_va + row * 16u;
+        const float v = ReadF32(base, elem_va);
+        if (std::isfinite(v) && v != 0.0f) {
+            WriteF32(base, elem_va, v * scale_x);
+        }
+    }
+}
+
+// Clears left (0..80) and right (560..640) 4:3 pillarbox sidebars in guest 640x480 target coordinates to opaque black
+// (ARGB 0xFF000000) using D3DDevice_Clear with gpu::kClearTarget (0xF0, color-only, zero depth/stencil writes and
+// zero disturbance to guest D3D8 shaders, streams, textures, or render states across both D3D12 and Vulkan).
+void ClearOpaquePillarboxSidebars(X86Context& ctx, uint8_t* base) {
+    if (!ValidGuest(ctx.esp - 0x440u, 0x440u)) return;
+    const uint32_t rects_va = (ctx.esp - 0x40u) & ~0xFu;
+    static constexpr int32_t kPillarboxRects[8] = {
+        0,   0, 80,  480,  // Left sidebar:  x = [0, 80),   y = [0, 480)
+        560, 0, 640, 480,  // Right sidebar: x = [560, 640), y = [0, 480)
+    };
+    std::memcpy(base + rects_va, kPillarboxRects, sizeof(kPillarboxRects));
+
+    // Reserve below rects_va so GuestCallFrame's callee scratch never overlaps kPillarboxRects.
+    const uint32_t orig_esp = ctx.esp;
+    ctx.esp = rects_va;
+    {
+        GuestCallFrame frame(ctx, base);
+        if (frame.ok()) {
+            frame.Push(0u);                 // [esp+24] Stencil = 0
+            frame.Push(0x3F800000u);        // [esp+20] Z = 1.0f (unused: kClearZ not set)
+            frame.Push(0xFF000000u);        // [esp+16] Color = opaque black ARGB
+            frame.Push(gpu::kClearTarget);  // [esp+12] Flags = 0xF0 (RGBA color target only, ZEnable=0 equivalent)
+            frame.Push(rects_va);           // [esp+8]  pRects = 2 D3DRECTs in 640x480 space
+            frame.Push(2u);                 // [esp+4]  Count = 2
+            frame.Call(SYM(D3DDevice_Clear));
+        }
+    }
+    ctx.esp = orig_esp;
+}
+
 }  // namespace
 
 // HUD::Update @ 0x000C1040 (ecx = HUD*, runs every frame in both Frontend Shell and In-Game Pause/Modals).
 // Implements full PC Mouse point-and-click support across all Psi-Ops UI screens using the single embedded
 // UIManager (hud + 0xB0) in binary-verified 512x465 (y_off=+10) Layer 0x17 ortho space.
 void Hook_HudUpdate(X86Context& ctx, uint8_t* base) {
+    g_in_layer17_pillarbox = false;
+    g_in_layer17_semi_modal = false;
+    psiops::ui_aspect::SetMenuPillarboxed43Active(EvaluateUiAspectState(base).pillarbox_layer17);
     EnsurePlayerPortBound(base);
     SyncHostSettingsToGuestOnFrame(ctx, base);
     TickCheatsOnGuestFrame(ctx, base);
@@ -2042,4 +2203,184 @@ X86_FUNC(sub_0001FBE0) {
         }
     }
     __imp__sub_0001FBE0(ctx, base);
+}
+
+// HUD::SetScopeVisible @ 0x000C25A0 (custom ABI: eax = HUD*, [esp+4] = uint8_t visible, ret 4).
+// Tracks Sniper Rifle 'Scope' (0x004F8F4C) Layer 0x17 overlay visibility for 4:3 pillarboxing + black sidebars.
+X86_FUNC(sub_000C25A0) {
+    g_scope_hud_va = ctx.eax;
+    g_scope_overlay_visible = ValidGuest(ctx.esp + 0x04u, 1u) && (ReadU8(base, ctx.esp + 0x04u) != 0u);
+    __imp__sub_000C25A0(ctx, base);
+}
+
+// Layer0x17_BeginOrtho @ 0x00315480 (__cdecl, ret 0).
+// Guest sets [renderer+0x270] to 512x465 (y_off=+10) ortho mapping x in [0..512] -> NDC [-1..+1].
+// When widescreen 4:3 UI pillarboxing is active, scales column 0 of [renderer+0x270] by 0.75f so Layer 0x17 quads
+// map cleanly to centered 4:3 NDC [-0.75..+0.75] (leaving Layer 0x16 world-projected markers & fades untouched).
+X86_FUNC(sub_00315480) {
+    g_in_layer17_pillarbox = false;
+    g_in_layer17_semi_modal = false;
+    g_draw_layer17_sidebars = false;
+    __imp__sub_00315480(ctx, base);
+
+    const UiAspectFrameState st = EvaluateUiAspectState(base);
+    psiops::ui_aspect::SetMenuPillarboxed43Active(st.pillarbox_layer17);
+    if (!st.pillarbox_layer17 || !ValidGuest(0x005DEFC8u, 4u)) {
+        return;
+    }
+    const uint32_t renderer = ReadU32(base, 0x005DEFC8u);
+    if (!ValidGuest(renderer + 0x270u, 64u)) {
+        return;
+    }
+    ScaleRowVecMatrixCol0(base, renderer + 0x270u, kWidescreen43ScaleX);
+    g_in_layer17_pillarbox = true;
+    g_in_layer17_semi_modal = st.semi_transparent_modal;
+    g_draw_layer17_sidebars = st.draw_opaque_sidebars;
+}
+
+// Layer0x17_EndOrtho @ 0x003154A0 (__cdecl, ret 0).
+// Restores [renderer+0x270] to full-width 640x480 ortho and clears opaque black 4:3 sidebars (x=0..80, 560..640)
+// when in Frontend Shell, Loading screens, Sniper 'Scope', or opaque full-screen modals (never over Pause/Tip dimmers).
+X86_FUNC(sub_003154A0) {
+    const bool draw_sidebars = g_draw_layer17_sidebars;
+    g_in_layer17_pillarbox = false;
+    g_in_layer17_semi_modal = false;
+    g_draw_layer17_sidebars = false;
+    __imp__sub_003154A0(ctx, base);
+    if (draw_sidebars) {
+        ClearOpaquePillarboxSidebars(ctx, base);
+    }
+}
+
+// Font2D::Render @ 0x002FA180 (__thiscall, ecx = UIText*/Font2D*).
+// Font2D ignores [renderer+0x270] and instead multiplies by its own static 640x480 ortho matrix @ 0x005EC038.
+// While inside a pillarboxed Layer 0x17 pass, temporarily scales column 0 of 0x005EC038 by 0.75f so all menu/HUD
+// text aligns pixel-for-pixel with Layer 0x17 Quad2D elements, then restores 0x005EC038 immediately on exit.
+X86_FUNC(sub_002FA180) {
+    if (!g_in_layer17_pillarbox || !ValidGuest(kFont2DOrthoMatrixVa, 68u) || !ValidGuest(0x0051F584u, 8u)) {
+        __imp__sub_002FA180(ctx, base);
+        return;
+    }
+
+    // Pre-initialize 0x005EC038 on the very first Font2D::Render call (matching 0x002FA248..0x002FA2C5:
+    // Translate(+0.5, +8.5, 0) * Scale(2/640, -2/480, 0) * Translate(-1, +1, 0)) so column-0 scaling works on frame 0.
+    if ((ReadU8(base, kFont2DOrthoGuardVa) & 1u) == 0u) {
+        const float sx = ReadF32(base, 0x0051F584u);
+        const float sy = ReadF32(base, 0x0051F588u);
+        float init_m[16] = {};
+        init_m[0] = sx;
+        init_m[5] = sy;
+        init_m[10] = 0.0f;
+        init_m[12] = 0.5f * sx - 1.0f;
+        init_m[13] = 8.5f * sy + 1.0f;
+        init_m[15] = 1.0f;
+        std::memcpy(base + kFont2DOrthoMatrixVa, init_m, sizeof(init_m));
+        WriteU32(base, kFont2DOrthoGuardVa, ReadU32(base, kFont2DOrthoGuardVa) | 1u);
+    }
+
+    struct ScopedCol0Restore {
+        uint8_t* base_ptr;
+        float c0, c4, c8, c12;
+        ~ScopedCol0Restore() {
+            WriteF32(base_ptr, kFont2DOrthoMatrixVa + 0x00u, c0);
+            WriteF32(base_ptr, kFont2DOrthoMatrixVa + 0x10u, c4);
+            WriteF32(base_ptr, kFont2DOrthoMatrixVa + 0x20u, c8);
+            WriteF32(base_ptr, kFont2DOrthoMatrixVa + 0x30u, c12);
+        }
+    } guard{
+        base,
+        ReadF32(base, kFont2DOrthoMatrixVa + 0x00u),
+        ReadF32(base, kFont2DOrthoMatrixVa + 0x10u),
+        ReadF32(base, kFont2DOrthoMatrixVa + 0x20u),
+        ReadF32(base, kFont2DOrthoMatrixVa + 0x30u),
+    };
+
+    ScaleRowVecMatrixCol0(base, kFont2DOrthoMatrixVa, kWidescreen43ScaleX);
+    __imp__sub_002FA180(ctx, base);
+}
+
+// Quad2D::Render @ 0x002FB690 (__thiscall, ret 4, ecx = Quad2D*).
+// 1. Weapon crosshairs ([crosshair+0x94], all 7 firearms + dynamic spread) and crosshair_dot1 ([0x005CCBB4]) are
+//    uniquely identified by vtable 0x0051C314 and rendered in Layer 0x16 (full-width 640x480 ortho) centered at
+//    screen_x via TransformNode translation tx = screen_x - 0.5*W. Because Crosshair::Crosshair (0x002F1DCE) also
+//    pre-inflates base_width by 7/6 (0x0051F7F4 = 1.166667, PS2 512x448 -> Xbox 640x480 artifact, 74 vs 64) on square
+//    64x64 reticle textures, setting the quad's local X span around mid_x = 0.5*W to 0.75 * H ([-0.375*H .. +0.375*H]
+//    around mid_x) cancels both 16:9 stretch and 7/6 inflation for exact 1:1 circular reticles with 0px center shift.
+// 2. During in-game semi-transparent Pause/Tip/Objectives modals (Layer 0x17 pillarboxed without opaque sidebars),
+//    full-screen backdrop dimmer quads (|dx| > 480 && |dy| > 380) expand by 4/3 so they dim the full 16:9 viewport
+//    edge-to-edge without vertical seams at the 4:3 pillarbox boundary.
+X86_FUNC(sub_002FB690) {
+    const uint32_t quad = ctx.ecx;
+    if (ValidGuest(quad, 0xF0u)) {
+        const uint32_t vtbl = ReadU32(base, quad);
+        if (!g_in_layer17_pillarbox && vtbl == kVtblCrosshairQuad && EvaluateUiAspectState(base).fix_crosshair) {
+            const float x0 = ReadF32(base, quad + 0x28u);
+            const float x1 = ReadF32(base, quad + 0x50u);
+            const float x2 = ReadF32(base, quad + 0x78u);
+            const float x3 = ReadF32(base, quad + 0xA0u);
+            const float y0 = ReadF32(base, quad + 0x2Cu);
+            const float y2 = ReadF32(base, quad + 0x7Cu);
+            float quad_h = std::fabs(y2 - y0);
+            if (!std::isfinite(quad_h) || quad_h < 0.5f) {
+                quad_h = std::fabs(ReadF32(base, quad + 0xECu));
+            }
+            if (std::isfinite(x0) && std::isfinite(x1) && std::isfinite(x2) && std::isfinite(x3) &&
+                std::isfinite(quad_h) && quad_h >= 0.5f) {
+                struct ScopedQuadXRestore {
+                    uint8_t* base_ptr;
+                    uint32_t quad_va;
+                    float v0, v1, v2, v3;
+                    ~ScopedQuadXRestore() {
+                        WriteF32(base_ptr, quad_va + 0x28u, v0);
+                        WriteF32(base_ptr, quad_va + 0x50u, v1);
+                        WriteF32(base_ptr, quad_va + 0x78u, v2);
+                        WriteF32(base_ptr, quad_va + 0xA0u, v3);
+                    }
+                } guard{base, quad, x0, x1, x2, x3};
+
+                const float mid_x = 0.5f * (x0 + x1);
+                const float half_w = 0.5f * quad_h * kWidescreen43ScaleX;
+                const float sign_top = (x1 >= x0) ? 1.0f : -1.0f;
+                const float sign_bot = (x3 >= x2) ? 1.0f : -1.0f;
+                WriteF32(base, quad + 0x28u, mid_x - sign_top * half_w);
+                WriteF32(base, quad + 0x50u, mid_x + sign_top * half_w);
+                WriteF32(base, quad + 0x78u, mid_x - sign_bot * half_w);
+                WriteF32(base, quad + 0xA0u, mid_x + sign_bot * half_w);
+                __imp__sub_002FB690(ctx, base);
+                return;
+            }
+        } else if (g_in_layer17_pillarbox && g_in_layer17_semi_modal) {
+            const float x0 = ReadF32(base, quad + 0x28u);
+            const float x1 = ReadF32(base, quad + 0x50u);
+            const float x2 = ReadF32(base, quad + 0x78u);
+            const float x3 = ReadF32(base, quad + 0xA0u);
+            const float y0 = ReadF32(base, quad + 0x2Cu);
+            const float y2 = ReadF32(base, quad + 0x7Cu);
+            if (std::isfinite(x0) && std::isfinite(x1) && std::isfinite(x2) && std::isfinite(x3) &&
+                std::isfinite(y0) && std::isfinite(y2) &&
+                std::fabs(x1 - x0) > 480.0f && std::fabs(y2 - y0) > 380.0f) {
+                struct ScopedBackdropXRestore {
+                    uint8_t* base_ptr;
+                    uint32_t quad_va;
+                    float v0, v1, v2, v3;
+                    ~ScopedBackdropXRestore() {
+                        WriteF32(base_ptr, quad_va + 0x28u, v0);
+                        WriteF32(base_ptr, quad_va + 0x50u, v1);
+                        WriteF32(base_ptr, quad_va + 0x78u, v2);
+                        WriteF32(base_ptr, quad_va + 0xA0u, v3);
+                    }
+                } guard{base, quad, x0, x1, x2, x3};
+
+                constexpr float kInv43ScaleX = 1.0f / kWidescreen43ScaleX;  // 4/3 -> cancels 0.75 ortho squeeze
+                const float mid_x = 0.5f * (x0 + x1);
+                WriteF32(base, quad + 0x28u, mid_x + (x0 - mid_x) * kInv43ScaleX);
+                WriteF32(base, quad + 0x50u, mid_x + (x1 - mid_x) * kInv43ScaleX);
+                WriteF32(base, quad + 0x78u, mid_x + (x2 - mid_x) * kInv43ScaleX);
+                WriteF32(base, quad + 0xA0u, mid_x + (x3 - mid_x) * kInv43ScaleX);
+                __imp__sub_002FB690(ctx, base);
+                return;
+            }
+        }
+    }
+    __imp__sub_002FB690(ctx, base);
 }

@@ -3,6 +3,7 @@
 // and live-synced Settings panels for Pre-Game Launcher and in-game F1 Overlay.
 
 #include "common/ui_common.h"
+#include "common/ui_aspect.h"
 #include "../game/cheats.h"
 #include "../game/guest_settings.h"
 
@@ -494,6 +495,52 @@ void DrawDisplayGpuPanel(const std::vector<app::GpuAdapterInfo>& gpus,
         app::MarkPresentModeUserEdited();
         dirty = true;
     }
+
+    // Widescreen 2D UI & Crosshair Aspect Ratio selector ([ui_aspect])
+    const app::Mode ui_out = app::Output();
+    const uint32_t ui_w = ui_out.width ? ui_out.width : 1920u;
+    const uint32_t ui_h = ui_out.height ? ui_out.height : 1080u;
+    const bool ui_wide = (ui_w * 2u >= ui_h * 3u);
+    const psiops::ui_aspect::Mode cur_ui_aspect = psiops::ui_aspect::GetMode();
+    if (ImGui::BeginCombo("UI & Crosshair Aspect", psiops::ui_aspect::ModeLabel(cur_ui_aspect))) {
+        for (uint8_t i = 0; i < static_cast<uint8_t>(psiops::ui_aspect::Mode::Count); ++i) {
+            const auto m = static_cast<psiops::ui_aspect::Mode>(i);
+            const bool sel = (cur_ui_aspect == m);
+            if (ImGui::Selectable(psiops::ui_aspect::ModeLabel(m), sel)) {
+                psiops::ui_aspect::SetMode(m);
+                dirty = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::PushTextWrapPos(420.0f);
+                ImGui::TextUnformatted(psiops::ui_aspect::ModeDescription(m));
+                ImGui::PopTextWrapPos();
+                ImGui::EndTooltip();
+            }
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (!ui_wide) {
+        DrawBadge("4:3 Display (Native)", kBadgeGray);
+    } else if (cur_ui_aspect == psiops::ui_aspect::Mode::AspectCorrect) {
+        DrawBadge("4:3 UI + 1:1 Crosshair", kBadgeGreen);
+    } else if (cur_ui_aspect == psiops::ui_aspect::Mode::MenusAndCrosshair) {
+        DrawBadge("4:3 Menus + 16:9 HUD", kBadgeCyan);
+    } else {
+        DrawBadge("Stretched 16:9", kBadgeAmber);
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    if (ui_wide) {
+        ImGui::TextWrapped("%s", psiops::ui_aspect::ModeDescription(cur_ui_aspect));
+    } else {
+        ImGui::TextWrapped(
+            "Current output (%ux%u) is 4:3, where 2D menus, HUD widgets, and crosshairs already render at native 1:1 "
+            "proportions. Your selection is saved for widescreen displays.",
+            ui_w, ui_h);
+    }
+    ImGui::PopStyleColor();
 
     SectionHeading("Graphics Adapter (GPU)");
     std::string gpu_label = "Auto (High-Performance GPU)";

@@ -40,6 +40,7 @@
 #include <toml++/toml.hpp>
 
 #include "app/app.h"
+#include "common/ui_aspect.h"
 #include "core/log.h"
 
 namespace mkb {
@@ -211,6 +212,11 @@ struct MkbCursorEvent {
     uint64_t target_ms = 0;
     float ui_x = 320.0f;
     float ui_y = 240.0f;
+    float client_x = 0.0f;
+    float client_y = 0.0f;
+    float client_w = 0.0f;
+    float client_h = 0.0f;
+    bool is_client_coords = false;
     bool click_lmb = false;
     bool click_rmb = false;
     bool has_pos = true;
@@ -356,15 +362,22 @@ MkbState& St() {
 
 // Maps OS window client coordinates (cx, cy) into Psi-Ops Layer 0x17 SetOrtho2D UI space
 // (binary-verified 0x002F5970: width=512.0, height=465.0, offset_x=0.0, offset_y=+10.0),
-// accounting for centered 16:9 / 4:3 viewport letterboxing/pillarboxing.
+// accounting first for the centered 16:9 / 4:3 presentation viewport inside (win_w, win_h)
+// (letterboxed on 16:10, pillarboxed on 21:9) and then for 4:3 UI pillarboxing (0.75 * vp_w_169)
+// inside that presentation viewport whenever Layer 0x17 is 4:3 pillarboxed.
 bool MapClientToUiSpace(float cx, float cy, float win_w, float win_h, float& out_x, float& out_y) {
     if (win_w < 1.0f || win_h < 1.0f) return false;
     const bool wide = (win_w * 2.0f >= win_h * 3.0f);
-    const float asp = wide ? (16.0f / 9.0f) : (4.0f / 3.0f);
-    const float vp_w = std::min(win_w, win_h * asp);
-    const float vp_h = vp_w / asp;
-    const float vp_x = 0.5f * (win_w - vp_w);
+    const float pres_asp = wide ? (16.0f / 9.0f) : (4.0f / 3.0f);
+    float vp_w = std::min(win_w, win_h * pres_asp);
+    const float vp_h = vp_w / pres_asp;
+    float vp_x = 0.5f * (win_w - vp_w);
     const float vp_y = 0.5f * (win_h - vp_h);
+    if (wide && psiops::ui_aspect::IsCurrentMenuPillarboxed43()) {
+        const float box_w = vp_w * 0.75f;  // Centered 4:3 sub-box (vp_h * 4/3) inside the 16:9 viewport
+        vp_x += 0.5f * (vp_w - box_w);
+        vp_w = box_w;
+    }
     if (vp_w < 1.0f || vp_h < 1.0f) return false;
     const float u = (cx - vp_x) / vp_w;
     const float v = (cy - vp_y) / vp_h;
@@ -1011,6 +1024,19 @@ void LoadAutotestScriptLocked(MkbState& st) {
                 else ev.has_pos = false;
                 st.at_cursors.push_back(ev);
             }
+        } else if (ucmd == "CLIENT_CURSOR_MS" || ucmd == "CLIENT_CLICK_MS") {
+            MkbCursorEvent ev{};
+            if (iss >> ev.target_ms >> ev.client_x >> ev.client_y) {
+                if (!(iss >> ev.client_w >> ev.client_h)) {
+                    const app::Mode out_m = app::Output();
+                    ev.client_w = float(out_m.width ? out_m.width : 1920u);
+                    ev.client_h = float(out_m.height ? out_m.height : 1080u);
+                }
+                ev.has_pos = true;
+                ev.is_client_coords = true;
+                ev.click_lmb = (ucmd == "CLIENT_CLICK_MS");
+                st.at_cursors.push_back(ev);
+            }
         } else if (ucmd == "RMB_CLICK_MS" || ucmd == "UI_BACK_MS") {
             MkbCursorEvent ev{};
             if (iss >> ev.target_ms) {
@@ -1073,6 +1099,14 @@ void ApplyRuntimeOptionLocked(MkbState& st, const std::string& key_raw, const st
             st.active_device.store(ActiveDevice::Controller, std::memory_order_relaxed);
         } else {
             st.cfg.input_mode = InputMode::Auto;
+        }
+    } else if (k == "ui_aspect" || k == "ui_aspect_mode") {
+        if (v == "menus_and_crosshair" || v == "menus_crosshair" || v == "1") {
+            psiops::ui_aspect::SetMode(psiops::ui_aspect::Mode::MenusAndCrosshair);
+        } else if (v == "stretched" || v == "stretched_16x9" || v == "2") {
+            psiops::ui_aspect::SetMode(psiops::ui_aspect::Mode::Stretched16x9);
+        } else {
+            psiops::ui_aspect::SetMode(psiops::ui_aspect::Mode::AspectCorrect);
         }
     }
 }
@@ -2192,10 +2226,16 @@ void OnPresent(uint64_t /*present_frame*/, perf::Phase phase, bool modal_ui_open
                     if (!bypassed) {
                         MarkMkbActivity(st);
                         if (ce.has_pos) {
-                            st.ui_x = ce.ui_x;
-                            st.ui_y = ce.ui_y;
-                            st.ui_pos_valid = true;
-                            st.ui_moved_pending = true;
+                            float mapped_x = ce.ui_x;
+                            float mapped_y = ce.ui_y;
+                            if (!ce.is_client_coords ||
+                                MapClientToUiSpace(ce.client_x, ce.client_y, ce.client_w, ce.client_h, mapped_x,
+                                                   mapped_y)) {
+                                st.ui_x = mapped_x;
+                                st.ui_y = mapped_y;
+                                st.ui_pos_valid = true;
+                                st.ui_moved_pending = true;
+                            }
                         }
                         if (ce.click_lmb) {
                             if (phase == perf::Phase::Fmv || non_pointer_modal) {
