@@ -711,7 +711,9 @@ void Draw(double fps) {
                     } else if (t == 2) {
                         ui_common::DrawAudioPanel(dirty);
                     } else if (t == kTabControls) {
-                        mkb::DrawControlsSettingsPanel(true, &dirty);
+                        // auto_save=false: the overlay's own `if (dirty) app::Save()` below is the single save
+                        // for this frame; saving inside the panel as well would write settings.toml twice.
+                        mkb::DrawControlsSettingsPanel(false, &dirty);
                         ImGui::Spacing();
                         ui_common::DrawInGameControlsOptionsPanel(dirty);
                     } else if (t == kTabDiagnostics) {

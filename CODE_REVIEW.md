@@ -13,7 +13,7 @@
 | `CODE_REVIEW.md` | New. This file. |
 | `handoff.md` | One appended section pointing here. |
 
-That documentation commit (`3fd50d1`) touched nothing else. The follow-up fix branch `claude/fix-review-high` changes seven code files (listed in §3a) plus this file and `handoff.md`. **Still untouched by any Claude work: `config/`, `patches/`, the SDK submodule, build scripts, and version strings.** Nothing was tagged or pushed.
+That documentation commit (`3fd50d1`) touched nothing else. The follow-up fix branch `claude/fix-review-high` changes eight code files (listed in §3a) plus this file and `handoff.md`. **Still untouched by any Claude work: `config/`, `patches/`, the SDK submodule, build scripts, and version strings.** Nothing was tagged or pushed.
 
 ## 2. How to read the findings
 
@@ -35,14 +35,14 @@ Two `.string()` calls on host paths remain and break the new UTF-8 rule: `src/co
 
 | ID | What was wrong | Change | Files |
 |---|---|---|---|
-| H1 | F1 overlay Controls tab re-locked its own non-recursive mutex: `DrawControlsSettingsPanel` held `st.lock` while calling `app::Save()`, which reaches `mkb::SaveSettings` and locks it again. | The panel now takes a `std::unique_lock` and releases it before `app::Save()`. No other behaviour change. | `src/common/mkb_input.cpp` |
+| H1 | F1 overlay Controls tab re-locked its own non-recursive mutex: `DrawControlsSettingsPanel` held `st.lock` while calling `app::Save()`, which reaches `mkb::SaveSettings` and locks it again. | The panel now takes a `std::unique_lock` and releases it before `app::Save()`. The F1 overlay passes `auto_save = false` and lets its own `if (dirty) app::Save()` do the single save, so a change no longer writes `settings.toml` twice in one frame (PR review follow-up). | `src/common/mkb_input.cpp`, `src/common/settings_ui.cpp` |
 | H2 | Self-update skipped the hash check when the release asset had no digest, then reported "staged and verified". | `StartDownloadAndStageUpdate()` refuses up front when the digest is empty (error state, message points to the release page), and the worker's check is now unconditional. | `src/common/update_checker.cpp` |
 | H4 | Win64 CI passed when `release.bat` failed, because cmd ignores a failed `call` and the audit fell back to an unpacked check. | `call release.bat --skip-build || exit /b 1`; new opt-in `--require-archives` audit flag (used by CI) makes a missing zip fail Gate 4. Without the flag the audit behaves as before. | `.github/workflows/build.yml`, `tools/audit_release.py` |
 | H5 | Zero-gated perf counters were read with `.get(key, 0)`, so a missing key passed; `--rec` passed `--replay`, which the runtime ignores. | Missing zero-gated counters are recorded and fail strict (`post`) runs; flag renamed to `--replay-input`. | `tools/test_m4_perf.py`, `tools/test_shader_precompile.py`, `tools/test_real_upscalers.py` |
 
 How these were checked (no game launch, no full build):
 
-- `mkb_input.cpp` and `update_checker.cpp` compile cleanly with `-fsyntax-only` using the exact Win64 flags from the existing headers-only build tree. **Not compiled for Linux, not linked, not run.**
+- `mkb_input.cpp`, `settings_ui.cpp` and `update_checker.cpp` compile cleanly with `-fsyntax-only` using the exact Win64 flags from the existing headers-only build tree. **Not compiled for Linux, not linked, not run.**
 - The new perf parser was run over 96 existing `perf.json` files: all 70 from current-era builds have every required key; 26 from pre-M4 builds lack `mid_frame_flushes` / `sync_present_cache_writes`, which only matters in strict `post` mode (pre-baselines are not strict). The `--dry-run` self-test passes and now covers the missing-key case.
 - CI was confirmed green and producing the zip at `ff3b1d2` before the `|| exit /b 1` change, so the stricter step should not turn a healthy run red. **The changed workflow itself has not run yet.**
 
