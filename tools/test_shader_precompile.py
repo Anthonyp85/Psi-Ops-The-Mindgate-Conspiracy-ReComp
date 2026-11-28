@@ -223,6 +223,10 @@ def _analyze_run(
         phases = perf.get("phases", {})
         res.total_presents = int(meta.get("total_presents", 0) or 0)
         res.gameplay_frames = int(phases.get("gameplay_active", {}).get("frames", 0) or 0)
+        # A missing zero-gated counter must fail the run, never read as a passing 0.
+        for required_key in ("compile_count", "sync_present_cache_writes"):
+            if required_key not in shaders:
+                res.errors.append(f"perf.json is missing shaders.{required_key}.")
         res.perf_compile_count = int(shaders.get("compile_count", 0) or 0)
         res.sync_present_cache_writes = int(shaders.get("sync_present_cache_writes", 0) or 0)
         csv_path_str = str(meta.get("csv_path", "") or "")

@@ -2,6 +2,7 @@
 
 - **Reviewed at:** `v1.2.2` (`ff3b1d2`), 2026-11-27. First pass was at `v1.2.1` (`882a082`); every "verified" item below was re-read at `v1.2.2`.
 - **Reviewer:** Claude Code, working in a separate git worktree on branch `claude/init-b2b832`.
+- **Fixes:** `H1`, `H2`, `H4`, `H5` are fixed on branch `claude/fix-review-high` (see §3a). Until that branch is merged, `main` still has them.
 - **For:** whoever picks the project up next (Gemini / Antigravity on `main`, or a human).
 
 ## 1. What this session changed
@@ -12,7 +13,7 @@
 | `CODE_REVIEW.md` | New. This file. |
 | `handoff.md` | One appended section pointing here. |
 
-Nothing else was touched: **no changes to `src/`, `tools/`, `config/`, `patches/`, the SDK submodule, build scripts, CI, or version strings.** Nothing was built, run, tagged or pushed. No finding below has been fixed yet — they are open for whoever takes them.
+That documentation commit (`3fd50d1`) touched nothing else. The follow-up fix branch `claude/fix-review-high` changes seven code files (listed in §3a) plus this file and `handoff.md`. **Still untouched by any Claude work: `config/`, `patches/`, the SDK submodule, build scripts, and version strings.** Nothing was tagged or pushed.
 
 ## 2. How to read the findings
 
@@ -30,19 +31,36 @@ Nothing else was touched: **no changes to `src/`, `tools/`, `config/`, `patches/
 
 Two `.string()` calls on host paths remain and break the new UTF-8 rule: `src/common/ui_common.cpp:792` (`app::ExeDir().string()`) and `:798` (`out_lnk.string()`). On Windows these can still throw for a non-ACP install or Desktop path.
 
+## 3a. Fixed on branch `claude/fix-review-high` (based on `3fd50d1`, not yet on `main`)
+
+| ID | What was wrong | Change | Files |
+|---|---|---|---|
+| H1 | F1 overlay Controls tab re-locked its own non-recursive mutex: `DrawControlsSettingsPanel` held `st.lock` while calling `app::Save()`, which reaches `mkb::SaveSettings` and locks it again. | The panel now takes a `std::unique_lock` and releases it before `app::Save()`. No other behaviour change. | `src/common/mkb_input.cpp` |
+| H2 | Self-update skipped the hash check when the release asset had no digest, then reported "staged and verified". | `StartDownloadAndStageUpdate()` refuses up front when the digest is empty (error state, message points to the release page), and the worker's check is now unconditional. | `src/common/update_checker.cpp` |
+| H4 | Win64 CI passed when `release.bat` failed, because cmd ignores a failed `call` and the audit fell back to an unpacked check. | `call release.bat --skip-build || exit /b 1`; new opt-in `--require-archives` audit flag (used by CI) makes a missing zip fail Gate 4. Without the flag the audit behaves as before. | `.github/workflows/build.yml`, `tools/audit_release.py` |
+| H5 | Zero-gated perf counters were read with `.get(key, 0)`, so a missing key passed; `--rec` passed `--replay`, which the runtime ignores. | Missing zero-gated counters are recorded and fail strict (`post`) runs; flag renamed to `--replay-input`. | `tools/test_m4_perf.py`, `tools/test_shader_precompile.py`, `tools/test_real_upscalers.py` |
+
+How these were checked (no game launch, no full build):
+
+- `mkb_input.cpp` and `update_checker.cpp` compile cleanly with `-fsyntax-only` using the exact Win64 flags from the existing headers-only build tree. **Not compiled for Linux, not linked, not run.**
+- The new perf parser was run over 96 existing `perf.json` files: all 70 from current-era builds have every required key; 26 from pre-M4 builds lack `mid_frame_flushes` / `sync_present_cache_writes`, which only matters in strict `post` mode (pre-baselines are not strict). The `--dry-run` self-test passes and now covers the missing-key case.
+- CI was confirmed green and producing the zip at `ff3b1d2` before the `|| exit /b 1` change, so the stricter step should not turn a healthy run red. **The changed workflow itself has not run yet.**
+
+Worth doing before merging: rebind a key and move a slider in the F1 overlay Controls tab on both platforms (H1), run `tools/test_m4_perf.py --mode post` and `tools/test_shader_precompile.py` once (H5), and let CI run on the branch (H4).
+
+Behaviour changes to be aware of: a release whose asset has no `digest` in the GitHub API response can no longer be self-installed (H2), and `test_real_upscalers.py --rec` now really replays the recording and exits when it ends (H5).
+
 ## 4. Still open — verified at `v1.2.2`
 
 ### High
 
 | ID | Finding | Where | Suggested fix |
 |---|---|---|---|
-| H1 | **F1 overlay Controls tab re-locks its own mutex.** `DrawControlsSettingsPanel` holds `std::lock_guard<std::mutex> lk(st.lock)` for the whole function and, when `auto_save` is true and something changed, calls `app::Save()`, which reaches `mkb::SaveSettings`, which locks `st.lock` again. `st.lock` is a plain `std::mutex`. Only the F1 overlay passes `auto_save = true`; the launcher passes `false`. | `src/common/mkb_input.cpp:228`, `:2740-2742`, `:2868`, `:1319-1323`; caller `src/common/settings_ui.cpp:714` | Release the lock before saving (scope the guard, save after it), or set a flag and save from the caller. |
-| H2 | **Self-update skips the hash check when the release has no digest**, then reports "staged and verified". The digest also comes from the same API response as the download URL, so it proves integrity, not origin. | `src/common/update_checker.cpp:2286`, `:2324` | Treat an empty digest as a failure (or at least say "unverified" and require confirmation). |
 | H3 | **D3D12 window resize skips render-target reallocation and upscaler reset.** `ResizeSwap()` ends by calling `ComputeRenderExtents(render_w_, render_h_, …)`, so the following `ApplySettings()` computes `size_changed == false` and skips `targets_.clear()`, the scale update and the upscaler history reset. | `XboxXBERecomp/runtime/gpu/d3d12.cpp:5639`, `:6122-6135` | Have `ResizeSwap` leave the old extents (or set a `remake` flag) so `ApplySettings` sees the change. Vulkan equivalent was reported, not verified. |
-| H4 | **Win64 CI passes even if packaging fails.** The step is `shell: cmd` with `call release.bat --skip-build` followed by the audit; cmd does not stop on a failed `call`, and the audit falls back to an unpacked check when the zip is missing. | `.github/workflows/build.yml:109-110`, `tools/audit_release.py:1428-1430` | Add `|| exit /b 1` after `call release.bat`; make `--ci` fail when the archive is absent. |
-| H5 | **Test suites can pass vacuously.** Missing perf metrics are read with `.get(key, 0)` and then asserted `== 0`; `test_real_upscalers.py` passes `--replay`, which the runtime does not parse (the flag is `--replay-input`). | `tools/test_m4_perf.py:158`, `:170`, `:204`; `tools/test_shader_precompile.py:227`; `tools/test_real_upscalers.py:376` | Fail when a required key is absent; rename the flag. |
 
-Note on H1: the save call has been there since `v1.0.0`. Re-locking a `std::mutex` on the same thread is undefined behaviour (normally a hang or abort). If rebinding a key in the F1 overlay works in practice, something in that chain is not what it looks like on paper — worth one manual test before changing anything.
+`H1`, `H2`, `H4` and `H5` moved to §3a.
+
+Note on H1 (now fixed): the save call had been there since `v1.0.0`. Re-locking a `std::mutex` on the same thread is undefined behaviour (normally a hang or abort). If rebinding a key in the F1 overlay works in practice, something in that chain is not what it looks like on paper — worth one manual test before changing anything.
 
 ### Medium
 

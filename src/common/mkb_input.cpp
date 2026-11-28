@@ -2739,7 +2739,7 @@ static KeyCode PollImGuiRebindInput() {
 
 void DrawControlsSettingsPanel(bool auto_save, bool* out_dirty) {
     MkbState& st = St();
-    std::lock_guard<std::mutex> lk(st.lock);
+    std::unique_lock<std::mutex> lk(st.lock);
     bool dirty = false;
 
     // A binding stored by the window-message capture path still has to be saved.
@@ -2865,7 +2865,12 @@ void DrawControlsSettingsPanel(bool auto_save, bool* out_dirty) {
 
     if (dirty) {
         if (out_dirty) *out_dirty = true;
-        if (auto_save) app::Save();
+        if (auto_save) {
+            // app::Save() -> kGame.save -> mkb::SaveSettings() takes st.lock itself (non-recursive std::mutex),
+            // so the panel lock must be released first.
+            lk.unlock();
+            app::Save();
+        }
     }
 }
 

@@ -2190,6 +2190,15 @@ bool StartDownloadAndStageUpdate() {
             g_snapshot.status_message = "No allowlisted release archive available for automatic update.";
             return false;
         }
+        // Never stage an archive that cannot be verified: a release asset without a SHA-256 digest is refused
+        // up front instead of being installed unchecked and reported as "verified".
+        if (g_snapshot.asset_sha256.empty()) {
+            g_snapshot.state = UpdateState::Error;
+            g_snapshot.status_message =
+                "This release has no SHA-256 digest, so the download cannot be verified. "
+                "Use the release page to update manually.";
+            return false;
+        }
         asset_url = g_snapshot.asset_url;
         asset_name = SanitizeAssetFilename(g_snapshot.asset_name);
         asset_sha256 = g_snapshot.asset_sha256;
@@ -2283,7 +2292,7 @@ bool StartDownloadAndStageUpdate() {
         }
 
         std::string actual_sha = sha.FinalHex();
-        if (!asset_sha256.empty() && LowerAscii(actual_sha) != LowerAscii(asset_sha256)) {
+        if (asset_sha256.empty() || LowerAscii(actual_sha) != LowerAscii(asset_sha256)) {
             fs::remove_all(staging_dir, ec);
             std::lock_guard<std::mutex> lk(g_state_mutex);
             g_snapshot.state = UpdateState::Error;

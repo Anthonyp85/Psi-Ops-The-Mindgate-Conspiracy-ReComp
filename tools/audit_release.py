@@ -1392,6 +1392,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Explicit PE/ELF/.lib file for Gate 2b to scan (repeatable).",
     )
     parser.add_argument("--skip-build-binaries", action="store_true", help="Skip Gate 2b (built binary path hygiene).")
+    parser.add_argument(
+        "--require-archives",
+        action="store_true",
+        help="With --ci: fail Gate 4 when the packaged win64-launcher.zip is missing instead of falling back to the "
+        "unpacked build-tree check (use in CI right after release.bat).",
+    )
     args = parser.parse_args(argv)
 
     dist_dir = args.dist_dir.resolve()
@@ -1426,7 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
         results.append(run_gate_3_source_zip(dist_dir, args.repo_name, args.version))
     if "4" in selected:
         win_zip = dist_dir / f"{args.repo_name}-{args.version}-win64-launcher.zip"
-        if args.ci and not win_zip.is_file():
+        if args.ci and not win_zip.is_file() and not args.require_archives:
             results.append(run_gate_4_ci_win64_unpacked(args.version))
         else:
             results.append(run_gate_4_win64_zip(dist_dir, args.repo_name, args.version))

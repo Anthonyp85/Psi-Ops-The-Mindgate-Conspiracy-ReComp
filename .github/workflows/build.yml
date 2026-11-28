@@ -106,5 +106,5 @@ jobs:
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           set "PATH=C:\Program Files\LLVM\bin;%PATH%"
-          call release.bat --skip-build
-          python tools/audit_release.py --ci --platform win64 --build-dir out/build/headers-only-win
+          call release.bat --skip-build || exit /b 1
+          python tools/audit_release.py --ci --require-archives --platform win64 --build-dir out/build/headers-only-win

@@ -373,7 +373,7 @@ def _build_case_cli_args(
     if case.render_scale_pct is not None:
         args += ["--render-scale", str(case.render_scale_pct)]
     if rec_arg:
-        args += ["--replay", rec_arg, "--replay-exit"]
+        args += ["--replay-input", rec_arg, "--replay-exit"]
     args.extend(case.extra_args)
     return args
 

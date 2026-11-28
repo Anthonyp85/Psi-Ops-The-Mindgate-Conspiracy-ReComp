@@ -104,6 +104,8 @@ class ElevenMetrics:
     upload_overflows: int = 0
     # Simulation speed ratio
     g_elapsed_to_wall_ratio: float = 0.0
+    # Zero-gated counters absent from perf.json (a missing key must fail, never read as a passing 0)
+    missing_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -130,6 +132,15 @@ class BenchmarkRunResult:
     metrics_fmv: dict[str, Any] = field(default_factory=dict)
 
 
+def _required_counter(section: dict[str, Any], section_name: str, keys: tuple[str, ...], missing: list[str]) -> int:
+    """Read a zero-gated counter; record it as missing instead of silently defaulting to 0."""
+    for key in keys:
+        if key in section:
+            return int(section[key])
+    missing.append(f"{section_name}.{keys[0]}")
+    return 0
+
+
 def extract_eleven_metrics(perf: dict[str, Any], phase_key: str, log_text: str = "") -> ElevenMetrics:
     meta = perf.get("meta", {})
     phase = perf.get("phases", {}).get(phase_key, {})
@@ -154,12 +165,13 @@ def extract_eleven_metrics(perf: dict[str, Any], phase_key: str, log_text: str =
     m.gpu_ms = float(phase.get("gpu_ms_avg", 0.0))
     m.process_cpu_pct = float(workload.get("process_cpu_pct_avg", 0.0))
 
-    m.lock_stalls = int(stalls.get("lock_stalls", stalls.get("render_waits_total", 0)))
-    m.mid_frame_flushes = int(stalls.get("mid_frame_flushes", 0))
+    missing = m.missing_keys
+    m.lock_stalls = _required_counter(stalls, "stalls", ("lock_stalls", "render_waits_total"), missing)
+    m.mid_frame_flushes = _required_counter(stalls, "stalls", ("mid_frame_flushes",), missing)
 
-    m.compile_count = int(shaders.get("compile_count", 0))
+    m.compile_count = _required_counter(shaders, "shaders", ("compile_count",), missing)
     m.compile_ms_total = float(shaders.get("compile_ms_total", 0.0))
-    m.pso_create_count = int(shaders.get("pso_create_count", 0))
+    m.pso_create_count = _required_counter(shaders, "shaders", ("pso_create_count",), missing)
     m.pso_create_ms_total = float(shaders.get("pso_create_ms_total", 0.0))
     prewarm_ms = float(shaders.get("boot_prewarm_ms", 0.0))
     if prewarm_ms <= 0.0 and log_text:
@@ -167,10 +179,12 @@ def extract_eleven_metrics(perf: dict[str, Any], phase_key: str, log_text: str =
         if pm:
             prewarm_ms = float(pm.group(1))
     m.boot_prewarm_ms = round(prewarm_ms, 3)
-    m.sync_present_cache_writes = int(shaders.get("sync_present_cache_writes", 0))
+    m.sync_present_cache_writes = _required_counter(shaders, "shaders", ("sync_present_cache_writes",), missing)
 
-    m.audio_underruns = int(audio.get("underruns", audio.get("xaudio2_underruns", 0))) + int(audio.get("stream_underruns", 0))
-    m.audio_glitches = int(audio.get("glitches", audio.get("xaudio2_glitches", 0)))
+    m.audio_underruns = _required_counter(audio, "audio", ("underruns", "xaudio2_underruns"), missing) + int(
+        audio.get("stream_underruns", 0)
+    )
+    m.audio_glitches = _required_counter(audio, "audio", ("glitches", "xaudio2_glitches"), missing)
     m.audio_blocks = int(audio.get("blocks_submitted", 0))
     wall_s = float(meta.get("wall_duration_s", 0.0))
     if "av_sync_ratio" in audio:
@@ -201,7 +215,7 @@ def extract_eleven_metrics(perf: dict[str, Any], phase_key: str, log_text: str =
         if um:
             ring_mb = float(um.group(1))
     m.upload_ring_mb = ring_mb
-    m.upload_overflows = int(mem.get("upload_overflows", mem.get("d3d12_upload_overflows", 0)))
+    m.upload_overflows = _required_counter(mem, "memory", ("upload_overflows", "d3d12_upload_overflows"), missing)
     m.g_elapsed_to_wall_ratio = float(phase.get("g_elapsed_to_wall_ratio", 0.0))
     return m
 
@@ -354,6 +368,8 @@ def run_benchmark_case(
                 if m_ov.frames <= 0:
                     res.errors.append("perf.json reports 0 overall frames.")
                 if strict_post:
+                    if m_ov.missing_keys:
+                        res.errors.append(f"perf.json is missing zero-gated metrics: {', '.join(m_ov.missing_keys)}.")
                     if m_ov.audio_underruns != 0 or m_ov.audio_glitches != 0:
                         res.errors.append(f"Audio underruns/glitches non-zero (underruns={m_ov.audio_underruns}, glitches={m_ov.audio_glitches}).")
                     if m_ov.mid_frame_flushes != 0:
@@ -537,6 +553,8 @@ def run_benchmark_case(
         res.warnings.append("perf.json reports 0 fmv frames.")
 
     if strict_post:
+        if m_ov.missing_keys:
+            res.errors.append(f"perf.json is missing zero-gated metrics: {', '.join(m_ov.missing_keys)}.")
         if m_ov.audio_underruns != 0 or m_ov.audio_glitches != 0:
             res.errors.append(f"Audio underruns/glitches non-zero (underruns={m_ov.audio_underruns}, glitches={m_ov.audio_glitches}).")
         if m_ov.mid_frame_flushes != 0:
@@ -846,6 +864,12 @@ def _self_test_m4_logic(repo_root: Path) -> None:
     m_gp = extract_eleven_metrics(sample_perf, "gameplay_active")
     assert m_gp.avg_fps == 60.0 and m_gp.mid_frame_flushes == 0 and m_gp.sync_present_cache_writes == 0
     assert m_gp.disc_cache_hit_pct == 87.5 and m_gp.gpu_slab_count == 2 and m_gp.upload_ring_mb == 64.0
+    assert m_gp.missing_keys == [], m_gp.missing_keys
+    m_empty = extract_eleven_metrics({"phases": {"overall": {"frames": 10}}}, "overall")
+    assert set(m_empty.missing_keys) == {
+        "stalls.lock_stalls", "stalls.mid_frame_flushes", "shaders.compile_count", "shaders.pso_create_count",
+        "shaders.sync_present_cache_writes", "audio.underruns", "audio.glitches", "memory.upload_overflows",
+    }, m_empty.missing_keys
     md = build_pre_vs_post_markdown(
         {"benchmarks": [{"name": "win64_warm", "metrics_gameplay": asdict(m_gp), "metrics_fmv": asdict(m_gp)}]},
         {"benchmarks": [{"name": "win64_warm", "metrics_gameplay": asdict(m_gp), "metrics_fmv": asdict(m_gp)}]},
