@@ -40,7 +40,7 @@ struct TemporalPrepConstants {
     uint32_t has_scene_color;
     float jitter_x;
     float jitter_y;
-    float pad0;
+    uint32_t has_skin_mask;
     float pad1;
 };
 
@@ -348,21 +348,22 @@ float4 ps_nis(VsOut i) : SV_Target {
 
 const char kTemporalPrepHlsl[] = R"HLSL(
 cbuffer PrepCB : register(b0) {
-    float4x4 CurVpInv;
-    float4x4 PrevVp;
+    row_major float4x4 CurVpInv;
+    row_major float4x4 PrevVp;
     uint Width;
     uint Height;
     uint HasPrevVp;
     uint HasSceneColor;
     float JitterX;
     float JitterY;
-    float Pad0;
+    uint HasSkinMask;
     float Pad1;
 };
 
 Texture2D<float4> FrontTex      : register(t0);
 Texture2D<float4> SceneColorTex : register(t1);
 Texture2D<float>  DepthTex      : register(t2);
+Texture2D<float4> SkinMaskTex   : register(t3);
 
 RWTexture2D<float2> OutMv       : register(u0);
 RWTexture2D<float>  OutReactive : register(u1);
@@ -378,7 +379,10 @@ void cs_temporal_prep(uint3 tid : SV_DispatchThreadID) {
     z = saturate(z);
     OutDepth[tid.xy] = z;
 
-    // HUD / 2D overlay reactive mask
+    float4 skin = (HasSkinMask != 0) ? SkinMaskTex.Load(coord) : float4(0.0, 0.0, 0.0, 0.0);
+    bool isSkin = (HasSkinMask != 0) && isfinite(skin.w) && (skin.w > 1e-6) && (abs(z - skin.w) <= 2e-5);
+
+    // HUD / 2D overlay + animated skinned-character reactive mask
     float reactive = 0.0;
     if (HasSceneColor != 0) {
         float3 f = FrontTex.Load(coord).rgb;
@@ -389,23 +393,30 @@ void cs_temporal_prep(uint3 tid : SV_DispatchThreadID) {
     } else if (z <= 1e-6) {
         reactive = 0.5;
     }
+    if (isSkin) {
+        reactive = max(reactive, 0.80);
+    }
     OutReactive[tid.xy] = reactive;
 
-    // Camera reprojection motion vector (prev_px - curr_px in render-resolution pixels)
+    // Unjittered camera + per-character root motion vector (prev_px - curr_px in render-resolution pixels)
     float2 mv = float2(0.0, 0.0);
     if (HasPrevVp != 0 && z > 1e-6) {
         float2 px = float2(tid.xy) + 0.5;
-        float2 unj = (px - float2(JitterX, JitterY)) / float2(float(Width), float(Height));
+        float2 unjPx = px - float2(JitterX, JitterY);
+        float2 unj = unjPx / float2(float(Width), float(Height));
         float4 ndc = float4(unj.x * 2.0 - 1.0, 1.0 - unj.y * 2.0, z, 1.0);
         float4 world = mul(CurVpInv, ndc);
         if (abs(world.w) > 1e-6) {
             world /= world.w;
+            if (isSkin && all(isfinite(skin.xyz))) {
+                world.xyz -= skin.xyz;
+            }
             float4 prevClip = mul(PrevVp, world);
             if (abs(prevClip.w) > 1e-6) {
                 float2 prevNdc = prevClip.xy / prevClip.w;
                 float2 prevUv = float2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
                 float2 prevPx = prevUv * float2(float(Width), float(Height));
-                float2 rawMv = prevPx - px;
+                float2 rawMv = prevPx - unjPx;
                 if (all(isfinite(rawMv))) {
                     mv = clamp(rawMv, float2(-2048.0, -2048.0), float2(2048.0, 2048.0));
                 }
@@ -647,10 +658,10 @@ bool SpatialD3D12::Init(ID3D12Device* dev, const gpu::UpscalerHostOps& host) {
         return false;
     }
 
-    // Compute root signature: [0]=CBV(b0), [1]=SRV table(t0..t2), [2]=UAV table(u0..u2)
+    // Compute root signature: [0]=CBV(b0), [1]=SRV table(t0..t3), [2]=UAV table(u0..u2)
     D3D12_DESCRIPTOR_RANGE cs_srv{};
     cs_srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    cs_srv.NumDescriptors = 3;
+    cs_srv.NumDescriptors = 4;
     cs_srv.BaseShaderRegister = 0;
 
     D3D12_DESCRIPTOR_RANGE cs_uav{};
@@ -708,7 +719,7 @@ bool SpatialD3D12::Init(ID3D12Device* dev, const gpu::UpscalerHostOps& host) {
         cd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
         void* raw = nullptr;
         if (host.create_or_load_compute_pso &&
-            host.create_or_load_compute_pso(host.ctx, L"upscale_temporal_prep", &cd, &raw) && raw) {
+            host.create_or_load_compute_pso(host.ctx, L"upscale_temporal_prep_v2", &cd, &raw) && raw) {
             impl_->pso_temporal_prep.Attach(static_cast<ID3D12PipelineState*>(raw));
         } else {
             dev->CreateComputePipelineState(&cd, IID_PPV_ARGS(&impl_->pso_temporal_prep));
@@ -836,7 +847,8 @@ bool SpatialD3D12::BuildTemporalInputs(ID3D12GraphicsCommandList* cmd, ID3D12Res
                                        D3D12_RESOURCE_STATES& front_state, DXGI_FORMAT front_fmt,
                                        ID3D12Resource* scene_color_res, D3D12_RESOURCE_STATES* scene_color_state,
                                        DXGI_FORMAT scene_color_fmt, ID3D12Resource* depth_res,
-                                       D3D12_RESOURCE_STATES& depth_state, ID3D12Resource* out_mv,
+                                       D3D12_RESOURCE_STATES& depth_state, ID3D12Resource* skin_mask_res,
+                                       D3D12_RESOURCE_STATES* skin_mask_state, ID3D12Resource* out_mv,
                                        D3D12_RESOURCE_STATES& mv_state, ID3D12Resource* out_reactive,
                                        D3D12_RESOURCE_STATES& reactive_state, ID3D12Resource* out_depth_r32f,
                                        D3D12_RESOURCE_STATES& depth_r32f_state, uint32_t w, uint32_t h,
@@ -859,6 +871,10 @@ bool SpatialD3D12::BuildTemporalInputs(ID3D12GraphicsCommandList* cmd, ID3D12Res
         tr(scene_color_res, *scene_color_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
     tr(depth_res, depth_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    bool has_skin = (skin_mask_res != nullptr && skin_mask_state != nullptr);
+    if (has_skin) {
+        tr(skin_mask_res, *skin_mask_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     tr(out_mv, mv_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     tr(out_reactive, reactive_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     tr(out_depth_r32f, depth_r32f_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -878,14 +894,17 @@ bool SpatialD3D12::BuildTemporalInputs(ID3D12GraphicsCommandList* cmd, ID3D12Res
     sv.Format = CleanSrvFormat(depth_res->GetDesc().Format);
     impl_->dev->CreateShaderResourceView(depth_res, &sv, impl_->CpuSrv(base + 2));
 
+    sv.Format = has_skin ? DXGI_FORMAT_R32G32B32A32_FLOAT : CleanSrvFormat(front_fmt);
+    impl_->dev->CreateShaderResourceView(has_skin ? skin_mask_res : front_res, &sv, impl_->CpuSrv(base + 3));
+
     D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
     uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     uv.Format = DXGI_FORMAT_R16G16_FLOAT;
-    impl_->dev->CreateUnorderedAccessView(out_mv, nullptr, &uv, impl_->CpuSrv(base + 3));
+    impl_->dev->CreateUnorderedAccessView(out_mv, nullptr, &uv, impl_->CpuSrv(base + 4));
     uv.Format = DXGI_FORMAT_R8_UNORM;
-    impl_->dev->CreateUnorderedAccessView(out_reactive, nullptr, &uv, impl_->CpuSrv(base + 4));
+    impl_->dev->CreateUnorderedAccessView(out_reactive, nullptr, &uv, impl_->CpuSrv(base + 5));
     uv.Format = DXGI_FORMAT_R32_FLOAT;
-    impl_->dev->CreateUnorderedAccessView(out_depth_r32f, nullptr, &uv, impl_->CpuSrv(base + 5));
+    impl_->dev->CreateUnorderedAccessView(out_depth_r32f, nullptr, &uv, impl_->CpuSrv(base + 6));
 
     TemporalPrepConstants cb{};
     std::memcpy(cb.cur_vp_inv, cur_vp_inv, sizeof(cb.cur_vp_inv));
@@ -896,6 +915,7 @@ bool SpatialD3D12::BuildTemporalInputs(ID3D12GraphicsCommandList* cmd, ID3D12Res
     cb.has_scene_color = has_sc ? 1u : 0u;
     cb.jitter_x = jx;
     cb.jitter_y = jy;
+    cb.has_skin_mask = has_skin ? 1u : 0u;
 
     void* up_res = nullptr;
     uint64_t up_off = 0;
@@ -910,7 +930,7 @@ bool SpatialD3D12::BuildTemporalInputs(ID3D12GraphicsCommandList* cmd, ID3D12Res
     cmd->SetPipelineState(impl_->pso_temporal_prep.Get());
     cmd->SetComputeRootConstantBufferView(0, up_gpu);
     cmd->SetComputeRootDescriptorTable(1, impl_->GpuSrv(base + 0));
-    cmd->SetComputeRootDescriptorTable(2, impl_->GpuSrv(base + 3));
+    cmd->SetComputeRootDescriptorTable(2, impl_->GpuSrv(base + 4));
     cmd->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
 
     D3D12_RESOURCE_BARRIER uavs[3]{};

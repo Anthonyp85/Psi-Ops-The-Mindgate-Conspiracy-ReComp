@@ -307,7 +307,23 @@ XPP_MemoryUnitType          = 0
 # convention: a register (eax ebx ecx edx esi edi ebp) or "stack" for the next stack slot, which the callee pops
 [abi]
 
-# Binary-verified CRI ADX spin-blocker thread (0x003FFCF0..0x003FFD12) cooperative suspend hook
+# Binary-verified CRI ADX (ADXXB Ver.1.49) host mutex, mwidle border wait & spin-blocker hooks:
+# ADXM_Lock (0x003FFBD0) and ADXM_Unlock (0x003FFC20) assume single-core Xbox real-time priority preemption
+# without a mutex, which races under Linux SCHED_OTHER and starves hMwidle in adxm_goto_mwidle_border (0x003FFC70).
+[[hook]]
+at = 0x3FFBD0
+call = "Hook_AdxLock"
+on_true = "ret"
+
+[[hook]]
+at = 0x3FFC20
+call = "Hook_AdxUnlock"
+on_true = "ret"
+
+[[hook]]
+at = 0x3FFC9E
+call = "Hook_AdxMwidleBorderWait"
+
 [[hook]]
 at = 0x3FFD00
 call = "Hook_AdxSpinYield"

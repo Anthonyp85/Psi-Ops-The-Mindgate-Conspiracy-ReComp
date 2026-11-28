@@ -472,18 +472,28 @@ void DrawDisplayGpuPanel(const std::vector<app::GpuAdapterInfo>& gpus,
         ImGui::EndCombo();
     }
 
-    // FPS Cap selector
-    static constexpr uint32_t kCaps[7] = {30, 60, 90, 120, 144, app::kFpsCapRefresh, 0};
-    static constexpr const char* kCapNames[7] = {"30 FPS (Xbox Original)", "60 FPS (Recommended)", "90 FPS (OLED Deck)",
-                                                 "120 FPS", "144 FPS", "Monitor Refresh Rate", "Unlimited"};
-    int cap_idx = 1;
-    for (int i = 0; i < 7; ++i) {
-        if (s.fps_cap == kCaps[i]) cap_idx = i;
+    // FPS Cap selector — Psi-Ops's Havok physics step (0x003052CE) skips simulation whenever step_dt <= 1/120s,
+    // causing severe character/camera sawtooth desync and temporal ghosting above 60 FPS on high-Hz displays.
+    if (s.fps_cap == 0u || s.fps_cap == app::kFpsCapRefresh || s.fps_cap > 60u) {
+        s.fps_cap = 60u;
+        dirty = true;
     }
-    if (ImGui::Combo("Frame Rate Cap", &cap_idx, kCapNames, 7)) {
+    static constexpr uint32_t kCaps[2] = {30, 60};
+    static constexpr const char* kCapNames[2] = {"30 FPS (Xbox Original)", "60 FPS (Recommended - Native Physics Lockstep)"};
+    int cap_idx = (s.fps_cap <= 30u) ? 0 : 1;
+    if (ImGui::Combo("Frame Rate Cap", &cap_idx, kCapNames, 2)) {
         s.fps_cap = kCaps[cap_idx];
         app::MarkFpsCapUserEdited();
         dirty = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(420.0f);
+        ImGui::TextUnformatted(
+            "Psi-Ops's Havok physics engine steps at a 60 Hz ceiling (skipping physics steps above 60 FPS). "
+            "On 120/144/165/240 Hz and VRR displays, 60 FPS is paced tear-free via Present / VSync Mode.");
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
     }
 
     // Present Mode selector

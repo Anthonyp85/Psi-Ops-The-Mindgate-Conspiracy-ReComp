@@ -94,12 +94,13 @@ public:
     bool CompositeOutput(ID3D12Resource* src_tex, D3D12_RESOURCE_STATES& src_state, DXGI_FORMAT src_fmt,
                          float extra_sharpness, const gpu::UpscalerFrameDesc& fd);
 
-    // Generates render-resolution RG16F camera motion vectors (prev_px - curr_px), R8_UNORM HUD reactive mask,
-    // and clean R32_FLOAT reversed-Z depth copy for universal DLSS 4 / FSR 3.1 / XeSS 2 compatibility.
+    // Generates render-resolution RG16F motion vectors (prev_px - curr_px), R8_UNORM HUD + skinned-character
+    // reactive mask, and clean R32_FLOAT reversed-Z depth copy for universal DLSS 4 / FSR 3.1 / XeSS 2 compatibility.
     bool BuildTemporalInputs(ID3D12GraphicsCommandList* cmd, ID3D12Resource* front_res,
                              D3D12_RESOURCE_STATES& front_state, DXGI_FORMAT front_fmt, ID3D12Resource* scene_color_res,
                              D3D12_RESOURCE_STATES* scene_color_state, DXGI_FORMAT scene_color_fmt,
                              ID3D12Resource* depth_res, D3D12_RESOURCE_STATES& depth_state,
+                             ID3D12Resource* skin_mask_res, D3D12_RESOURCE_STATES* skin_mask_state,
                              ID3D12Resource* out_mv, D3D12_RESOURCE_STATES& mv_state, ID3D12Resource* out_reactive,
                              D3D12_RESOURCE_STATES& reactive_state, ID3D12Resource* out_depth_r32f,
                              D3D12_RESOURCE_STATES& depth_r32f_state, uint32_t w, uint32_t h,

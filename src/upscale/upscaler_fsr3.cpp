@@ -95,7 +95,7 @@ public:
 
         available_ = true;
         detail_ = "FSR 3.1 Ready (FidelityFX API DX12)";
-        LOGR("upscale: FSR 3.1 initialized (%s)", probe.fsr3_loader_path.string().c_str());
+        LOGR("upscale: FSR 3.1 initialized (%s)", app::PathToUtf8(probe.fsr3_loader_path).c_str());
         return true;
     }
 

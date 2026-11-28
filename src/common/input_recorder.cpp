@@ -113,6 +113,27 @@ std::vector<std::string> ReadProcessArgs() {
     return out;
 }
 
+std::string GetEnvUtf8Local(const char* name) {
+    if (!name || !*name) return {};
+#ifdef _WIN32
+    int wn = MultiByteToWideChar(CP_UTF8, 0, name, -1, nullptr, 0);
+    if (wn > 1) {
+        std::wstring wname(size_t(wn - 1), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, name, -1, wname.data(), wn - 1);
+        if (const wchar_t* wv = _wgetenv(wname.c_str()); wv && *wv) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, wv, -1, nullptr, 0, nullptr, nullptr);
+            if (n > 1) {
+                std::string s(size_t(n - 1), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, wv, -1, s.data(), n - 1, nullptr, nullptr);
+                return s;
+            }
+        }
+    }
+#endif
+    if (const char* v = std::getenv(name); v && *v) return std::string(v);
+    return {};
+}
+
 std::string GetArgValue(const std::vector<std::string>& args, const char* flag, const char* env_fallback) {
     size_t n = std::strlen(flag);
     for (size_t i = 1; i < args.size(); ++i) {
@@ -121,9 +142,7 @@ std::string GetArgValue(const std::vector<std::string>& args, const char* flag, 
             return args[i].substr(n + 1);
         }
     }
-    if (env_fallback) {
-        if (const char* v = std::getenv(env_fallback); v && *v) return std::string(v);
-    }
+    if (env_fallback) return GetEnvUtf8Local(env_fallback);
     return {};
 }
 
@@ -136,7 +155,8 @@ bool HasArgFlag(const std::vector<std::string>& args, const char* flag, const ch
         }
     }
     if (env_fallback) {
-        if (const char* v = std::getenv(env_fallback); v && *v && std::strcmp(v, "0") != 0) return true;
+        std::string v = GetEnvUtf8Local(env_fallback);
+        if (!v.empty() && v != "0") return true;
     }
     return false;
 }
@@ -231,13 +251,13 @@ RecSample PadToSample(uint64_t frame_id, uint64_t ts_us, uint64_t eff_us, uint8_
 bool LoadReplayFileLocked(RecorderState& st) {
     std::ifstream f(st.replay_path, std::ios::binary);
     if (!f) {
-        LOGE("input_rec: failed to open replay file %s", st.replay_path.string().c_str());
+        LOGE("input_rec: failed to open replay file %s", app::PathToUtf8(st.replay_path).c_str());
         return false;
     }
     RecHeader hdr{};
     f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
     if (!f || std::memcmp(hdr.magic, kMagic, sizeof(kMagic)) != 0 || hdr.version != kVersion) {
-        LOGE("input_rec: invalid replay header in %s", st.replay_path.string().c_str());
+        LOGE("input_rec: invalid replay header in %s", app::PathToUtf8(st.replay_path).c_str());
         return false;
     }
     st.replay_samples.clear();
@@ -253,7 +273,7 @@ bool LoadReplayFileLocked(RecorderState& st) {
     st.replay_cursor = 0;
     st.active_replay_pad[0].connected = true;
     LOGR("input_rec: loaded replay %s (samples=%zu frames=%llu eff_ms=%.1f mode=%s exit=%d)",
-         st.replay_path.string().c_str(), st.replay_samples.size(), (unsigned long long)st.replay_total_frames,
+         app::PathToUtf8(st.replay_path).c_str(), st.replay_samples.size(), (unsigned long long)st.replay_total_frames,
          double(st.replay_total_eff_us) / 1000.0,
          st.replay_mode == ReplayMode::Frame ? "frame" : (st.replay_mode == ReplayMode::Time ? "time" : "hybrid"),
          st.replay_exit ? 1 : 0);
@@ -422,10 +442,10 @@ void FlushLocked(RecorderState& st) {
                         std::streamsize(st.recorded_samples.size() * sizeof(RecSample)));
             }
             f.flush();
-            LOGR("input_rec: wrote %s (%zu samples, %llu frames)", st.record_path.string().c_str(),
+            LOGR("input_rec: wrote %s (%zu samples, %llu frames)", app::PathToUtf8(st.record_path).c_str(),
                  st.recorded_samples.size(), (unsigned long long)hdr.total_frames);
         } else {
-            LOGE("input_rec: failed to write %s", st.record_path.string().c_str());
+            LOGE("input_rec: failed to write %s", app::PathToUtf8(st.record_path).c_str());
         }
     }
 
@@ -433,7 +453,7 @@ void FlushLocked(RecorderState& st) {
         std::fflush(st.state_fp);
         std::fclose(st.state_fp);
         st.state_fp = nullptr;
-        LOGR("input_rec: closed state log %s", st.state_log_path.string().c_str());
+        LOGR("input_rec: closed state log %s", app::PathToUtf8(st.state_log_path).c_str());
     }
 }
 
@@ -457,28 +477,32 @@ void Init() {
     st.replay_exit = rep_exit;
 
     if (!rep_s.empty()) {
-        st.replay_path = std::filesystem::path(rep_s);
+        st.replay_path = app::Utf8ToPath(rep_s);
         if (LoadReplayFileLocked(st)) {
             st.replay_active.store(true, std::memory_order_release);
         }
     } else if (!rec_s.empty()) {
-        st.record_path = std::filesystem::path(rec_s);
+        st.record_path = app::Utf8ToPath(rec_s);
         st.recorded_samples.reserve(8192);
         st.record_active.store(true, std::memory_order_release);
-        LOGR("input_rec: recording enabled -> %s", st.record_path.string().c_str());
+        LOGR("input_rec: recording enabled -> %s", app::PathToUtf8(st.record_path).c_str());
     }
 
     if (!log_s.empty()) {
-        st.state_log_path = std::filesystem::path(log_s);
+        st.state_log_path = app::Utf8ToPath(log_s);
         std::error_code ec;
         if (st.state_log_path.has_parent_path())
             std::filesystem::create_directories(st.state_log_path.parent_path(), ec);
-        st.state_fp = std::fopen(st.state_log_path.string().c_str(), "wb");
+#ifdef _WIN32
+        st.state_fp = _wfopen(st.state_log_path.c_str(), L"wb");
+#else
+        st.state_fp = std::fopen(st.state_log_path.c_str(), "wb");
+#endif
         if (st.state_fp) {
             st.state_log_active.store(true, std::memory_order_release);
-            LOGR("input_rec: state log enabled -> %s", st.state_log_path.string().c_str());
+            LOGR("input_rec: state log enabled -> %s", app::PathToUtf8(st.state_log_path).c_str());
         } else {
-            LOGE("input_rec: failed to open state log %s", st.state_log_path.string().c_str());
+            LOGE("input_rec: failed to open state log %s", app::PathToUtf8(st.state_log_path).c_str());
         }
     }
 }

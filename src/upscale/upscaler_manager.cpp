@@ -167,21 +167,27 @@ public:
                 auto* front = static_cast<ID3D12Resource*>(fd.front_res);
                 auto* sc = static_cast<ID3D12Resource*>(fd.scene_color_res);
                 auto* depth = static_cast<ID3D12Resource*>(fd.scene_depth_res);
+                auto* skin_mask = static_cast<ID3D12Resource*>(fd.skin_mask_res);
 
                 D3D12_RESOURCE_STATES front_st = static_cast<D3D12_RESOURCE_STATES>(*fd.front_state);
                 D3D12_RESOURCE_STATES sc_st =
                     fd.scene_color_state ? static_cast<D3D12_RESOURCE_STATES>(*fd.scene_color_state)
                                          : D3D12_RESOURCE_STATE_COMMON;
                 D3D12_RESOURCE_STATES depth_st = static_cast<D3D12_RESOURCE_STATES>(*fd.scene_depth_state);
+                D3D12_RESOURCE_STATES skin_st =
+                    fd.skin_mask_state ? static_cast<D3D12_RESOURCE_STATES>(*fd.skin_mask_state)
+                                       : D3D12_RESOURCE_STATE_COMMON;
 
                 bool prep_ok = spatial_.BuildTemporalInputs(
                     cmd, front, front_st, static_cast<DXGI_FORMAT>(fd.front_fmt), sc,
                     fd.scene_color_state ? &sc_st : nullptr, static_cast<DXGI_FORMAT>(fd.scene_color_fmt), depth,
-                    depth_st, mv_tex_.Get(), mv_state_, reactive_tex_.Get(), reactive_state_, depth_r32f_tex_.Get(),
-                    depth_r32f_state_, fd.render_w, fd.render_h, cur_vp_inv, prev_vp_, has_prev_vp_ && inv_ok && !cut,
+                    depth_st, skin_mask, fd.skin_mask_state ? &skin_st : nullptr, mv_tex_.Get(), mv_state_,
+                    reactive_tex_.Get(), reactive_state_, depth_r32f_tex_.Get(), depth_r32f_state_, fd.render_w,
+                    fd.render_h, cur_vp_inv, prev_vp_, has_prev_vp_ && inv_ok && !cut,
                     fd.jitter_active ? fd.jitter_x : 0.0f, fd.jitter_active ? fd.jitter_y : 0.0f);
 
                 if (prep_ok) {
+                    if (fd.skin_mask_state) *fd.skin_mask_state = uint32_t(skin_st);
                     TemporalExecDesc td{};
                     td.cmd = cmd;
                     td.color = front;
@@ -238,6 +244,7 @@ public:
                     *fd.front_state = uint32_t(front_st);
                     if (fd.scene_color_state) *fd.scene_color_state = uint32_t(sc_st);
                     if (fd.scene_depth_state) *fd.scene_depth_state = uint32_t(depth_st);
+                    if (fd.skin_mask_state) *fd.skin_mask_state = uint32_t(skin_st);
                 }
             } else {
                 has_prev_cam_ = false;

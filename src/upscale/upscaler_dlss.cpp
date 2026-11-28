@@ -100,7 +100,7 @@ public:
         ngx_mod_ = LoadLibraryW(ngx_core.c_str());
         if (!ngx_mod_) {
             detail_ = "LoadLibrary(_nvngx.dll) failed";
-            LOGW("upscale: DLSS LoadLibrary(%s) failed (err=%lu)", ngx_core.string().c_str(), GetLastError());
+            LOGW("upscale: DLSS LoadLibrary(%s) failed (err=%lu)", app::PathToUtf8(ngx_core).c_str(), GetLastError());
             return false;
         }
 
@@ -176,8 +176,9 @@ public:
 
         available_ = true;
         detail_ = used_programdata_ ? "DLSS 4 Ready (NGX ProgramData fallback)" : "DLSS 4 Ready (plugins/nvngx_dlss.dll)";
-        LOGR("upscale: DLSS 4 initialized (core=%s, model=%s, programdata_fallback=%s)", ngx_core.string().c_str(),
-             dlss_dll.string().c_str(), used_programdata_ ? "true" : "false");
+        LOGR("upscale: DLSS 4 initialized (core=%s, model=%s, programdata_fallback=%s)",
+             app::PathToUtf8(ngx_core).c_str(), app::PathToUtf8(dlss_dll).c_str(),
+             used_programdata_ ? "true" : "false");
         return true;
     }
 

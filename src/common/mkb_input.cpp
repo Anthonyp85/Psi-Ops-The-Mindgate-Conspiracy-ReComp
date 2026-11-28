@@ -946,6 +946,16 @@ KeyCode SdlScancodeToKeyCode(SDL_Scancode sc) {
 #endif
 
 void LoadAutotestScriptLocked(MkbState& st) {
+#ifdef _WIN32
+    const wchar_t* wenv = _wgetenv(L"XBE_MKB_AUTOTEST");
+    if (!wenv || !*wenv || std::wcscmp(wenv, L"0") == 0) return;
+    std::wstring script_path_w = wenv;
+    if (script_path_w == L"1") {
+        if (const wchar_t* p2 = _wgetenv(L"XBE_MKB_AUTOTEST_SCRIPT"); p2 && *p2) script_path_w = p2;
+        else return;
+    }
+    std::filesystem::path sp(script_path_w);
+#else
     const char* env = std::getenv("XBE_MKB_AUTOTEST");
     if (!env || !*env || std::strcmp(env, "0") == 0) return;
     std::string script_path_s = env;
@@ -954,13 +964,19 @@ void LoadAutotestScriptLocked(MkbState& st) {
         else return;
     }
     std::filesystem::path sp(script_path_s);
+#endif
     std::ifstream f(sp);
     if (!f) {
-        LOGE("mkb: failed to open XBE_MKB_AUTOTEST=%s", sp.string().c_str());
+        LOGE("mkb: failed to open XBE_MKB_AUTOTEST=%s", app::PathToUtf8(sp).c_str());
         return;
     }
+#ifdef _WIN32
+    const wchar_t* out_wenv = _wgetenv(L"XBE_AUTOTEST_OUT_DIR");
+    std::filesystem::path out_dir = (out_wenv && *out_wenv) ? std::filesystem::path(out_wenv) : app::ExeDir();
+#else
     const char* out_env = std::getenv("XBE_AUTOTEST_OUT_DIR");
     std::filesystem::path out_dir = (out_env && *out_env) ? std::filesystem::path(out_env) : app::ExeDir();
+#endif
     std::error_code ec;
     std::filesystem::create_directories(out_dir, ec);
 
@@ -1048,7 +1064,7 @@ void LoadAutotestScriptLocked(MkbState& st) {
             uint64_t ms = 0;
             std::string fname;
             if (!(iss >> ms >> fname)) continue;
-            std::filesystem::path p(fname);
+            std::filesystem::path p = app::Utf8ToPath(fname);
             if (p.is_relative()) p = out_dir / p;
             st.at_caps.push_back({ms, std::move(p), false});
         } else if (ucmd == "EXIT_MS") {
@@ -1058,7 +1074,7 @@ void LoadAutotestScriptLocked(MkbState& st) {
     }
     st.autotest_active.store(true, std::memory_order_release);
     LOGR("mkb: loaded XBE_MKB_AUTOTEST=%s (keys=%zu mouse=%zu wheel=%zu pads=%zu sets=%zu caps=%zu exit_ms=%llu)",
-         sp.string().c_str(), st.at_keys.size(), st.at_mouse.size(), st.at_wheel.size(), st.at_pads.size(),
+         app::PathToUtf8(sp).c_str(), st.at_keys.size(), st.at_mouse.size(), st.at_wheel.size(), st.at_pads.size(),
          st.at_sets.size(), st.at_caps.size(), (unsigned long long)st.at_exit_ms);
 }
 
@@ -2258,7 +2274,7 @@ void OnPresent(uint64_t /*present_frame*/, perf::Phase phase, bool modal_ui_open
                             ce.triggered = true;
                             out_capture_bmp = ce.path;
                             LOGR("mkb: capture triggered ms=%llu -> %s", (unsigned long long)ms,
-                                 ce.path.string().c_str());
+                                 app::PathToUtf8(ce.path).c_str());
                         } else {
                             any_pending_cap = true;
                         }

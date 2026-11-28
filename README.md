@@ -18,32 +18,32 @@ A native **Windows x64** (D3D12 + XAudio2 + SDL3) and **Native Linux x86_64 / St
 - **Built-In GitHub Update Checker & Staged Self-Updater:** Asynchronous GitHub Releases check (native WinHTTP on Windows, zero-`DT_NEEDED` `curl`/`wget`/`python3` subprocesses on Linux), FIPS 180-4 SHA-256 archive verification, dismissible Launcher/Overlay release alerts, and one-click staged self-updates (`update_apply.cmd` / `update_apply.sh`) that preserve `settings.toml`, `hdd/` saves, shader caches, and disc images while refreshing recompiled game binaries on relaunch.
 - **9-Upscaler Graphics Suite, Native `16:9` / `16:10` Widescreen & Aspect-Correct 4:3 UI / `1:1` Crosshairs:**
   - **6 Built-In Zero-DLL Spatial Upscalers (Windows D3D12 & Linux Vulkan 1.2):** `FSR 1.0` (default), `NVIDIA NIS v1.0.3`, `AMD CAS`, `Bicubic 5-Tap` (supports `>100%` SSAA), `Integer`, and `Bilinear`.
-  - **3 Retail Vendor-Signed Temporal Upscalers (Windows D3D12, bundled in `plugins/`):** `NVIDIA DLSS 4` (Presets Auto/E/J/K & DLAA + automatic NGX driver-store fallback), `AMD FSR 3.1`, and `Intel XeSS 2` — driven by true `16:9` square-pixel rendering, Halton `(2,3)` camera jitter, `RG16F` motion vectors, and `R8_UNORM` HUD reactive masking (auto-bypassed on 2D menus, loading screens, and FMVs; gracefully falls back to `FSR 1.0` on Linux Vulkan or missing DLLs).
+  - **3 Retail Vendor-Signed Temporal Upscalers (Windows D3D12, bundled in `plugins/`):** `NVIDIA DLSS 4` (Presets Auto/E/J/K & DLAA + automatic NGX driver-store fallback), `AMD FSR 3.1`, and `Intel XeSS 2` — driven by true `16:9` square-pixel rendering, Halton `(2,3)` camera jitter, unjittered `RG16F` camera + skinned-character (`skinMesh.vsh`) root motion vectors, and `R8_UNORM` pre-HUD + animated-character reactive masking (auto-bypassed on 2D menus, loading screens, and FMVs; gracefully falls back to `FSR 1.0` on Linux Vulkan or missing DLLs).
   - **Configurable Widescreen UI & Crosshair Aspect Ratio (`[ui_aspect]` in `settings.toml`, Launcher, and `F1` Overlay):** Defaults to `Aspect-Correct 4:3 UI & 1:1 Crosshair` (pillarboxes 2D menus, modals, and Sniper Scope to 4:3 with black sidebars, keeps HUD widgets at unstretched 4:3 proportions, renders circular `1:1` weapon crosshairs around 16:9 lock-on targets, and remaps PC mouse menu hit-testing to 4:3), with optional `4:3 Menus & 1:1 Crosshair + 16:9 Edge HUD` and `Stretched 16:9 (Original Xbox Widescreen)` modes.
 - **Native-PC 1:1 Mouse & Keyboard + Multi-Vendor Controller Support:**
   - `WM_INPUT` Raw Input (Windows) & `SDL_SetWindowRelativeMouseMode` (Linux) injected past the controller deadzone & slew filter with `1px` micro-aim precision, `0.000°` stop-drift, `dt`-independent sensitivity (`cm/360 @ 800 DPI`), decoupled PC Mouse Invert-Y, `Raw 1:1 Aim` auto-steer bypass, normalized `WASD` (`1.000`), engine-level decoupled `InputManager` actions (`E` Interact/Pickup, `Space` Jump/Mantle, `Q`/`Mouse4` Melee, `LCtrl`/`C` Crouch, `LAlt` Wall Cover, `R`/`MMB` instant manual Reload / MC Secondary, `WheelUp`/`WheelDown` bidirectional Next/Prev Weapon & Sniper Zoom / TK Push-Pull, `RMB`/`V` Sniper Scope / Target Lock-On, `LShift`/`Mouse5` + `1–6` Psi powers, mouse-flick TK Throw, `G` TK Camera Control, `X` MC Head Pop), smart OS cursor capture/release with menu-exit mouse-click suppression (held `LMB`/`RMB` clicks dismissing menus or overlays never bleed into gunfire or scope toggles), and portable OS-independent `settings.toml` bindings (`Primary` + `Secondary` slots across 25 actions).
   - Full SDL3 controller support (DualSense 5 / Edge with Touchpad-as-Back, Xbox, Switch, Steam Deck) with sustained rumble keepalive and deterministic `.rec` recording/replay.
 - **Cross-Hardware Performance & Frame Pacing:**
-  - `NvOptimusEnablement` & `AmdPowerXpressRequestHighPerformance` exports, `--list-gpus` / `--gpu <idx>`, adaptive `16 / 32 / 64 MiB` upload rings, `32 MiB` GPU texture slab sub-allocators with aliasing barriers, `MmFreeContiguousMemory` GPU target/texture cache invalidation, `512 KiB` `FastMemHash64` surface hashing, driver-update resilient per-VID/DID shader/PSO/metadata disk caches (`kAotSchemaVersion=4`) with parallel boot pre-warm & post-boot status toast, `0` mid-frame GPU flushes, D3D12 waitable swapchains + tear-free `60 FPS` pacing across divisor and non-divisor refresh rates (`60/90/120/144/165 Hz`), single-core guest thread priority hierarchy with a `25 ms` loading watchdog, RAM-bounded first-launch compilation (`~768 MiB`/slot), and binary-verified `60 FPS` (default) & `30 FPS` `1.00x` Havok simulation fidelity.
+  - `NvOptimusEnablement` & `AmdPowerXpressRequestHighPerformance` exports, `--list-gpus` / `--gpu <idx>`, adaptive `16 / 32 / 64 MiB` upload rings, `32 MiB` GPU texture slab sub-allocators with aliasing barriers, `MmFreeContiguousMemory` GPU target/texture cache invalidation, `512 KiB` `FastMemHash64` surface hashing, driver-update resilient per-VID/DID shader/PSO/metadata disk caches (`kAotSchemaVersion=4`) with parallel boot pre-warm & post-boot status toast, `0` mid-frame GPU flushes, D3D12 waitable swapchains + Gamescope-hardened Vulkan swapchains + tear-free `60 FPS` pacing across divisor and non-divisor refresh rates (`60/90/120/144/165/240 Hz` & VRR), lossless UTF-8/Unicode host path support, Linux `SCHED_OTHER`-safe CRI ADX cutscene synchronization, single-core guest thread priority hierarchy with a `25 ms` loading watchdog, RAM-bounded first-launch compilation (`~768 MiB`/slot), and binary-verified `60 FPS` (default) & `30 FPS` `1.00x` Havok simulation fidelity.
 
 ---
 
 ## Quick Start (Pre-Built Release Archives)
 
-### Windows x64 (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.1-win64-launcher.zip`)
+### Windows x64 (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.2-win64-launcher.zip`)
 1. Extract the `.zip` archive to any writable folder (e.g. `C:\Games\PsiOps`).
 2. Double-click **`PsiOps.exe`** to open the 6-Tab Pre-Game Launcher.
 3. In **Play & Game Disc**, browse to your retail USA `Psi-Ops - The Mindgate Conspiracy (USA).xiso.iso` (or place it inside an `assets/` folder beside `PsiOps.exe`).
 4. Choose a one-click **Hardware Preset** (`1080p Mainstream`, `1440p High`, `4K Ultra`, `Handheld / iGPU`, or `Steam Deck`) and click **Play**.
    - On first launch, `PsiOps.exe` compiles `PsiOps.dll` locally from your XISO using the bundled `compiler/` toolchain and caches it for instant subsequent launches.
 
-### Native Linux x86_64 & Steam Deck (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.1-linux-x86_64.tar.gz`)
+### Native Linux x86_64 & Steam Deck (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.2-linux-x86_64.tar.gz`)
 > **IMPORTANT (Steam Deck / SteamOS):** `PsiOps` is a **native Linux x86_64 ELF binary** (`GLIBC 2.35`, Vulkan 1.2, SDL3). **Do NOT enable Proton / Steam Play compatibility** on the Steam shortcut!
 
 1. Extract the tarball on your Steam Deck or Linux PC:
    ```bash
    mkdir -p ~/Games/PsiOps
-   tar -xzf Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.1-linux-x86_64.tar.gz -C ~/Games/PsiOps
+   tar -xzf Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.2-linux-x86_64.tar.gz -C ~/Games/PsiOps
    cd ~/Games/PsiOps
    ```
 2. *(Optional, Steam Deck / Desktop shortcut)* Register the native Linux Non-Steam Game shortcut and icon:
@@ -143,10 +143,10 @@ build.bat
 
 ### 4. Building Distributable Archives & Running the Release Audit
 ```bash
-# Windows: creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.1-{win64-launcher,source}.zip
+# Windows: creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.2-{win64-launcher,source}.zip
 release.bat
 
-# Linux (Ubuntu 22.04): creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.1-linux-x86_64.tar.gz
+# Linux (Ubuntu 22.04): creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.2-linux-x86_64.tar.gz
 ./release_linux.sh
 
 # Run full release audit (Gates 1, 2, 2b built-binary path hygiene, and Gates 3-6 archive/ABI/media checks)

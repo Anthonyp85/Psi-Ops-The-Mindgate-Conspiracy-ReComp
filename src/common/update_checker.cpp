@@ -1588,7 +1588,7 @@ bool ExtractArchiveToDir(const fs::path& archive_path, const fs::path& extracted
     fs::remove_all(extracted_dir, ec);
     fs::create_directories(extracted_dir, ec);
     if (ec) {
-        out_err = "Could not create extraction directory: " + extracted_dir.string();
+        out_err = "Could not create extraction directory: " + app::PathToUtf8(extracted_dir);
         return false;
     }
 
@@ -1637,8 +1637,8 @@ bool ExtractArchiveToDir(const fs::path& archive_path, const fs::path& extracted
     CloseHandle(pi.hProcess);
     return wait_rc == WAIT_OBJECT_0 && exit_code == 0;
 #else
-    std::string arch_s = archive_path.string();
-    std::string dst_s = extracted_dir.string();
+    std::string arch_s = app::PathToUtf8(archive_path);
+    std::string dst_s = app::PathToUtf8(extracted_dir);
     pid_t pid = fork();
     if (pid < 0) {
         out_err = "fork() failed before extracting tarball.";
@@ -1684,7 +1684,7 @@ bool SanitizeAndLocateExtractedRoot(const fs::path& extracted_dir, fs::path& out
          it != end && !ec; it.increment(ec)) {
         if (it->is_symlink(ec)) {
             fs::path resolved = fs::weakly_canonical(it->path(), ec);
-            std::string rel = resolved.lexically_relative(canon_extract).string();
+            std::string rel = app::PathToUtf8(resolved.lexically_relative(canon_extract));
             if (ec || rel.empty() || rel.rfind("..", 0) == 0) {
                 unsafe_links.push_back(it->path());
             }
@@ -1744,10 +1744,11 @@ bool SanitizeAndLocateExtractedRoot(const fs::path& extracted_dir, fs::path& out
     }
     fs::remove_all(found / "compiler" / "work", ec);
 
-    for (const auto& e : fs::directory_iterator(found, ec)) {
-        std::string ext = LowerAscii(e.path().extension().string());
+    for (auto it = fs::directory_iterator(found, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        std::string ext = LowerAscii(app::PathToUtf8(it->path().extension()));
         if (ext == ".iso" || ext == ".xiso" || ext == ".xbe" || ext == ".7z" || ext == ".rec") {
-            fs::remove(e.path(), ec);
+            fs::remove(it->path(), ec);
         }
     }
 
@@ -2220,7 +2221,7 @@ bool StartDownloadAndStageUpdate() {
             std::lock_guard<std::mutex> lk(g_state_mutex);
             g_snapshot.state = UpdateState::Error;
             g_snapshot.status_message =
-                "Game folder is not writable (" + staging_dir.string() + "). Move the game to a writable folder.";
+                "Game folder is not writable (" + app::PathToUtf8(staging_dir) + "). Move the game to a writable folder.";
             g_worker_active.store(false, std::memory_order_release);
             return;
         }
@@ -2324,7 +2325,7 @@ bool StartDownloadAndStageUpdate() {
         }
         LOGR("update_checker: staged %s (%llu bytes, sha256=%s) at %s",
              asset_name.c_str(), static_cast<unsigned long long>(actual_size), actual_sha.c_str(),
-             staged_root.string().c_str());
+             app::PathToUtf8(staged_root).c_str());
         g_worker_active.store(false, std::memory_order_release);
     });
     return true;
@@ -2366,9 +2367,9 @@ std::string BuildUpdateApplyScript(const fs::path& exe_dir,
        << "(rd /s /q \"%STAGE_DIR%\" >nul 2>&1 & exit /b 0)\r\n";
     return ss.str();
 #else
-    std::string target_q = ShellQuoteSingle(exe_dir.string());
-    std::string root_q = ShellQuoteSingle(staged_root.string());
-    std::string stage_q = ShellQuoteSingle(staging_dir.string());
+    std::string target_q = ShellQuoteSingle(app::PathToUtf8(exe_dir));
+    std::string root_q = ShellQuoteSingle(app::PathToUtf8(staged_root));
+    std::string stage_q = ShellQuoteSingle(app::PathToUtf8(staging_dir));
 
     std::ostringstream ss;
     ss << "#!/bin/sh\n"
@@ -2498,7 +2499,7 @@ bool ApplyStagedUpdateAndRelaunch() {
     }
     chmod(script_path.c_str(), 0700);
 
-    std::string script_s = script_path.string();
+    std::string script_s = app::PathToUtf8(script_path);
     pid_t child = fork();
     if (child < 0) {
         std::lock_guard<std::mutex> lk(g_state_mutex);

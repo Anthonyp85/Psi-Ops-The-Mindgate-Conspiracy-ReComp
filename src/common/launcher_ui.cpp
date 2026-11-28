@@ -160,9 +160,9 @@ LauncherCli ParseLauncherCli() {
         } else if (args[i] == "--open-file-browser") {
             cli.open_file_browser = true;
         } else if (args[i] == "--capture-launcher-bmp" && i + 1 < args.size()) {
-            cli.capture_bmp = fs::path(args[++i]);
+            cli.capture_bmp = app::Utf8ToPath(args[++i]);
         } else if (args[i].rfind("--capture-launcher-bmp=", 0) == 0) {
-            cli.capture_bmp = fs::path(args[i].substr(23));
+            cli.capture_bmp = app::Utf8ToPath(args[i].substr(23));
         } else if (args[i] == "--launcher-autoplay-ms" && i + 1 < args.size()) {
             int ms = std::atoi(args[++i].c_str());
             if (ms > 0) cli.autoplay_ms = ms;
@@ -194,17 +194,21 @@ struct LauncherState {
     psiops::UpdateState prev_upd_state = psiops::UpdateState::Idle;
 
     void RefreshDiscStatus() {
-        has_valid_game = app::HasValidConfiguredGame();
+        has_valid_game = false;
         has_disc_info = false;
         disc_info = app::DiscValidation{};
         const std::string& iso = app::Get().iso_path;
         if (!iso.empty()) {
-            fs::path p(iso);
+            fs::path p = app::Utf8ToPath(iso);
             if (p.is_relative()) p = (app::ExeDir() / p).lexically_normal();
             app::ValidateDiscImage(p, disc_info);
             has_disc_info = true;
-            if (disc_info.valid) has_valid_game = true;
+            if (disc_info.valid) {
+                has_valid_game = true;
+                return;
+            }
         }
+        has_valid_game = app::HasValidConfiguredGame();
     }
 };
 
@@ -380,10 +384,10 @@ void DrawPlayAndDiscTab(LauncherState& st, void* native_owner_win, bool show_upd
         if (app::BrowseDiscImage(native_owner_win, picked)) {
             app::DiscValidation v;
             if (app::ValidateDiscImage(picked, v)) {
-                s.iso_path = picked.string();
+                s.iso_path = app::PathToUtf8(picked);
                 st.settings_modified = true;
                 st.RefreshDiscStatus();
-                st.status_banner = "Verified retail disc image configured: " + picked.filename().string();
+                st.status_banner = "Verified retail disc image configured: " + app::PathToUtf8(picked.filename());
             } else {
                 st.disc_info = v;
                 st.has_disc_info = true;
@@ -613,10 +617,10 @@ void DrawLauncherFrame(LauncherState& st, void* native_owner_win, float ui_scale
     // In-App XISO File Browser Modal
     fs::path picked_iso;
     if (st.browser.Draw(picked_iso)) {
-        app::Get().iso_path = picked_iso.string();
+        app::Get().iso_path = app::PathToUtf8(picked_iso);
         st.settings_modified = true;
         st.RefreshDiscStatus();
-        st.status_banner = "Verified retail disc image selected: " + picked_iso.filename().string();
+        st.status_banner = "Verified retail disc image selected: " + app::PathToUtf8(picked_iso.filename());
     }
 }
 
@@ -987,8 +991,8 @@ struct Win32LauncherApp {
             ++frames_rendered;
             if (!cli.capture_bmp.empty() && frames_rendered >= 4) {
                 bool cap_ok = CaptureBackbuffer(bb[bi].Get(), cli.capture_bmp);
-                LOGR("launcher: captured Win64 BMP %s (%ux%u, %s)", cli.capture_bmp.string().c_str(), width, height,
-                     cap_ok ? "ok" : "failed");
+                LOGR("launcher: captured Win64 BMP %s (%ux%u, %s)", app::PathToUtf8(cli.capture_bmp).c_str(), width,
+                     height, cap_ok ? "ok" : "failed");
                 st.request_exit = true;
                 break;
             }
@@ -1060,7 +1064,12 @@ bool RunLinuxLauncher(const LauncherCli& cli) {
         return false;
     }
     SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-    SDL_Renderer* ren = SDL_CreateRenderer(win, nullptr);
+    // Default the lightweight 2D pre-game launcher to SDL3's software renderer so X11/Xvfb/Wayland never
+    // recreates the window for GLX, loads Mesa OpenGL into RTLD_GLOBAL before the Vulkan game window opens,
+    // or hits unchecked GLX/Vulkan fallback function pointers on headless/software drivers.
+    const char* req_drv = std::getenv("SDL_RENDER_DRIVER");
+    SDL_Renderer* ren = SDL_CreateRenderer(win, (req_drv && *req_drv) ? req_drv : "software");
+    if (!ren) ren = SDL_CreateRenderer(win, nullptr);
     if (!ren) {
         LOGE("launcher: SDL_CreateRenderer failed: %s", SDL_GetError());
         SDL_DestroyWindow(win);
@@ -1120,8 +1129,8 @@ bool RunLinuxLauncher(const LauncherCli& cli) {
                     bool cap_ok = ui_common::WriteBmp32File(cli.capture_bmp, uint32_t(bgra->w), uint32_t(bgra->h),
                                                             static_cast<const uint8_t*>(bgra->pixels),
                                                             uint32_t(bgra->pitch), false, true);
-                    LOGR("launcher: captured Linux BMP %s (%dx%d, %s)", cli.capture_bmp.string().c_str(), bgra->w,
-                         bgra->h, cap_ok ? "ok" : "failed");
+                    LOGR("launcher: captured Linux BMP %s (%dx%d, %s)", app::PathToUtf8(cli.capture_bmp).c_str(),
+                         bgra->w, bgra->h, cap_ok ? "ok" : "failed");
                     SDL_DestroySurface(bgra);
                 }
             }

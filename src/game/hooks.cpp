@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,7 +35,7 @@
 //  - sub_000DA750: GameStatus::GameStatus ctor (__stdcall, ret 4, [esp+4] = 0x005ECC78)
 //  - sub_000DBF50: GameStatus::ReadProfile (__thiscall, ret 4, ecx = 0x005ECC78)
 //  - sub_000DC090: GameStatus::WriteProfile (__thiscall, ret 4, ecx = 0x005ECC78)
-//  - sub_000DD0D0: GameStatus::CommitOptionsTransaction (__thiscall, ret 0, ecx = 0x005ECC78)
+//  - sub_000DD0D0: GameStatus::CommitOptionsTransaction (custom eax = 0x005ECC78, ret 0)
 //  - sub_000FEF40: Player::TakeDamage (__thiscall, ret 0x10, ecx = Player*)
 //  - sub_0001FBE0: Character::TakeDamage (__thiscall, ret 0x10, ecx = Character*)
 //  - sub_000C25A0: HUD::SetScopeVisible (custom eax = HUD*, [esp+4] = uint8_t visible, ret 4)
@@ -172,15 +173,93 @@ constexpr uint32_t kGameStatusVa = 0x005ECC78u;
 constexpr uint32_t kGameStatusSize = 0x640u;
 constexpr uint32_t kGameStatusInitGuardVa = 0x005ED2B8u;
 constexpr uint32_t kGameStatusTxActiveVa = 0x005ED034u;  // GameStatus + 0x3BC (Options staging active)
-constexpr uint32_t kSoundMgrPtrVa = 0x005ECAE0u;
+constexpr uint32_t kSoundMgrVa = 0x005ECAE0u;             // inline SoundManager singleton (NOT a pointer!)
+constexpr uint32_t kSoundMgrSfxBusVa = 0x005ECB14u;       // [SoundManager + 0x34] = SoundBus* sfx_bus
+constexpr uint32_t kSoundMgrMusicBusVa = 0x005ECB18u;     // [SoundManager + 0x38] = SoundBus* music_bus
+constexpr uint32_t kSoundMgrInitGuardVa = 0x005ECB1Cu;    // bit 0 set once sub_00266920 constructs SoundManager
+constexpr uint32_t kEngineAudioReadyVa = 0x005CCBE4u;     // set to 1 at end of EngineAudio::Init (0x0014EC62)
+constexpr uint32_t kUiControllerPtrVa = 0x005CCB90u;      // active UIController* (HUD RTTI cid = 0x91)
+constexpr uint32_t kAudioVolScaleVa = 0x0051F108u;        // 0.01f scale constant used by sub_0007BA20
 constexpr uint32_t kRumbleMgrPtrVa = 0x005CC840u;
 
-constexpr uint32_t kFnApplyAudioOptions = 0x0007BA20u;    // __cdecl, ret 0
+constexpr uint32_t kFnSoundBusSetVolume = 0x0026A700u;    // custom: edi=SoundBus*, xmm0.f[0]=vol (0..1), ret 0
 constexpr uint32_t kFnSetBoolOption = 0x000DC630u;        // __thiscall, ecx=GS, [esp+4]=id, [esp+8]=val, ret 8
 constexpr uint32_t kFnSetControllerLayout = 0x000DCEE0u;  // custom, esi=GS, [esp+4]=layout (2..4), ret 4
 
 // Guest-thread re-entrancy guard while applying host [game_options] to GameStatus subsystems.
 bool g_applying_host_guest_settings = false;
+
+bool IsLiveSoundBus(const uint8_t* base, uint32_t bus_va) {
+    if (bus_va == 0u || !ValidGuest(bus_va, 0x2Cu)) return false;
+    if (!ValidGuest(kSoundMgrInitGuardVa, 1u) || (ReadU8(base, kSoundMgrInitGuardVa) & 1u) == 0u) return false;
+    if (!ValidGuest(kEngineAudioReadyVa, 1u) || ReadU8(base, kEngineAudioReadyVa) == 0u) return false;
+    if (!ValidGuest(kSoundMgrVa, 0x3Cu)) return false;
+
+    const uint32_t vec_begin = ReadU32(base, kSoundMgrVa + 0x24u);
+    const uint32_t vec_end = ReadU32(base, kSoundMgrVa + 0x28u);
+    if (vec_begin == 0u || vec_end <= vec_begin || ((vec_end - vec_begin) & 3u) != 0u) return false;
+    const uint32_t count = (vec_end - vec_begin) >> 2;
+    if (count > 256u || !ValidGuest(vec_begin, vec_end - vec_begin)) return false;
+
+    bool in_active_list = false;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (ReadU32(base, vec_begin + i * 4u) == bus_va) {
+            in_active_list = true;
+            break;
+        }
+    }
+    if (!in_active_list) return false;
+
+    const uint32_t v_begin = ReadU32(base, bus_va + 0x08u);
+    const uint32_t v_end = ReadU32(base, bus_va + 0x0Cu);
+    if (v_begin != v_end) {
+        if (v_begin == 0u || v_end < v_begin || ((v_end - v_begin) & 3u) != 0u) return false;
+        if ((v_end - v_begin) > 4096u || !ValidGuest(v_begin, v_end - v_begin)) return false;
+    }
+    return true;
+}
+
+void ApplyLiveGuestAudioVolumes(X86Context& ctx, uint8_t* base,
+                                const psiops::guest_settings::GuestUserSettings& s) {
+    if (!ValidGuest(kSoundMgrVa, 0x3Cu)) return;
+    if (!ValidGuest(kSoundMgrInitGuardVa, 1u) || (ReadU8(base, kSoundMgrInitGuardVa) & 1u) == 0u) return;
+    if (!ValidGuest(kEngineAudioReadyVa, 1u) || ReadU8(base, kEngineAudioReadyVa) == 0u) return;
+
+    const float scale = ValidGuest(kAudioVolScaleVa, 4u) ? ReadF32(base, kAudioVolScaleVa) : 0.01f;
+    const float sfx_vol = std::clamp(float(s.sfx_volume) * scale, 0.0f, 1.0f);
+    const float music_vol = std::clamp(float(s.music_volume) * scale, 0.0f, 1.0f);
+
+    auto set_bus_volume = [&](uint32_t bus_va, float vol) {
+        if (!IsLiveSoundBus(base, bus_va)) return;
+        GuestCallFrame frame(ctx, base);
+        if (frame.ok()) {
+            ctx.edi = bus_va;
+            ctx.xmm[0].u[0] = 0u;
+            ctx.xmm[0].u[1] = 0u;
+            ctx.xmm[0].u[2] = 0u;
+            ctx.xmm[0].u[3] = 0u;
+            ctx.xmm[0].f[0] = vol;
+            frame.Call(kFnSoundBusSetVolume);
+        }
+    };
+
+    set_bus_volume(ReadU32(base, kSoundMgrSfxBusVa), sfx_vol);
+
+    // Retail sub_0007BA20 lacks a null guard after dynamic_cast<HUD*>([0x005CCB90]) at 0x0007BA91;
+    // validate both HUD RTTI inheritance (cid * 0xA3 + 0x005C4F91) and IsLiveSoundBus([hud + 0x3BC]).
+    if (ValidGuest(kUiControllerPtrVa, 4u)) {
+        const uint32_t uic = ReadU32(base, kUiControllerPtrVa);
+        if (uic != 0u && ValidGuest(uic, 0x3C0u)) {
+            const uint32_t cid = ReadU32(base, uic + 0x08u);
+            if (cid < 0xA3u && ValidGuest(0x005C4F91u + cid * 0xA3u, 1u) &&
+                ReadU8(base, 0x005C4F91u + cid * 0xA3u) != 0u) {
+                set_bus_volume(ReadU32(base, uic + 0x3BCu), sfx_vol);
+            }
+        }
+    }
+
+    set_bus_volume(ReadU32(base, kSoundMgrMusicBusVa), music_vol);
+}
 
 bool ShouldBypassGuestSettings() {
     return app::IsReplayOrAutotestActive() || input_rec::IsReplayActive() || input_rec::IsRecordActive() ||
@@ -276,12 +355,7 @@ void WriteGuestUserSettingsToRamAndApply(X86Context& ctx, uint8_t* base,
     g_applying_host_guest_settings = true;
     base[kGameStatusTxActiveVa] = 0u;
 
-    if (ValidGuest(kSoundMgrPtrVa, 4u) && ReadU32(base, kSoundMgrPtrVa) != 0u) {
-        GuestCallFrame frame(ctx, base);
-        if (frame.ok()) {
-            frame.Call(kFnApplyAudioOptions);
-        }
-    }
+    ApplyLiveGuestAudioVolumes(ctx, base, s);
 
     if (ValidGuest(kRumbleMgrPtrVa, 4u) && ReadU32(base, kRumbleMgrPtrVa) != 0u) {
         GuestCallFrame frame(ctx, base);
@@ -659,10 +733,88 @@ void TickCheatsOnGuestFrame(X86Context& ctx, uint8_t* base) {
 
 }  // namespace
 
-// CRI ADX (ADXXB Ver.1.49) priority-ceiling spin-blocker thread at 0x003FFCF0..0x003FFD12.
-// ADXM_Unlock (0x003FFC20) calls SuspendThread on this thread, but XboxXBERecomp uses cooperative
-// SuspendPoint() checks inside kernel calls; because 0x003FFD00..0x003FFD12 makes zero kernel calls,
-// checking kernel::SuspendPoint() here lets SuspendThread park it cleanly on both Windows and Linux.
+// CRI ADX (ADXXB Ver.1.49) multi-thread synchronization & teardown hooks (0x003FFBD0..0x003FFD12).
+// Original Xbox CRI ADX has no mutex or atomics in ADXM_Lock (0x003FFBD0) / ADXM_Unlock (0x003FFC20):
+// if [0x0056C360] != 0 it assumes same-thread recursion because Xbox THREAD_PRIORITY_TIME_CRITICAL (15)
+// plus the hSafe (+2) spin-blocker strictly preempts hVsync (+1), hFs (+1), Main (0), and hMwidle (-2).
+// Under Linux SCHED_OTHER (CFS/EEVDF) and unprivileged nice ceilings (SteamOS), threads time-slice into
+// ADXM_Lock simultaneously, corrupting SJ/MPEG/ADXT state, clobbering global saved-priority [0x00604EC4],
+// and starving hMwidle during adxm_goto_mwidle_border (0x003FFC70) until it times out and frees active decoders.
+namespace {
+
+constexpr uint32_t kAdxmLockLevelVa = 0x0056C360u;
+constexpr uint32_t kAdxmMwidleBorderFlagVa = 0x0056C364u;
+constexpr uint32_t kAdxmMwidleDoneFlagVa = 0x0056C39Cu;
+constexpr uint32_t kAdxmMwidleHandleVa = 0x00604EA4u;
+
+std::recursive_mutex& AdxmMutex() {
+    static std::recursive_mutex* const mtx = new std::recursive_mutex();
+    return *mtx;
+}
+
+struct AdxmThreadLockState {
+    uint32_t depth = 0u;
+    ~AdxmThreadLockState() {
+        while (depth > 0u) {
+            --depth;
+            AdxmMutex().unlock();
+        }
+    }
+};
+
+thread_local AdxmThreadLockState t_adxm_lock{};
+
+}  // namespace
+
+bool Hook_AdxLock(X86Context& ctx, uint8_t* base) {
+    AdxmMutex().lock();
+    ++t_adxm_lock.depth;
+    if (ValidGuest(kAdxmLockLevelVa, 4u)) {
+        WriteU32(base, kAdxmLockLevelVa, t_adxm_lock.depth);
+    }
+    ctx.eax = t_adxm_lock.depth;
+    return true;
+}
+
+bool Hook_AdxUnlock(X86Context& ctx, uint8_t* base) {
+    if (t_adxm_lock.depth > 0u) {
+        --t_adxm_lock.depth;
+        if (ValidGuest(kAdxmLockLevelVa, 4u)) {
+            WriteU32(base, kAdxmLockLevelVa, t_adxm_lock.depth);
+        }
+        ctx.eax = t_adxm_lock.depth;
+        AdxmMutex().unlock();
+    } else {
+        ctx.eax = 0u;
+    }
+    return true;
+}
+
+// Hooked at 0x003FFC9E inside adxm_goto_mwidle_border (0x003FFC70..0x003FFCC6), right after SetThreadPriority +
+// ResumeThread(hMwidle) and right before testing [0x0056C364] == 0. Yields the single pinned guest CPU core via a
+// short sleep so hMwidle (0x003FFD30) immediately runs ADXM_ExecSvr_Mwidle (0x00400A30) and clears [0x0056C364]
+// instead of starving behind 3,000,000 tight spin iterations on Zen 4 / SteamOS.
+void Hook_AdxMwidleBorderWait(X86Context& ctx, uint8_t* base) {
+    if (!ValidGuest(kAdxmMwidleBorderFlagVa, 4u) || ReadU32(base, kAdxmMwidleBorderFlagVa) == 0u) {
+        return;
+    }
+    const bool mwidle_missing_or_exited =
+        (ValidGuest(kAdxmMwidleHandleVa, 4u) && ReadU32(base, kAdxmMwidleHandleVa) == 0u) ||
+        (ValidGuest(kAdxmMwidleDoneFlagVa, 4u) && ReadU32(base, kAdxmMwidleDoneFlagVa) != 0u);
+    if (mwidle_missing_or_exited) {
+        WriteU32(base, kAdxmMwidleBorderFlagVa, 0u);
+        return;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+    constexpr uint32_t kMaxSpin = 0x002DC6C0u;  // 3,000,000
+    constexpr uint32_t kStep = 299u;            // +1 in guest loop -> 300/iter => 10,000 * 200 us (~2.0 s max bound)
+    if (ctx.esi + kStep + 1u < kMaxSpin) {
+        ctx.esi += kStep;
+    } else if (ctx.esi + 1u < kMaxSpin) {
+        ctx.esi = kMaxSpin - 2u;
+    }
+}
+
 void Hook_AdxSpinYield(X86Context& ctx, uint8_t* base) {
     (void)ctx;
     (void)base;
@@ -2092,7 +2244,7 @@ X86_FUNC(sub_000DA750) {
     const psiops::guest_settings::GuestUserSettings s = psiops::guest_settings::GetSettings();
     if (s.has_saved_values) {
         const uint32_t saved_eax = ctx.eax;
-        WriteGuestUserSettingsToRamAndApply(ctx, base, s, true);
+        WriteGuestUserSettingsToRamAndApply(ctx, base, s, false);
         ctx.eax = saved_eax;
         LOGR("settings: applied persisted [game_options] on GameStatus init (sfx=%d, music=%d, layout=%u, inv_y=%u, vib=%u)",
              s.sfx_volume, s.music_volume, s.controller_layout, s.controller_invert_y ? 1u : 0u,
@@ -2127,10 +2279,10 @@ X86_FUNC(sub_000DBF50) {
     ctx.eax = saved_eax;
 }
 
-// GameStatus::CommitOptionsTransaction @ 0x000DD0D0 (__thiscall, ret 0, ecx = 0x005ECC78).
+// GameStatus::CommitOptionsTransaction @ 0x000DD0D0 (custom eax = 0x005ECC78, ret 0).
 // Invoked when the player clicks "Accept" (UI command 0x819) in any native in-game Options screen.
 X86_FUNC(sub_000DD0D0) {
-    const uint32_t gs_va = ctx.ecx;
+    const uint32_t gs_va = ctx.eax;
     __imp__sub_000DD0D0(ctx, base);
     if (ShouldBypassGuestSettings() || g_applying_host_guest_settings || gs_va != kGameStatusVa ||
         !ValidGuest(kGameStatusVa, kGameStatusSize)) {

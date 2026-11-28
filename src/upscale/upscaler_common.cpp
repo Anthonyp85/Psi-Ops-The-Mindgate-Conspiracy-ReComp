@@ -109,11 +109,12 @@ std::vector<fs::path> FindProgramDataDlssCandidates() {
         fs::path dir;
     };
     std::vector<VerEntry> dirs;
-    for (auto& e : fs::directory_iterator(versions_root, ec)) {
-        if (!e.is_directory(ec)) continue;
-        std::string n = e.path().filename().string();
+    for (auto it = fs::directory_iterator(versions_root, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        if (!it->is_directory(ec)) continue;
+        std::string n = app::PathToUtf8(it->path().filename());
         uint64_t v = std::strtoull(n.c_str(), nullptr, 10);
-        dirs.push_back({v, std::move(n), e.path()});
+        dirs.push_back({v, std::move(n), it->path()});
     }
     std::sort(dirs.begin(), dirs.end(), [](const VerEntry& a, const VerEntry& b) {
         if (a.ver_num != b.ver_num) return a.ver_num > b.ver_num;
@@ -124,12 +125,13 @@ std::vector<fs::path> FindProgramDataDlssCandidates() {
         fs::path files_dir = vd.dir / "files";
         if (!fs::is_directory(files_dir, ec)) continue;
         std::vector<std::pair<uint64_t, fs::path>> bins;
-        for (auto& fe : fs::directory_iterator(files_dir, ec)) {
-            if (!fe.is_regular_file(ec)) continue;
-            std::string ext = LowerAscii(fe.path().extension().string());
+        for (auto fit = fs::directory_iterator(files_dir, fs::directory_options::skip_permission_denied, ec);
+             !ec && fit != fs::directory_iterator(); fit.increment(ec)) {
+            if (!fit->is_regular_file(ec)) continue;
+            std::string ext = LowerAscii(app::PathToUtf8(fit->path().extension()));
             if (ext == ".bin" || ext == ".dll") {
-                uint64_t sz = fe.file_size(ec);
-                if (sz >= (1ull << 20)) bins.emplace_back(sz, fe.path());
+                uint64_t sz = fit->file_size(ec);
+                if (sz >= (1ull << 20)) bins.emplace_back(sz, fit->path());
             }
         }
         std::sort(bins.begin(), bins.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
@@ -494,7 +496,7 @@ fs::path ResolveNgxDlssPath(bool* out_used_programdata, std::string* out_detail)
             if (out_detail) *out_detail = "plugins/nvngx_dlss.dll";
             return plugin_dlss;
         }
-        LOGW("upscale: rejected %s: %s", plugin_dlss.string().c_str(), reason.c_str());
+        LOGW("upscale: rejected %s: %s", app::PathToUtf8(plugin_dlss).c_str(), reason.c_str());
     }
 
     // Fallback: verify NVIDIA-signed retail DLSS model in %ProgramData%\NVIDIA\NGX\models\dlss\
@@ -505,7 +507,7 @@ fs::path ResolveNgxDlssPath(bool* out_used_programdata, std::string* out_detail)
     for (const fs::path& cand : cands) {
         std::string reason;
         if (!VerifyPe64AndAuthenticode(cand, "NVIDIA", &reason)) {
-            LOGW("upscale: skipping ProgramData NGX candidate %s (%s)", cand.string().c_str(), reason.c_str());
+            LOGW("upscale: skipping ProgramData NGX candidate %s (%s)", app::PathToUtf8(cand).c_str(), reason.c_str());
             continue;
         }
         uint64_t src_sz = fs::file_size(cand, ec);
@@ -527,7 +529,7 @@ fs::path ResolveNgxDlssPath(bool* out_used_programdata, std::string* out_detail)
             if (out_used_programdata) *out_used_programdata = true;
             if (out_detail) *out_detail = "ProgramData NGX fallback -> cache/ngx/nvngx_dlss.dll";
             LOGR("upscale: NGX ProgramData fallback staged verified retail nvngx_dlss.dll (%s -> %s)",
-                 cand.string().c_str(), cached_dll.string().c_str());
+                 app::PathToUtf8(cand).c_str(), app::PathToUtf8(cached_dll).c_str());
             return cached_dll;
         }
     }

@@ -129,9 +129,10 @@ std::vector<QuickJump> BuildQuickJumps() {
     add_unique("Steam Deck microSD", fs::path("/run/media/mmcblk0p1"), true);
     auto scan_media_user = [&](const fs::path& base) {
         if (!fs::is_directory(base, ec)) return;
-        for (auto& e : fs::directory_iterator(base, fs::directory_options::skip_permission_denied, ec)) {
-            if (e.is_directory(ec)) {
-                add_unique("microSD: " + e.path().filename().string(), e.path(), true);
+        for (auto it = fs::directory_iterator(base, fs::directory_options::skip_permission_denied, ec);
+             !ec && it != fs::directory_iterator(); it.increment(ec)) {
+            if (it->is_directory(ec)) {
+                add_unique("microSD: " + app::PathToUtf8(it->path().filename()), it->path(), true);
             }
         }
     };
@@ -164,7 +165,8 @@ void FileBrowserUi::Open(const fs::path& start_dir) {
     std::error_code ec;
     fs::path target = start_dir;
     if (target.empty() && !app::Get().iso_path.empty()) {
-        fs::path p(app::Get().iso_path);
+        fs::path p = app::Utf8ToPath(app::Get().iso_path);
+        if (p.is_relative()) p = (app::ExeDir() / p).lexically_normal();
         if (fs::is_regular_file(p, ec)) target = p.parent_path();
         else if (fs::is_directory(p, ec)) target = p;
     }
@@ -192,23 +194,28 @@ void FileBrowserUi::RefreshEntries() {
     entries_.clear();
     std::error_code ec;
     if (!fs::is_directory(current_dir_, ec)) {
-        status_error_ = "Directory is not readable: " + current_dir_.string();
+        status_error_ = "Directory is not readable: " + app::PathToUtf8(current_dir_);
         return;
     }
     std::vector<Entry> dirs;
     std::vector<Entry> files;
-    for (auto& de : fs::directory_iterator(current_dir_, fs::directory_options::skip_permission_denied, ec)) {
-        std::error_code iec;
-        bool is_d = de.is_directory(iec);
-        std::string name = de.path().filename().string();
-        if (name.empty()) continue;
-        if (is_d) {
-            dirs.push_back({de.path(), name, true, 0});
-        } else if (de.is_regular_file(iec)) {
-            if (!iso_filter_only_ || IsIsoLikeName(name)) {
-                files.push_back({de.path(), name, false, de.file_size(iec)});
+    try {
+        for (auto it = fs::directory_iterator(current_dir_, fs::directory_options::skip_permission_denied, ec);
+             !ec && it != fs::directory_iterator(); it.increment(ec)) {
+            std::error_code iec;
+            bool is_d = it->is_directory(iec);
+            std::string name = app::PathToUtf8(it->path().filename());
+            if (name.empty()) continue;
+            if (is_d) {
+                dirs.push_back({it->path(), name, true, 0});
+            } else if (it->is_regular_file(iec)) {
+                if (!iso_filter_only_ || IsIsoLikeName(name)) {
+                    files.push_back({it->path(), name, false, it->file_size(iec)});
+                }
             }
         }
+    } catch (...) {
+        status_error_ = "Error while reading directory: " + app::PathToUtf8(current_dir_);
     }
     auto cmp = [](const Entry& a, const Entry& b) { return LowerAscii(a.name) < LowerAscii(b.name); };
     std::sort(dirs.begin(), dirs.end(), cmp);
@@ -249,7 +256,7 @@ bool FileBrowserUi::Draw(fs::path& out_selected) {
             RefreshEntries();
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("Path: %s", current_dir_.string().c_str());
+        ImGui::TextDisabled("Path: %s", app::PathToUtf8(current_dir_).c_str());
         ImGui::Separator();
 
         float footer_h = 108.0f;
