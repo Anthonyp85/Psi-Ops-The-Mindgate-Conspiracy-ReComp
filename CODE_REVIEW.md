@@ -2,7 +2,7 @@
 
 - **Reviewed at:** `v1.2.2` (`ff3b1d2`), 2026-11-27. First pass was at `v1.2.1` (`882a082`); every "verified" item below was re-read at `v1.2.2`.
 - **Reviewer:** Claude Code, working in a separate git worktree on branch `claude/init-b2b832`.
-- **Fixes:** `H1`, `H2`, `H4`, `H5` are fixed on branch `claude/fix-review-high` (see §3a). Until that branch is merged, `main` still has them.
+- **Fixes:** `H1`, `H2`, `H4`, `H5` (PR #6, branch `claude/fix-review-high`: `f0f06c7`, `39c4502`) were runtime-verified across Windows x64 and Linux (`Ubuntu 22.04` / `GLIBC 2.35`), fast-forward merged onto `main`, and shipped in `v1.2.3` (see §3a).
 - **For:** whoever picks the project up next (Gemini / Antigravity on `main`, or a human).
 
 ## 1. What this session changed
@@ -13,7 +13,7 @@
 | `CODE_REVIEW.md` | New. This file. |
 | `handoff.md` | One appended section pointing here. |
 
-That documentation commit (`3fd50d1`) touched nothing else. The follow-up fix branch `claude/fix-review-high` changes eight code files (listed in §3a) plus this file and `handoff.md`. **Still untouched by any Claude work: `config/`, `patches/`, the SDK submodule, build scripts, and version strings.** Nothing was tagged or pushed.
+That documentation commit (`3fd50d1`) touched nothing else. The follow-up fix branch `claude/fix-review-high` (PR #6: `f0f06c7`, `39c4502`) changed eight code files (listed in §3a) plus this file and `handoff.md` (**untouched by Claude's commits: `config/`, `patches/`, the SDK submodule, build scripts, and version strings**), and has since been runtime-verified across Windows x64 and Linux, fast-forward merged onto `main`, and released in `v1.2.3`.
 
 ## 2. How to read the findings
 
@@ -31,7 +31,7 @@ That documentation commit (`3fd50d1`) touched nothing else. The follow-up fix br
 
 Two `.string()` calls on host paths remain and break the new UTF-8 rule: `src/common/ui_common.cpp:792` (`app::ExeDir().string()`) and `:798` (`out_lnk.string()`). On Windows these can still throw for a non-ACP install or Desktop path.
 
-## 3a. Fixed on branch `claude/fix-review-high` (based on `3fd50d1`, not yet on `main`)
+## 3a. Fixed on `main` in `v1.2.3` (PR #6: `f0f06c7`, `39c4502`)
 
 | ID | What was wrong | Change | Files |
 |---|---|---|---|
@@ -40,13 +40,12 @@ Two `.string()` calls on host paths remain and break the new UTF-8 rule: `src/co
 | H4 | Win64 CI passed when `release.bat` failed, because cmd ignores a failed `call` and the audit fell back to an unpacked check. | `call release.bat --skip-build || exit /b 1`; new opt-in `--require-archives` audit flag (used by CI) makes a missing zip fail Gate 4. Without the flag the audit behaves as before. | `.github/workflows/build.yml`, `tools/audit_release.py` |
 | H5 | Zero-gated perf counters were read with `.get(key, 0)`, so a missing key passed; `--rec` passed `--replay`, which the runtime ignores. | Missing zero-gated counters are recorded and fail strict (`post`) runs; flag renamed to `--replay-input`. | `tools/test_m4_perf.py`, `tools/test_shader_precompile.py`, `tools/test_real_upscalers.py` |
 
-How these were checked (no game launch, no full build):
+Dual-platform runtime verification completed prior to fast-forward merge onto `main` and `v1.2.3` release (Windows x64 D3D12 + Ubuntu 22.04 Linux Vulkan 1.2, `GLIBC <= 2.35`):
 
-- `mkb_input.cpp`, `settings_ui.cpp` and `update_checker.cpp` compile cleanly with `-fsyntax-only` using the exact Win64 flags from the existing headers-only build tree. **Not compiled for Linux, not linked, not run.**
-- The new perf parser was run over 96 existing `perf.json` files: all 70 from current-era builds have every required key; 26 from pre-M4 builds lack `mid_frame_flushes` / `sync_present_cache_writes`, which only matters in strict `post` mode (pre-baselines are not strict). The `--dry-run` self-test passes and now covers the missing-key case.
-- CI was confirmed green and producing the zip at `ff3b1d2` before the `|| exit /b 1` change, so the stricter step should not turn a healthy run red. **The changed workflow itself has not run yet.**
-
-Worth doing before merging: rebind a key and move a slider in the F1 overlay Controls tab on both platforms (H1), run `tools/test_m4_perf.py --mode post` and `tools/test_shader_precompile.py` once (H5), and let CI run on the branch (H4).
+- **Builds & SDK parity (`39c4502`):** `headers-only-win`, `release`, `debug`, `headers-only-linux`, and `linux-release` (`GLIBC <= 2.35`, freestanding `libPsiOps.so` `NEEDED = []`) all built cleanly (`exit 0`), with `XboxXBERecomp` byte-identical to pure-LF `patches/xboxxberecomp.patch` (`1,254,177` B, `0` CR bytes).
+- **H1 & H2 live UI and updater verification (`5/5 PASS` on Win64 + `5/5 PASS` on Linux):** Live in-game `F1` overlay Controls-tab input-mode, sensitivity-slider, and key-rebind changes saved once without mutex re-lock or deadlock and persisted identically across clean exit and restart; Pre-Game Launcher Controls-tab edits saved and launched into live gameplay; unconfigured Launcher exit preserved `zero_settings_write=true`; a mock update archive with a valid FIPS 180-4 SHA-256 digest staged and verified cleanly, while both empty `""` and omitted `digest` fields were refused up front in `UpdateState::Error` with zero staged files.
+- **H4 archive enforcement & 7-gate release audit:** Negative `--ci --require-archives` checks against an empty `dist` directory failed Gate 4 (Win64) and Gate 5 (Linux) with `exit 1` as expected; positive `--ci --require-archives` checks passed `4/4` (`exit 0`), and all `7/7` `tools/audit_release.py` gates (`Gates 1, 2, 2b, 3, 4, 5, 6`) passed.
+- **H5 strict telemetry, `--rec` replay & full regression suites (`100% PASS` on Win64 & Linux):** `tools/test_m4_perf.py --mode post` (`0` missing zero-gated metrics), `tools/test_shader_precompile.py` (`2/2` Win64 + `2/2` Linux, `0` mid-game compiles/PSOs, `0` missing `shaders.*` keys), `tools/test_real_upscalers.py --rec` (`--replay-input` replayed `.rec` and exited `0`), `tools/test_m2_gameplay.py --runs 1 --require-speed-ratio`, `tools/test_m3_mkb.py`, `tools/test_m3_replay.py` (`8/8` Win64 + `8/8` Linux deterministic `.rec` replays PASS), `tools/test_m5_ux.py --skip-unpacked-compile` (`4/4` Win64 + `4/4` Linux), and `tools/test_issue2_unicode_and_options.py` (`3/3` Win64 + `3/3` Linux).
 
 Behaviour changes to be aware of: a release whose asset has no `digest` in the GitHub API response can no longer be self-installed (H2), and `test_real_upscalers.py --rec` now really replays the recording and exits when it ends (H5).
 
@@ -60,7 +59,7 @@ Behaviour changes to be aware of: a release whose asset has no `digest` in the G
 
 `H1`, `H2`, `H4` and `H5` moved to §3a.
 
-Note on H1 (now fixed): the save call had been there since `v1.0.0`. Re-locking a `std::mutex` on the same thread is undefined behaviour (normally a hang or abort). If rebinding a key in the F1 overlay works in practice, something in that chain is not what it looks like on paper — worth one manual test before changing anything.
+Note on H1 (now fixed and verified in-game on both Win64 and Linux in `v1.2.3`): the save call had been there since `v1.0.0`. Re-locking a `std::mutex` on the same thread is undefined behaviour (normally a hang or abort).
 
 ### Medium
 
@@ -113,7 +112,7 @@ Guest pointer bounds and `GuestCallFrame` usage in the hooks; the hand-written S
 Skimmed, not reviewed in depth:
 
 - `Hook_AdxLock` / `Hook_AdxUnlock` / `Hook_AdxMwidleBorderWait` validate the guest addresses they write. Their comments do not state the guest calling convention or stack cleanup, which the other hooks do.
-- The ADX mutex hooks replace the guest functions on every platform, not only Linux. If that is intended, a line in `PROJECT_MEMORY.md` saying Windows replays were re-verified with them would close the question.
+- The ADX mutex hooks replace the guest functions on every platform, not only Linux. (`PROJECT_MEMORY.md` §16/§17 now records that all `8/8` Windows and `8/8` Linux `.rec` deterministic replays passed with these hooks active.)
 
 ## 8. Environment observations (main checkout)
 

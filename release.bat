@@ -6,7 +6,7 @@ rem Keep %%_PDB%% undefined so cmd.exe-wrapped link steps pass /PDBALTPATH:%%_PD
 set "_PDB="
 
 set "REPO_NAME=Psi-Ops-The-Mindgate-Conspiracy-ReComp"
-set "VERSION=v1.2.2"
+set "VERSION=v1.2.3"
 set "SKIP_BUILD=0"
 
 :parse_args

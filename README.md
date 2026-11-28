@@ -30,20 +30,20 @@ A native **Windows x64** (D3D12 + XAudio2 + SDL3) and **Native Linux x86_64 / St
 
 ## Quick Start (Pre-Built Release Archives)
 
-### Windows x64 (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.2-win64-launcher.zip`)
+### Windows x64 (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.3-win64-launcher.zip`)
 1. Extract the `.zip` archive to any writable folder (e.g. `C:\Games\PsiOps`).
 2. Double-click **`PsiOps.exe`** to open the 6-Tab Pre-Game Launcher.
 3. In **Play & Game Disc**, browse to your retail USA `Psi-Ops - The Mindgate Conspiracy (USA).xiso.iso` (or place it inside an `assets/` folder beside `PsiOps.exe`).
 4. Choose a one-click **Hardware Preset** (`1080p Mainstream`, `1440p High`, `4K Ultra`, `Handheld / iGPU`, or `Steam Deck`) and click **Play**.
    - On first launch, `PsiOps.exe` compiles `PsiOps.dll` locally from your XISO using the bundled `compiler/` toolchain and caches it for instant subsequent launches.
 
-### Native Linux x86_64 & Steam Deck (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.2-linux-x86_64.tar.gz`)
+### Native Linux x86_64 & Steam Deck (`Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.3-linux-x86_64.tar.gz`)
 > **IMPORTANT (Steam Deck / SteamOS):** `PsiOps` is a **native Linux x86_64 ELF binary** (`GLIBC 2.35`, Vulkan 1.2, SDL3). **Do NOT enable Proton / Steam Play compatibility** on the Steam shortcut!
 
 1. Extract the tarball on your Steam Deck or Linux PC:
    ```bash
    mkdir -p ~/Games/PsiOps
-   tar -xzf Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.2-linux-x86_64.tar.gz -C ~/Games/PsiOps
+   tar -xzf Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.3-linux-x86_64.tar.gz -C ~/Games/PsiOps
    cd ~/Games/PsiOps
    ```
 2. *(Optional, Steam Deck / Desktop shortcut)* Register the native Linux Non-Steam Game shortcut and icon:
@@ -143,10 +143,10 @@ build.bat
 
 ### 4. Building Distributable Archives & Running the Release Audit
 ```bash
-# Windows: creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.2-{win64-launcher,source}.zip
+# Windows: creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.3-{win64-launcher,source}.zip
 release.bat
 
-# Linux (Ubuntu 22.04): creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.2-linux-x86_64.tar.gz
+# Linux (Ubuntu 22.04): creates dist/Psi-Ops-The-Mindgate-Conspiracy-ReComp-v1.2.3-linux-x86_64.tar.gz
 ./release_linux.sh
 
 # Run full release audit (Gates 1, 2, 2b built-binary path hygiene, and Gates 3-6 archive/ABI/media checks)
