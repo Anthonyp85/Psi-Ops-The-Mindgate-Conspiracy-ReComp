@@ -75,3 +75,8 @@
 
 ## Release Verification Status
 - All 6 milestones and the **`v1.2.2`** release (`2278118`, `b854c47`, `7157c24`, `801fdf4`, `3e4bfd2`, `89a77c7`, `50c07c6`, and `v1.2.2` stability/upscaler/SteamOS hardening) are complete, verified across Windows x64 (D3D12) and Native Linux x86_64 / Steam Deck (Vulkan 1.2) including `--headers-only` targets, and audited across all 7 `tools/audit_release.py` gates (`PASS`).
+
+## External Review & Second-Agent Notes (Claude Code, 2026-11-27)
+- A read-only code review of `v1.2.2` (`ff3b1d2`) was done from a separate worktree on branch `claude/init-b2b832`. **No source, tooling, config, patch, CI, or version changes were made**; nothing was built, tagged, or pushed.
+- Files added by that session: `CLAUDE.md` (Claude Code counterpart to `AGENTS.md`) and `CODE_REVIEW.md` (open findings with `file:line`, severity, and suggested fixes; items fixed by `v1.2.2` are marked).
+- Highest-priority open items in `CODE_REVIEW.md`: `H1` F1 Controls-tab mutex re-lock (`src/common/mkb_input.cpp`), `H2` self-update with empty digest reported as verified (`src/common/update_checker.cpp`), `H3` D3D12 resize skipping render-target/upscaler reset, `H4` Win64 CI passing when `release.bat` fails, `H5` vacuous test assertions. All findings were verified by reading only and are unfixed.
